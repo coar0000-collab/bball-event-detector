@@ -297,7 +297,11 @@ def cmd_track_court(a):
             last_good, last_good_gray = H0, cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
             print(f"시작 화면({fmt_time(start)})을 기준 화면과 맞추지 못해 놓친 상태로 시작합니다", file=sys.stderr)
 
+    prev_good_gray = last_good_gray if status[0] != "lost" else None
     support = [tuple(trk.last_support) + (0,) * (3 - len(trk.last_support))]
+    # 좌표를 못 낸 짧은 구간(coast)을 앞뒤 정상 화면 사이에서 메우기 위해, 마지막 정상 화면 뒤의 샘플 화면을 모아 둔다
+    gap: list | None = [] if prev_good_gray is not None else None  # [(샘플 번호, 회색 화면)], None = 메우기 포기
+    n_bridged = 0
     for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
         if t <= start:
             continue
@@ -330,13 +334,34 @@ def cmd_track_court(a):
         scores.append(r.line_score)
         status.append(r.status)
         support.append(tuple(trk.last_support) + (0,) * (3 - len(trk.last_support)))
+        if a.bridge > 0:
+            if r.status == "coast":
+                if gap is not None:
+                    gap.append((len(times) - 1, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)))
+                    if t - times[gap[0][0] - 1] > a.bridge:
+                        gap = None
+            elif r.status in ("ok", "recovered"):
+                if gap:
+                    i0 = gap[0][0] - 1  # 구간 앞의 정상 샘플
+                    if np.all(np.isfinite(Hs[i0])) and status[i0] in ("ok", "recovered", "calib"):
+                        grays = [prev_good_gray] + [g for _, g in gap] + [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)]
+                        filled = HG.bridge_gap(grays, Hs[i0], r.H, spec, trk.orb, trk.matcher, mask=overlay, ok=trk.sane)
+                        for (j, _), Hj in zip(gap, filled):
+                            if Hj is not None:
+                                Hs[j], status[j] = Hj, "bridged"
+                                n_bridged += 1
+                gap = []
+                prev_good_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            else:
+                gap = None  # 화면 전환·놓침: 이동이 끊겼으니 메우지 않는다
         if len(times) % int(max(1, 60 / a.step)) == 0:
             print(f"{fmt_time(t)} 상태={r.status} 라인일치={r.line_score:.2f}", file=sys.stderr)
     # support: 샘플마다 (보이는 라인 줄, 맞은 줄, 방향 엇갈림) — 틀린 정합을 찾을 때 본다
     np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status),
                         support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name)
-    ok = sum(s in ("ok", "recovered", "calib") for s in status)
-    print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번)")
+    ok = sum(s in ("ok", "recovered", "calib", "bridged") for s in status)
+    print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
+          f"앞뒤 정상 화면 사이 메움 {n_bridged}개)")
 
 
 class _CourtLookup:
@@ -404,6 +429,7 @@ def cmd_click_shots(a):
     jersey = ""
     ft = False  # 자유투 모드 (f 로 켜고 끔)
     replay = False  # 리플레이 화면에서 찍은 슛 (r 로 켜고 끔)
+    line_call = ""  # 라인 근처 슛을 사람이 확대 화면에서 본 판정: "on"(라인 밟음·안쪽 → 2점) / "behind"(라인 뒤 → 3점)
     clicks: list[tuple] = []  # 같은 슛을 여러 번 찍은 것 [(H, u, v)] — Shift+클릭으로 추가
     state = {"click": None, "add": False}
     h_cache: dict = {}
@@ -446,6 +472,7 @@ def cmd_click_shots(a):
             point = (u, vv)
             if not (state["add"] and clicks):
                 clicks = []
+                line_call = ""
             state["click"] = None
             playing = False
             if H is not None:
@@ -472,6 +499,8 @@ def cmd_click_shots(a):
             view[100:100 + zoom.shape[0], view.shape[1] - zoom.shape[1]:] = zoom
         info = (f"{fmt_time(t)}  team={team}  no={jersey or '-'}  shots={len(rows)}" + ("  [FREE THROW]" if ft else "")
                 + ("  [REPLAY]" if replay else "") + (f"  avg of {len(clicks)} clicks" if len(clicks) > 1 else ""))
+        if line_call:
+            info += "  [LINE: " + ("ON/INSIDE -> 2PT" if line_call == "on" else "BEHIND -> 3PT") + "]"
         if H is None:
             info += "  [NO COURT - recalibrate]"
         _put(view, info, (10, 28), 0.65, (0, 255, 255))
@@ -481,7 +510,8 @@ def cmd_click_shots(a):
             if call.ft_spot and not ft:
                 _put(view, "FT spot: press f if this is a free throw", (10, 88), 0.6, (0, 200, 255))
             elif call.near_line:
-                _put(view, "NEAR LINE: Shift+click the feet again (other frames) to average", (10, 88), 0.6, (0, 200, 255))
+                _put(view, "NEAR LINE: Shift+click again to average, or look at zoom: i = foot on/inside line (2PT), o = behind (3PT)",
+                     (10, 88), 0.6, (0, 200, 255))
         cv2.imshow(win, view)
         key = cv2.waitKey(1 if playing else 30) & 0xFF
         if key == ord(" "):
@@ -504,6 +534,9 @@ def cmd_click_shots(a):
             ft = not ft
         elif key == ord("r"):
             replay = not replay
+        elif key in (ord("i"), ord("o")) and call is not None and not ft:
+            # 라인 근처: 확대 화면에서 발이 3점 라인을 밟았는지(또는 안쪽) 사람이 본 판정. 라인을 밟으면 2점 (FIBA)
+            line_call = "" if line_call == ("on" if key == ord("i") else "behind") else ("on" if key == ord("i") else "behind")
         elif ord("0") <= key <= ord("9"):
             jersey = (jersey + chr(key))[-3:]
         elif key in (8, 127):  # Backspace
@@ -512,13 +545,15 @@ def cmd_click_shots(a):
             row = {"t_sec": round(t, 2), "time": fmt_time(t), "team": team, "no": jersey, "result": "MADE" if key == ord("m") else "MISSED",
                    "u": round(point[0], 1), "v": round(point[1], 1)}
             row.update(call.as_dict() if call else {"points": "", "zone": "", "zone_kr": "", "near_line": ""})
-            row.update({"replay": replay, "clicks": len(clicks)})
+            row.update({"replay": replay, "clicks": len(clicks), "line_call": line_call})
+            if line_call and call is not None:
+                row["points"] = 2 if line_call == "on" else 3
             if ft:
                 row.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
             rows.append(row)
             _write_csv(a.out, rows)
             print(f"기록: {row['time']} {team} #{jersey or '?'} {row['result']} {row.get('points')}점 {row.get('zone_kr')}")
-            point, call, jersey, clicks = None, None, "", []
+            point, call, jersey, clicks, line_call = None, None, "", [], ""
         elif key == ord("z") and rows:
             print(f"삭제: {rows.pop()}")
             _write_csv(a.out, rows)
@@ -537,6 +572,8 @@ __SHOTS_HELP = """
   m 성공으로 저장   x 실패로 저장   t 홈/원정(스코어버그 왼쪽/오른쪽 팀) 전환   z 마지막 기록 삭제   q 종료
   f 자유투 모드 켜기/끄기 (켜 있으면 1점·자유투로 저장, 자유투가 끝나면 다시 f 로 끄기)
   NEAR LINE 이 뜨면: , . 로 한두 프레임 옮겨 Shift+클릭으로 같은 발을 더 찍으면 평균해서 다시 판정 (오른쪽 위 확대 보기 참고)
+    그래도 라인에 딱 걸쳐 있으면 확대 보기로 직접 판정: i = 발이 3점 라인을 밟았거나 안쪽(2점), o = 두 발 모두 라인 뒤(3점)
+    (다시 누르면 취소. 라인 위에 선 발은 위치 계산만으로는 2·3점이 갈리지 않는다)
   r 리플레이 표시 켜기/끄기 (본 화면에서 못 본 슛을 리플레이에서 찍을 때. 점수 변화와 짝지을 때 뒤로 더 넓게 찾음)
 """
 
@@ -679,6 +716,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--step", type=float, default=0.2)
     q.add_argument("--refine-every", type=int, default=1)
     q.add_argument("--recover-score", type=float, default=0.7, help="놓친 뒤 다시 찾은 화면을 받는 라인 일치율")
+    q.add_argument("--bridge", type=float, default=4.0,
+                   help="좌표를 못 낸 구간이 이 초 이하이고 앞뒤가 정상이면, 양쪽에서 화면 이동으로 따라와 서로 맞을 때만 메움 (0 = 끔)")
     q.add_argument("--out", default="out/court_track.npz")
 
     q = add("overlay", cmd_overlay, "코트 라인을 영상 프레임에 겹쳐 그려 확인")

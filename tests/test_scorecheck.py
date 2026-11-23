@@ -122,3 +122,10 @@ def test_correction_fixes_previous_score():
     assert SC.resolve_corrections(fixed) == fixed
     s = SC.check(events, [shot(9, "away", 2)]).summary()
     assert s["점수판 변화"] == 1 and s["일치"] == 1
+
+
+def test_line_call_counts_as_human_judgment():
+    """라인에 딱 걸친 슛을 사람이 확대 화면에서 '밟음(2점)'으로 판정하면 그 점수로 비교한다."""
+    s = dict(shot(10, "home", 2, near=True), line_call="on")
+    summ = SC.check([ev(12, "home", 2)], [s]).summary()
+    assert summ["일치"] == 1 and summ["라인 근처 사람 판정"] == 1
