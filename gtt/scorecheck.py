@@ -15,6 +15,43 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def resolve_corrections(rows: list[dict], window: float = 30.0) -> list[dict]:
+    """기록원이 점수를 고친 흔적(감소)을 앞뒤 변화와 묶어 정리한다. 원본은 두고 새 목록을 돌려준다.
+
+    - 감소 뒤 window 초 안에 같은 팀이 같은 만큼 다시 오르면(잠깐 잘못 내렸다가 되돌림) 그 증가는 득점이 아니다
+      → flag "revert". (실제 영상 73.5s·87.5s 에서 '+1 ok' 로 나와 자유투 하나가 있는 것처럼 보였다)
+    - 아니면, 감소 바로 앞의 같은 팀 정상 변화(window 초 안)를 고친 것으로 본다. 합이 0 이면 그 변화는 취소
+      (flag "reverted"), 1~3 이면 고친 값으로 바꾼다(+3 → -1 이면 +2). 감소 자체는 flag "merged".
+    정상(ok)만 득점으로 세므로 score-check 는 고친 뒤의 점수로 비교한다."""
+    out = [dict(r) for r in rows]
+    order = sorted(range(len(out)), key=lambda i: float(out[i]["t_sec"]))
+    for team in {r["team"] for r in out}:
+        idx = [i for i in order if out[i]["team"] == team]
+        for p, j in enumerate(idx):
+            e = out[j]
+            d = int(e["delta"])
+            if d >= 0 or e.get("flag") != "correction":
+                continue
+            t = float(e["t_sec"])
+            nxt = idx[p + 1] if p + 1 < len(idx) else None
+            if nxt is not None and int(out[nxt]["delta"]) == -d and float(out[nxt]["t_sec"]) - t <= window:
+                out[nxt]["flag"] = "revert"
+                continue
+            prv = idx[p - 1] if p > 0 else None
+            if prv is None or out[prv].get("flag", "ok") != "ok" or t - float(out[prv]["t_sec"]) > window:
+                continue
+            net = int(out[prv]["delta"]) + d
+            if net == 0:
+                out[prv]["flag"] = "reverted"
+            elif net in (1, 2, 3):
+                out[prv]["note"] = f"{out[prv]['delta']}→{net} 정정"
+                out[prv]["delta"] = net
+            else:
+                continue
+            e["flag"] = "merged"
+    return out
+
+
 def shot_points(row: dict) -> int | None:
     """슛 한 줄의 코트 기반 점수. 자유투로 표시됐으면 1."""
     if str(row.get("zone", "")).upper() == "FT" or str(row.get("kind", "")).upper() == "FT":
@@ -161,7 +198,9 @@ def check(score_events: list[dict], shots: list[dict], max_lag: float = 20.0, le
     def rng(t):
         return (start is None or t >= start) and (end is None or t <= end)
 
-    events = sorted((e for e in score_events if rng(float(e["t_sec"])) and e.get("flag", "ok") == "ok"), key=lambda e: float(e["t_sec"]))
+    # 기록원 정정(감소)을 앞뒤 변화와 묶은 뒤 정상 득점만 (이미 정리된 CSV 에 다시 해도 결과가 같다)
+    fixed = resolve_corrections([e for e in score_events if "flag" in e]) + [e for e in score_events if "flag" not in e]
+    events = sorted((e for e in fixed if rng(float(e["t_sec"])) and e.get("flag", "ok") == "ok"), key=lambda e: float(e["t_sec"]))
     made = sorted((s for s in shots if _made(s) and rng(float(s["t_sec"]))), key=lambda s: float(s["t_sec"]))
     chosen: dict[int, list[int]] = {}
     used: set[int] = set()

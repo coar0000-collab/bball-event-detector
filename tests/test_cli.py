@@ -85,6 +85,40 @@ def test_track_and_shot_cli(synthetic, capsys):
     assert json.loads(capsys.readouterr().out)["points"] == 2
 
 
+def test_track_start_differs_from_calib(synthetic):
+    """캘리브레이션은 6초 화면에서 했는데 0초부터 추적: 6초의 H 를 0초 화면에 그대로 붙이면 90 px 어긋난다.
+    기준 화면(6초)과 맞춰 0초 화면의 H 를 찾아야 한다 (실제 영상 --start 0, calib t=120 에서 생긴 문제)."""
+    d, video, Hs = synthetic
+    c = json.loads((d / "calib.json").read_text())
+    i6 = 6 * FPS
+    c6 = {"spec": "FIBA", "t_sec": 6.0, "H_court_to_image": Hs[i6].tolist()}
+    (d / "calib6.json").write_text(json.dumps(c6))
+    track = d / "track6.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib6.json"), "--start", "0", "--end", "8",
+              "--step", "0.5", "--out", str(track)])
+    z = np.load(track)
+    pts = np.array([[5.8, 5.05], [5.8, 9.95], [14, 7.5]])
+    for t, H, s in zip(z["times"], z["H"], z["status"]):
+        if not np.all(np.isfinite(H)):
+            continue
+        Ht = Hs[int(round(t * FPS))]
+        assert np.linalg.norm(HG.project(H, pts) - HG.project(Ht, pts), axis=1).mean() < 3, (t, s)
+    assert z["status"][0] == "recovered"
+    assert sum(np.all(np.isfinite(H)) for H in z["H"]) >= len(z["H"]) - 1
+
+
+def test_court_lookup_skips_missing_sample(tmp_path):
+    """가장 가까운 샘플이 좌표 없음(coast)이면 tol 안의 다음 가까운 샘플을 쓴다 (실제 영상 309.5s)."""
+    nan = np.full((3, 3), np.nan)
+    track = tmp_path / "t.npz"
+    np.savez(track, times=np.array([309.2, 309.4, 309.6]), H=np.stack([np.eye(3) * 2, nan, np.eye(3) * 3]),
+             line_score=np.array([0.9, 0.48, 0.9]), status=np.array(["ok", "coast", "ok"]))
+    look = cli._CourtLookup(None, str(track))
+    H, dt = look.nearest(309.45)
+    assert H[0, 0] == 3 and abs(dt - 0.15) < 1e-9
+    assert look.at(309.45, tol=0.1) is None
+
+
 def test_overlay_cli(synthetic):
     d, video, _ = synthetic
     out = d / "ov.png"

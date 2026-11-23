@@ -63,7 +63,7 @@ gtt scorebug-learn --video videos/game1.mp4 --n 12
 gtt scorebug-read --video videos/game1.mp4 --out out/game1_score_events.csv
 ```
 
-결과 CSV의 `flag`가 `ok`면 정상(+1/+2/+3), `check`나 `correction`이면 판독 오류나 점수 정정일 수 있으니 확인합니다. `t_sec`는 스코어버그가 바뀐 시각이라 실제 슛보다 보통 1~5초 늦습니다. 엑셀에서 바로 열 수 있게 UTF-8(BOM)으로 저장합니다.
+결과 CSV의 `flag`가 `ok`면 정상(+1/+2/+3), `check`나 `correction`이면 판독 오류나 점수 정정일 수 있으니 확인합니다. 기록원이 점수를 고친 흔적은 30초 안의 앞뒤 변화와 묶어 정리합니다: 잠깐 내렸다가 되돌린 증가는 `revert`(득점 아님), 넣었다가 지운 득점은 `reverted`, +3 을 넣었다가 -1 로 고친 것은 +2 `ok`(`note`에 표시)와 `merged`가 됩니다. `ok`만 득점으로 셉니다. `t_sec`는 스코어버그가 바뀐 시각이라 실제 슛보다 보통 1~5초 늦습니다. 엑셀에서 바로 열 수 있게 UTF-8(BOM)으로 저장합니다.
 
 ### 2. 코트 라인 캘리브레이션
 
@@ -91,7 +91,7 @@ gtt calibrate --video videos/game1.mp4 --t 15 --refine --out configs/calib_left.
 gtt track-court --video videos/game1.mp4 --calib configs/calib_right.json --calib configs/calib_left.json --step 0.2
 ```
 
-빠른 패닝 때는 샘플 사이 프레임까지 이어서 카메라 이동을 계산하고, 화면이 흐린 동안이나 라인 일치율이 0.5(`--min-score`)보다 낮을 때는 좌표를 내지 않습니다(틀린 좌표보다 빈칸이 낫다). 득점 장면에 코트가 비어 있으면 그 시각으로 `calibrate`를 한 번 더 하고 `--calib`에 추가해 다시 돌리면 됩니다.
+빠른 패닝 때는 샘플 사이 프레임까지 이어서 카메라 이동을 계산하고, 화면이 흐린 동안이나 라인 일치율이 0.5(`--min-score`)보다 낮을 때, 또는 화면에 보이는 코트 라인 줄(베이스라인·키 세 변·코너·아크 …) 가운데 실제 선과 겹치는 줄이 60% 미만일 때는 좌표를 내지 않습니다(틀린 좌표보다 빈칸이 낫다). `--start`가 캘리브레이션 시각과 달라도 캘리브레이션 화면을 기준으로 시작 화면의 위치를 다시 찾습니다. 득점 장면에 코트가 비어 있으면 그 시각으로 `calibrate`를 한 번 더 하고 `--calib`에 추가해 다시 돌리면 됩니다.
 
 `overlay` 이미지에서 노란 선이 라인에 겹쳐 있으면 추적이 잘 된 것입니다. 리플레이·클로즈업 뒤에 비슷한 화면으로 돌아오면 자동으로 다시 맞추고, 못 맞추면 그 구간은 코트 좌표가 비어 있습니다(그때는 그 시각으로 `calibrate`를 다시 하고 `track-court --start`로 이어서 실행).
 

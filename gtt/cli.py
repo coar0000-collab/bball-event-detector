@@ -136,6 +136,9 @@ def cmd_scorebug_read(a):
         if t - last_print > 300:
             last_print = t
             print(f"... {fmt_time(t)} 처리 중", file=sys.stderr)
+    from .scorecheck import resolve_corrections
+
+    events = resolve_corrections(events)
     _write_csv(a.out, events)
     if a.raw:
         _write_csv(a.raw, raw)
@@ -239,8 +242,10 @@ def cmd_track_court(a):
     calibs = a.calib if isinstance(a.calib, list) else [a.calib or "configs/calib.json"]
     H0, d = _load_calib(calibs[0])
     v = Video(a.video)
-    start = a.start if a.start is not None else float(d.get("t_sec") or 0.0)
-    frame0 = v.frame_at(start)
+    t_calib = float(d.get("t_sec") or 0.0)
+    start = a.start if a.start is not None else t_calib
+    frame_c = v.frame_at(t_calib)  # 캘리브레이션 H 는 이 화면에서 맞춘 것
+    frame0 = frame_c if abs(start - t_calib) < 1e-3 else v.frame_at(start)
     # 방송 그래픽(스코어버그·로고) 찾기: 구간 전체에서 띄엄띄엄 12장을 뽑아 안 변하는 곳을 특징점에서 뺀다
     end = a.end if a.end is not None else v.duration
     if end <= start:  # 길이를 모르는 영상
@@ -253,7 +258,8 @@ def cmd_track_court(a):
             pass
     sm = HG.StaticMask.from_frames(samples)
     overlay = sm.mask(frame0.shape[:2])
-    trk = HG.CourtTracker(H0, frame0, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score)
+    # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
+    trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score)
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
     for c in calibs[1:]:
         Hc, dc = _load_calib(c)
@@ -262,11 +268,27 @@ def cmd_track_court(a):
         except ValueError:
             print(f"경고: {c} 의 시각 프레임을 못 읽어 기준에서 뺌", file=sys.stderr)
     print(f"기준 화면(캘리브레이션) {len(trk.anchors)}개", file=sys.stderr)
-    times, Hs, scores, status = [start], [H0], [1.0], ["calib"]
-    last_good, last_good_gray = H0, cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
 
     def strong(Hr, sc):
         return Hr is not None and trk.last_inliers >= 80 and sc >= trk.min_score
+
+    if frame0 is frame_c:
+        times, Hs, scores, status = [start], [H0], [1.0], ["calib"]
+        last_good, last_good_gray = H0, cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+    else:
+        # 시작 시각이 캘리브레이션 시각과 다르면 캘리브레이션 H 를 시작 화면에 그대로 쓰면 안 된다(카메라가 움직였을 수 있음).
+        # 기준 화면들과 맞춰 시작 화면의 H 를 찾고, 못 찾으면 놓친 상태로 시작해 다음 샘플부터 다시 찾는다.
+        Hr, sc = trk.relocalize(frame0)
+        if strong(Hr, sc) or (Hr is not None and sc >= a.recover_score):
+            trk.reset(Hr, frame0)
+            times, Hs, scores, status = [start], [Hr], [sc], ["recovered"]
+            last_good, last_good_gray = Hr, cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+        else:
+            trk.reset(H0, frame0)
+            trk.lost = True
+            times, Hs, scores, status = [start], [np.full((3, 3), np.nan)], [0.0], ["lost"]
+            last_good, last_good_gray = H0, cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
+            print(f"시작 화면({fmt_time(start)})을 기준 화면과 맞추지 못해 놓친 상태로 시작합니다", file=sys.stderr)
 
     for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
         if t <= start:
@@ -285,7 +307,11 @@ def cmd_track_court(a):
                 # 마지막으로 잘 맞던 화면과 거의 같은 화면으로 돌아왔을 때만 그 H 에서 라인 정합 (멀리 이동한 화면에 억지로 맞추지 않음)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 F, n = HG.frame_to_frame(last_good_gray, gray, trk.orb, trk.matcher, mask=overlay, return_inliers=True)
-                Hr, sc = (None, 0.0) if F is None or n < 80 else HG.refine_homography(frame, F @ last_good, spec)
+                Hr, sc = None, 0.0
+                if F is not None and n >= 80:
+                    Hr, sc, sup = HG.refine_homography(frame, F @ last_good, spec, return_support=True)
+                    if not trk.supported(sup):
+                        Hr, sc = None, 0.0
             if strong(Hr, sc) or (Hr is not None and sc >= a.recover_score):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
@@ -308,23 +334,23 @@ class _CourtLookup:
         self.track = np.load(track, allow_pickle=False) if track else None
 
     def nearest(self, t: float, tol: float = 0.6) -> tuple[np.ndarray | None, float]:
-        """(H, 그 H 가 계산된 시각과의 차이 초). 고정 캘리브레이션이면 차이 0."""
+        """(H, 그 H 가 계산된 시각과의 차이 초). 고정 캘리브레이션이면 차이 0.
+
+        tol 안에서 좌표가 있는(NaN 이 아닌) 샘플 중 가장 가까운 것. 가장 가까운 샘플이 coast 라도 바로 옆 샘플이
+        ok 면 그것을 쓴다 (실제 영상 309.5s: 309.4s 는 coast, 309.6s 는 ok)."""
         if self.track is not None:
             times = self.track["times"]
-            i = int(np.argmin(np.abs(times - t)))
-            if abs(times[i] - t) <= tol and np.all(np.isfinite(self.track["H"][i])):
-                return self.track["H"][i], float(times[i] - t)
-            return None, 0.0
+            Hs = self.track["H"]
+            d = np.abs(times - t)
+            good = (d <= tol) & np.all(np.isfinite(Hs.reshape(len(Hs), -1)), axis=1)
+            if not good.any():
+                return None, 0.0
+            i = int(np.flatnonzero(good)[np.argmin(d[good])])
+            return Hs[i], float(times[i] - t)
         return self.fixed, 0.0
 
     def at(self, t: float, tol: float = 0.6) -> np.ndarray | None:
-        if self.track is not None:
-            times = self.track["times"]
-            i = int(np.argmin(np.abs(times - t)))
-            if abs(times[i] - t) <= tol and np.all(np.isfinite(self.track["H"][i])):
-                return self.track["H"][i]
-            return None
-        return self.fixed
+        return self.nearest(t, tol)[0]
 
 
 def cmd_overlay(a):
