@@ -607,6 +607,59 @@ class CourtTracker:
         self.coast_n = 0
 
 
+def h_distance(Ha: np.ndarray, Hb: np.ndarray, shape, spec: CourtSpec = FIBA) -> float:
+    """두 H 로 투영한 코트 라인 점들이 화면 안에서 평균 몇 px 떨어지는지. 화면 안에 점이 없으면 inf."""
+    h, w = shape[:2]
+    pts = np.concatenate([densify(p, 0.5) for p in court_polylines(spec).values()])
+    a, b = project(Ha, pts), project(Hb, pts)
+    vis = (a[:, 0] >= 0) & (a[:, 0] < w) & (a[:, 1] >= 0) & (a[:, 1] < h)
+    return float(np.linalg.norm(a[vis] - b[vis], axis=1).mean()) if vis.sum() >= 10 else float("inf")
+
+
+def bridge_gap(grays: list, H_start: np.ndarray, H_end: np.ndarray, spec: CourtSpec = FIBA, orb=None, matcher=None,
+               mask=None, min_inliers: int = 100, agree_px: float = 3.0, ok=None) -> list:
+    """좌표를 못 낸 짧은 구간 메우기. grays[0]·grays[-1] 은 앞뒤 정상 화면(H_start·H_end), 그 사이가 빈 샘플들.
+
+    앞 정상 화면에서 화면 이동만으로 끝까지 따라간 H 가 뒤 정상 화면의 H 와 agree_px 안에서 만나고(이동 계산이 정확했다는
+    뜻), 뒤에서 거꾸로 따라온 H 와도 각 샘플에서 agree_px 안에서 겹칠 때만 그 샘플을 채운다. 서로 따로 구한 두 길이 같은
+    곳을 가리켜야 하므로 한쪽만 틀린 경우는 걸러진다. 반환: 사이 샘플마다 H 또는 None (len(grays)-2 개).
+    ok: 추가 검사 함수(H, shape) → bool (예: CourtTracker.sane)."""
+    n = len(grays)
+    none = [None] * max(0, n - 2)
+    if n < 3:
+        return none
+    orb = orb or make_orb()
+    matcher = matcher or cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    shape = grays[0].shape
+    fwd = [H_start / H_start[2, 2]]
+    for k in range(1, n):
+        F, m = frame_to_frame(grays[k - 1], grays[k], orb, matcher, mask=mask, return_inliers=True)
+        if F is None or m < min_inliers:
+            return none
+        Hk = F @ fwd[-1]
+        fwd.append(Hk / Hk[2, 2])
+    if h_distance(fwd[-1], H_end, shape, spec) > agree_px:
+        return none  # 화면 이동을 이어 붙인 길이 뒤 정상 화면과 안 만난다 → 사이도 믿을 수 없다
+    bwd = [None] * n
+    bwd[-1] = H_end / H_end[2, 2]
+    for k in range(n - 2, 0, -1):
+        F, m = frame_to_frame(grays[k + 1], grays[k], orb, matcher, mask=mask, return_inliers=True)
+        if F is None or m < min_inliers:
+            return none
+        Hk = F @ bwd[k + 1]
+        bwd[k] = Hk / Hk[2, 2]
+    out = []
+    for k in range(1, n - 1):
+        if h_distance(fwd[k], bwd[k], shape, spec) > agree_px:
+            out.append(None)
+            continue
+        w = k / (n - 1)
+        Hk = (1 - w) * fwd[k] + w * bwd[k]
+        Hk = Hk / Hk[2, 2]
+        out.append(Hk if ok is None or ok(Hk, shape) else None)
+    return out
+
+
 def frame_to_frame(prev_gray, gray, orb=None, matcher=None, min_inliers: int = 25, mask=None,
                    return_inliers: bool = False):
     """두 프레임 사이 화면 변환(3x3). 실패하면 None (화면 전환 가능성). mask: 특징점을 찾을 곳(255).

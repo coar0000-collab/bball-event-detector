@@ -209,3 +209,18 @@ def test_sane_rejects_collapsed_court():
     shrink = np.array([[0.2, 0, 512], [0, 0.2, 288], [0, 0, 1]]) @ Htrue  # 점 하나로 쪼그라듦(넓이 1/25)
     assert not trk.sane(shrink, frame.shape)
     assert not trk.sane(np.full((3, 3), np.nan), frame.shape)
+
+
+def test_bridge_gap_fills_only_when_both_ways_agree():
+    """좌표가 빈 짧은 구간: 앞뒤 정상 화면에서 화면 이동으로 따라와 서로 맞으면 채우고, 뒤 H 가 틀렸으면 채우지 않는다."""
+    import cv2
+
+    scenes = [make_scene(shift=(-15.0 * k, 3.0 * k)) for k in range(6)]
+    grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f, _ in scenes]
+    Hs = [H for _, H in scenes]
+    filled = HG.bridge_gap(grays, Hs[0], Hs[-1], FIBA)
+    assert len(filled) == 4 and all(H is not None for H in filled)
+    for H, Ht in zip(filled, Hs[1:-1]):
+        assert HG.h_distance(H, Ht, grays[0].shape) < 2
+    wrong_end = np.array([[1, 0, 12.0], [0, 1, -8.0], [0, 0, 1]]) @ Hs[-1]
+    assert all(H is None for H in HG.bridge_gap(grays, Hs[0], wrong_end, FIBA))

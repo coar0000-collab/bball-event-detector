@@ -122,6 +122,7 @@ class Result:
             "점수 변화 없는 성공 슛": len(self.unmatched_shots),
             "라인 근처 슛이 낀 변화": len(near),
             "라인 근처에서 틀림": sum(1 for p in near if not p.agree),
+            "라인 근처 사람 판정": sum(1 for p in near if any(s.get("line_call") for s in p.shots)),
             # 라인에서 충분히 떨어져 코트만으로 확실히 정한 것. 여기서 틀리면 추적·찍기·짝짓기 문제다.
             "확실한 판정": len(judged) - len(near),
             "확실한 판정 일치": sum(1 for p in judged if p not in near and p.agree),
@@ -139,7 +140,7 @@ class Result:
                 "슛 시각": ", ".join(str(s.get("time") or s.get("t_sec")) for s in p.shots),
                 "구역": ", ".join(str(s.get("zone_kr", "")) for s in p.shots),
                 "3점 라인까지(m)": s0.get("margin_m", ""), "라인 근처": s0.get("near_line", ""),
-                "자유투 자리": s0.get("ft_spot", ""),
+                "라인 판정": s0.get("line_call", ""), "자유투 자리": s0.get("ft_spot", ""),
             })
         for s in self.unmatched_shots:
             out.append({"점수판 시각": "", "팀": s.get("team"), "점수판": "", "코트": shot_points(s), "일치": "-",
