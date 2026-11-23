@@ -101,3 +101,24 @@ def test_check_replay_shot_after_event():
     rep = dict(shot(22.5, "away", 2), replay="True")
     res = SC.check(events, [rep])
     assert res.pairs[0].shots == [rep] and res.summary()["일치"] == 1
+
+
+def test_correction_revert_is_not_a_score():
+    """기록원이 잠깐 1점 내렸다가 되돌리면(실제 영상 87.5s) 그 +1 은 자유투가 아니다."""
+    events = [ev(60, "home", 2), ev(85, "home", -1, "correction"), ev(87.5, "home", 1), ev(120, "home", 1)]
+    fixed = SC.resolve_corrections(events)
+    assert [e["flag"] for e in fixed] == ["ok", "correction", "revert", "ok"]
+    assert events[2]["flag"] == "ok"  # 원본은 그대로
+    assert SC.resolve_corrections(fixed) == fixed  # 이미 정리된 CSV 에 다시 해도 같다
+    s = SC.check(events, [shot(59, "home", 2), shot(119, "home", 1, zone="FT")]).summary()
+    assert s["점수판 변화"] == 2 and s["일치"] == 2
+
+
+def test_correction_fixes_previous_score():
+    """+3 을 넣었다가 -1 로 고치면 +2 득점, +2 를 넣었다가 -2 로 지우면 득점 없음."""
+    events = [ev(10, "away", 3), ev(18, "away", -1, "correction"), ev(40, "home", 2), ev(45, "home", -2, "correction")]
+    fixed = SC.resolve_corrections(events)
+    assert [(e["delta"], e["flag"]) for e in fixed] == [(2, "ok"), ("-1", "merged"), ("2", "reverted"), ("-2", "merged")]
+    assert SC.resolve_corrections(fixed) == fixed
+    s = SC.check(events, [shot(9, "away", 2)]).summary()
+    assert s["점수판 변화"] == 1 and s["일치"] == 1

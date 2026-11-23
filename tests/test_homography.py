@@ -126,3 +126,41 @@ def test_tracker_cut_to_other_basket_needs_anchor():
         assert Hr is not None and trk.last_inliers >= 80
         r = HG.TrackResult(Hr, sc, "recovered")
     assert err(r.H, Hb2) < 3
+
+
+def _one_line_scene():
+    """줌인해서 흰 선(사이드라인) 하나만 보이는 화면. 나머지 라인은 지운다."""
+    import cv2
+
+    frame, Htrue = make_scene()
+    mask = np.zeros(frame.shape[:2], np.uint8)
+    seg = HG.project(Htrue, HG.densify([(0, 15), (14, 15)], 0.2)).astype(np.int32)
+    cv2.polylines(mask, [seg], False, 255, 9)
+    return np.where(mask[..., None] > 0, frame, np.full_like(frame, 90)), Htrue
+
+
+@pytest.mark.parametrize("offset", [(7, -6), (-12, 8)])
+def test_refine_does_not_collapse_onto_one_line(offset):
+    """실제 중계에서 선 하나만 보일 때 코트 전체가 그 선으로 쪼그라든 H 가 일치율 0.9~1.0 으로 통과했다 (예전 코드: 370~480 px 틀림)."""
+    one, Htrue = _one_line_scene()
+    Hbad = np.array([[1, 0, offset[0]], [0, 1, offset[1]], [0, 0, 1]], float) @ Htrue
+    Hr, score, (n_vis, n_good) = HG.refine_homography(one, Hbad, FIBA, return_support=True)
+    assert 0.6 <= HG.key_area(Hr) / HG.key_area(Hbad) <= 1.67
+    pts = np.array([[5.8, 5.05], [5.8, 9.95], [14, 0], [8.3, 7.5]])
+    assert np.linalg.norm(HG.project(Hr, pts) - HG.project(Htrue, pts), axis=1).mean() < 20
+    # 보이는 라인 줄 대부분이 안 맞으므로 추적기는 좌표를 내지 않는다
+    assert n_vis >= 10 and n_good < 0.6 * n_vis
+
+
+def test_tracker_does_not_emit_on_one_line_frame():
+    f0, H0 = make_scene()
+    one, _ = _one_line_scene()
+    trk = HG.CourtTracker(H0, f0, FIBA)
+    r = trk.update(one)
+    assert r.H is None and r.status in ("coast", "cut")
+
+
+def test_line_support_full_scene():
+    frame, Htrue = make_scene()
+    _, score, (n_vis, n_good) = HG.refine_homography(frame, Htrue, FIBA, return_support=True)
+    assert score > 0.8 and n_good >= 0.9 * n_vis

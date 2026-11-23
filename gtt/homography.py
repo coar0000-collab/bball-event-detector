@@ -144,6 +144,59 @@ def line_mask(frame: np.ndarray) -> np.ndarray:
     return mask
 
 
+def _line_elements(spec: CourtSpec = FIBA) -> list[tuple[str, np.ndarray]]:
+    """코트 라인을 한 줄씩(베이스라인, 사이드라인, 키 세 변, 코너 직선, 아크 …) 나눈 것. 줄마다 맞았는지 따로 본다."""
+    L, W = spec.length, spec.width
+    m, kw, c, ce, kl = W / 2, spec.key_width / 2, spec.corner_offset, spec.corner_straight_end, spec.key_length
+    el = {"baseline_L": [(0, 0), (0, W)], "baseline_R": [(L, 0), (L, W)], "side_far": [(0, 0), (L, 0)],
+          "side_near": [(0, W), (L, W)], "halfcourt": [(L / 2, 0), (L / 2, W)]}
+    polys = court_polylines(spec)
+    for sd in ("L", "R"):
+        fx = (lambda x: x) if sd == "L" else (lambda x: L - x)
+        el[f"{sd}_key_a"] = [(fx(0), m - kw), (fx(kl), m - kw)]
+        el[f"{sd}_key_b"] = [(fx(0), m + kw), (fx(kl), m + kw)]
+        el[f"{sd}_ft"] = [(fx(kl), m - kw), (fx(kl), m + kw)]
+        el[f"{sd}_corner_a"] = [(fx(0), m - c), (fx(ce), m - c)]
+        el[f"{sd}_corner_b"] = [(fx(0), m + c), (fx(ce), m + c)]
+        el[f"{sd}_arc"] = polys[f"{sd}_three"][2:-2]
+    return [(k, densify(v, 0.2)) for k, v in el.items()]
+
+
+def key_area(H: np.ndarray, spec: CourtSpec = FIBA) -> float:
+    """양쪽 키(페인트존)를 화면에 투영한 넓이(부호 있음, px²). 코트 전체가 선 하나로 쪼그라든 H 는 0 에 가깝다."""
+    tot = 0.0
+    for sd, sgn in (("L", 1.0), ("R", -1.0)):  # 오른쪽 키는 좌우가 뒤집힌 순서라 부호를 맞춘다
+        q = project(H, court_polylines(spec)[f"{sd}_key"])
+        x, y = q[:, 0], q[:, 1]
+        tot += sgn * 0.5 * float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    return tot
+
+
+def _area_ok(H: np.ndarray, A0: float, spec: CourtSpec, lo: float, hi: float) -> bool:
+    A = key_area(H, spec)
+    return A0 != 0 and A * A0 > 0 and lo <= A / A0 <= hi
+
+
+def line_support(dist: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, tol: float = 4.0,
+                 min_pts: int = 10, good: float = 0.4) -> tuple[int, int]:
+    """화면에 보이는 코트 라인 줄 수와, 그중 실제 흰 선과 good 비율 이상 겹치는 줄 수.
+
+    전체 일치율 하나로는 틀린 정합(예: 키를 하프코트 근처 선에 겹침)도 0.5~0.65 가 나온다. 맞는 H 라면 보이는 줄
+    대부분이 각자 선과 겹치고, 틀린 H 는 몇 줄만 우연히 겹친다."""
+    h, w = dist.shape
+    n_vis = n_good = 0
+    for _, pts in _line_elements(spec):
+        uv = project(H, pts)
+        ok = (uv[:, 0] >= 5) & (uv[:, 0] < w - 6) & (uv[:, 1] >= 5) & (uv[:, 1] < h - 6)
+        if ok.sum() < min_pts:
+            continue
+        n_vis += 1
+        ui = np.round(uv[ok]).astype(int)
+        if float(np.mean(dist[ui[:, 1], ui[:, 0]] <= tol)) >= good:
+            n_good += 1
+    return n_vis, n_good
+
+
 def refine_homography(
     frame: np.ndarray,
     H: np.ndarray,
@@ -151,21 +204,32 @@ def refine_homography(
     search_px: int = 12,
     iterations: int = 10,
     min_matches: int = 30,
-) -> tuple[np.ndarray, float]:
+    return_support: bool = False,
+):
     """현재 H 로 투영한 코트 라인을 실제 흰 라인 픽셀에 맞춰 다듬는다.
 
     투영된 라인 점마다 주변 search_px 안의 라인 픽셀 무게중심(=라인 중심)으로 끌어당긴 뒤
     H 를 다시 맞추는 과정을 반복한다 (mean-shift 방식).
     반환: (다듬은 H, 라인 일치율 0~1). 일치율 = 투영한 라인 점 중 실제 라인 위(±4px)에 있는 비율.
+    return_support=True 면 (H, 일치율, (보이는 줄 수, 맞은 줄 수)).
+
+    실제 중계에서 끌려온 점이 모두 흰 선 하나 위에 있으면 코트 전체가 그 선으로 쪼그라든 H 가 나와 일치율 0.9~1.0 으로
+    통과한 적이 있다. 그래서 끌려온 점이 한 직선 위에만 있으면 그 단계를 버리고, 키 투영 넓이가 입력의 0.6~1.67배를
+    벗어나는 결과는 받지 않는다.
     """
     mask = (line_mask(frame) > 0).astype(np.float32)
     h, w = mask.shape
+    dist = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
+
+    def out(Hx, sc):
+        return (Hx, sc, line_support(dist, Hx, spec)) if return_support else (Hx, sc)
+
+    court_pts = np.concatenate([densify(p, 0.2) for p in court_polylines(spec).values()])
     if mask.sum() < min_matches:
-        return H, 0.0
+        return out(H, 0.0)
     xs = np.tile(np.arange(w, dtype=np.float32), (h, 1))
     ys = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
-    dist = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
-    court_pts = np.concatenate([densify(p, 0.2) for p in court_polylines(spec).values()])
+    A0 = key_area(H, spec)
     best_H, best_score = H, _line_score(dist, project(H, court_pts), w, h)
     cur = H
     # 넓은 창으로 크게 당긴 뒤 창을 줄여 가며 정밀하게 맞춘다 (coarse-to-fine)
@@ -186,6 +250,10 @@ def refine_homography(
             if near.sum() < min_matches:
                 break
             src = court_pts[ok][near]
+            # 끌려온 코트 점이 거의 한 직선 위에만 있으면 H 가 정해지지 않는다(쪼그라듦) → 멈춘다
+            sv = np.linalg.svd(src - src.mean(axis=0), compute_uv=False)
+            if sv[1] < 0.08 * sv[0]:
+                break
             target = np.stack([sx[ui[near, 1], ui[near, 0]], sy[ui[near, 1], ui[near, 0]]], axis=1) / c[near, None]
             newH, _ = cv2.findHomography(src, target.astype(np.float64), 0)
             if newH is None:
@@ -195,16 +263,16 @@ def refine_homography(
             keep = res <= max(2.0, 2.5 * float(np.median(res)))
             if keep.sum() >= min_matches:
                 newH, _ = cv2.findHomography(src[keep], target[keep].astype(np.float64), 0)
-            if newH is None:
+            if newH is None or not _area_ok(newH, A0, spec, 0.6, 1.67):
                 break
             move = float(np.mean(np.linalg.norm(project(newH, src) - project(cur, src), axis=1)))
             cur = newH
             if move < 0.2:
                 break
     score = _line_score(dist, project(cur, court_pts), w, h)
-    if score >= best_score - 0.02:  # 일치율이 눈에 띄게 나빠지지 않았으면 채택
+    if score >= best_score - 0.02 and _area_ok(cur, A0, spec, 0.6, 1.67):  # 일치율이 눈에 띄게 나빠지지 않았으면 채택
         best_H, best_score = cur, score
-    return best_H, best_score
+    return out(best_H, best_score)
 
 
 def _line_score(dist: np.ndarray, uv: np.ndarray, w: int, h: int, tol: float = 4.0) -> float:
@@ -291,12 +359,16 @@ class CourtTracker:
 
     def __init__(self, H0: np.ndarray, frame0: np.ndarray, spec: CourtSpec = FIBA, refine_every: int = 1,
                  min_score: float = 0.5, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None,
-                 keyframe_score: float = 0.6, max_jump_px: float = 15.0, weak_inliers: int = 100):
+                 keyframe_score: float = 0.6, max_jump_px: float = 15.0, weak_inliers: int = 100,
+                 min_good_lines: int = 2, min_line_frac: float = 0.6):
         """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
         0.36~0.47 이었으므로 0.5. keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
         max_jump_px: 라인 정합이 화면 이동으로 예측한 위치에서 이보다 많이 끌고 가면 다른 선(다른 종목 선, 반대쪽 키)에
         붙은 것으로 보고 받지 않는다. weak_inliers: 화면 간 변환의 맞은 점이 이보다 적으면 빠른 패닝으로 보고
-        샘플 사이 프레임들로 이어서 다시 구한다."""
+        샘플 사이 프레임들로 이어서 다시 구한다.
+        min_good_lines, min_line_frac: 화면에 보이는 코트 라인 줄 가운데 실제 흰 선과 겹치는 줄이 min_good_lines 줄 이상이고
+        min_line_frac 비율 이상이어야 좌표를 낸다. 실제 중계에서 일치율 0.5~0.65 화면의 절반이 1~4 m 틀렸는데, 틀린 화면은
+        몇 줄만 우연히 겹친다."""
         self.spec = spec
         self.H = H0.copy()
         self.prev = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
@@ -308,6 +380,9 @@ class CourtTracker:
         self.max_jump_px = max_jump_px
         self.weak_inliers = weak_inliers
         self.sure_score = 0.8
+        self.min_good_lines = min_good_lines
+        self.min_line_frac = min_line_frac
+        self.last_support = (0, 0)  # (보이는 줄, 맞은 줄)
         self._fast = False
         self.n = 0
         self.lost = False
@@ -392,15 +467,16 @@ class CourtTracker:
         self.n += 1
         score = float("nan")
         if self.refine_every and self.n % self.refine_every == 0:
-            Hr, score = refine_homography(frame, self.H, self.spec)
-            sure = score >= self.sure_score
+            Hr, score, sup = refine_homography(frame, self.H, self.spec, return_support=True)
+            self.last_support = sup
+            sure = score >= self.sure_score and self.supported(sup)
             if self._jump(self.H, Hr, frame.shape) > self.max_jump_px and not sure:
                 # 화면 이동으로 예측한 자리에서 멀리 끌려갔는데 라인도 확실히 맞지 않는다 → 다른 선(반대쪽 키, 다른 종목 선)에
                 # 붙었을 수 있다. 예측을 믿고 좌표는 내지 않는다. (라인이 거의 다 맞으면 흐린 패닝 뒤의 정상 보정으로 본다)
                 self.coast_n += 1
                 return TrackResult(None, score, "coast")
             self.H = Hr
-            if score < self.min_score or (self._fast and not sure):
+            if score < self.min_score or not self.supported(sup) or (self._fast and not sure):
                 # 빠른 패닝(흐림) 중에는 라인이 확실히 맞을 때만 좌표를 낸다
                 self.coast_n += 1
                 return TrackResult(None, score, "coast")
@@ -408,6 +484,11 @@ class CourtTracker:
                 self._add_keyframe(gray, self.H)
         self.coast_n = 0
         return TrackResult(self.H.copy(), score, "ok")
+
+    def supported(self, sup: tuple[int, int]) -> bool:
+        """보이는 코트 라인 줄 대부분이 실제 선과 겹치는가 (line_support 결과)."""
+        n_vis, n_good = sup
+        return n_good >= self.min_good_lines and n_good >= self.min_line_frac * n_vis
 
     def relocalize(self, frame: np.ndarray, min_inliers: int = 40) -> tuple[np.ndarray | None, float]:
         """놓친 뒤 현재 화면을 키프레임들과 맞춰 H 를 다시 찾는다. (H, 라인 일치율) 또는 (None, 0).
@@ -440,7 +521,11 @@ class CourtTracker:
         if best[0] is None or best[1] < min_inliers:
             return None, 0.0
         self.last_inliers = best[1]
-        H, score = refine_homography(frame, best[0] / best[0][2, 2], self.spec)
+        H, score, sup = refine_homography(frame, best[0] / best[0][2, 2], self.spec, return_support=True)
+        self.last_support = sup
+        if not self.supported(sup):
+            # 다시 찾은 자리의 라인이 대부분 안 겹친다 → 믿지 않는다 (일치율을 0 으로 낮춰 받는 쪽이 버리게)
+            score = min(score, 0.0)
         return H, score
 
     def reset(self, H: np.ndarray, frame: np.ndarray) -> None:
