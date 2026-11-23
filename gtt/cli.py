@@ -236,7 +236,8 @@ def _load_calib(path: str) -> tuple[np.ndarray, dict]:
 
 def cmd_track_court(a):
     spec = _spec(a.spec)
-    H0, d = _load_calib(a.calib)
+    calibs = a.calib if isinstance(a.calib, list) else [a.calib or "configs/calib.json"]
+    H0, d = _load_calib(calibs[0])
     v = Video(a.video)
     start = a.start if a.start is not None else float(d.get("t_sec") or 0.0)
     frame0 = v.frame_at(start)
@@ -252,31 +253,44 @@ def cmd_track_court(a):
             pass
     sm = HG.StaticMask.from_frames(samples)
     overlay = sm.mask(frame0.shape[:2])
-    trk = HG.CourtTracker(H0, frame0, spec, refine_every=a.refine_every, overlay_mask=overlay)
+    trk = HG.CourtTracker(H0, frame0, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score)
+    # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
+    for c in calibs[1:]:
+        Hc, dc = _load_calib(c)
+        try:
+            trk.add_anchor(v.frame_at(float(dc.get("t_sec") or 0.0)), Hc)
+        except ValueError:
+            print(f"경고: {c} 의 시각 프레임을 못 읽어 기준에서 뺌", file=sys.stderr)
+    print(f"기준 화면(캘리브레이션) {len(trk.anchors)}개", file=sys.stderr)
     times, Hs, scores, status = [start], [H0], [1.0], ["calib"]
-    last_good = H0
-    lost_since = None
-    for t, frame in v.iterate(step=a.step, start=start + a.step, end=a.end):
-        r = trk.update(frame)
-        if r.status == "ok":
-            last_good = r.H
-            lost_since = None
-        elif r.status == "coast":
-            pass  # 화면 이동은 따라가는 중. 라인이 다시 보이면 저절로 ok 로 돌아온다.
-        else:
-            if lost_since is None:
-                lost_since = t
-            # 리플레이가 끝나면 본 카메라로 돌아온다 → 잘 맞았던 순간(키프레임)들과 맞춰 보고, 안 되면 마지막 정상 H 로 라인 정합
+    last_good, last_good_gray = H0, cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
+
+    def strong(Hr, sc):
+        return Hr is not None and trk.last_inliers >= 80 and sc >= trk.min_score
+
+    for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
+        if t <= start:
+            continue
+        r = trk.update(frame, between)
+        if r.status == "coast" and trk.coast_n % 10 == 0:
+            # 오래 어긋나 있으면(2초) 기준 화면·키프레임과 맞춰 본다: 틀린 곳(반대쪽 골대 등)에 붙어 있었다면 여기서 바로잡힌다
             Hr, sc = trk.relocalize(frame)
-            # 키프레임과 특징점이 아주 많이 맞으면 (라인이 흐려 일치율이 낮아도) 받아들인다
-            strong = Hr is not None and trk.last_inliers >= 80 and sc >= trk.min_score
-            if not strong and (Hr is None or sc < a.recover_score):
-                Hr, sc = HG.refine_homography(frame, last_good, spec)
-            if strong or sc >= a.recover_score:
+            if strong(Hr, sc):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
-                last_good = Hr
-                lost_since = None
+        elif r.status in ("cut", "lost"):
+            # 화면 전환(리플레이·광고) 뒤: 기준 화면·키프레임과 맞춰 다시 찾는다
+            Hr, sc = trk.relocalize(frame)
+            if not strong(Hr, sc) and (Hr is None or sc < a.recover_score):
+                # 마지막으로 잘 맞던 화면과 거의 같은 화면으로 돌아왔을 때만 그 H 에서 라인 정합 (멀리 이동한 화면에 억지로 맞추지 않음)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                F, n = HG.frame_to_frame(last_good_gray, gray, trk.orb, trk.matcher, mask=overlay, return_inliers=True)
+                Hr, sc = (None, 0.0) if F is None or n < 80 else HG.refine_homography(frame, F @ last_good, spec)
+            if strong(Hr, sc) or (Hr is not None and sc >= a.recover_score):
+                trk.reset(Hr, frame)
+                r = HG.TrackResult(Hr, sc, "recovered")
+        if r.status in ("ok", "recovered"):
+            last_good, last_good_gray = r.H, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         times.append(t)
         Hs.append(r.H if r.H is not None else np.full((3, 3), np.nan))
         scores.append(r.line_score)
@@ -285,7 +299,7 @@ def cmd_track_court(a):
             print(f"{fmt_time(t)} 상태={r.status} 라인일치={r.line_score:.2f}", file=sys.stderr)
     np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status), spec=spec.name)
     ok = sum(s in ("ok", "recovered", "calib") for s in status)
-    print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개)")
+    print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번)")
 
 
 class _CourtLookup:
@@ -619,7 +633,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = add("track-court", cmd_track_court, "팬·줌 카메라를 따라 프레임별 코트 변환 계산")
     q.add_argument("--video", required=True)
-    q.add_argument("--calib", default="configs/calib.json")
+    q.add_argument("--calib", action="append", default=None,
+                   help="캘리브레이션 JSON. 여러 번 주면 첫 번째에서 시작하고 나머지(예: 반대쪽 골대 화면)는 다시 찾기 기준으로 씀")
+    q.add_argument("--min-score", type=float, default=0.5, help="라인 일치율이 이보다 낮으면 좌표를 내지 않음")
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
     q.add_argument("--start", type=float, default=None)
     q.add_argument("--end", type=float, default=None)

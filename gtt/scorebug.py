@@ -45,8 +45,37 @@ class ScorebugConfig:
 
 
 # ---------------------------------------------------------------- 숫자 분리
-def segment_digits(crop: np.ndarray, min_height_ratio: float = 0.4) -> list[np.ndarray]:
-    """점수 영역에서 숫자 글리프들을 왼쪽부터 잘라 정규화(GLYPH_W x GLYPH_H)해 돌려준다."""
+def _split_blob(g: np.ndarray, k: int) -> list[np.ndarray]:
+    """붙은 숫자 덩어리를 k 개로 나눈다. 대략 같은 폭으로 자르되, 자르는 자리는 근처에서 글자 픽셀이 가장 적은 열."""
+    h, w = g.shape
+    if k <= 1:
+        return [g]
+    cols = (g > 0).sum(axis=0).astype(np.float32)
+    cuts, prev = [], 0
+    for j in range(1, k):
+        c0 = int(round(j * w / k))
+        lo, hi = max(prev + 1, c0 - w // (4 * k)), min(w - 1, c0 + w // (4 * k))
+        c = lo + int(np.argmin(cols[lo:hi + 1])) if hi > lo else c0
+        cuts.append(c)
+        prev = c
+    parts = []
+    for a, b in zip([0] + cuts, cuts + [w]):
+        part = g[:, a:b]
+        ys = np.where(part.any(axis=1))[0]
+        xs = np.where(part.any(axis=0))[0]
+        if len(ys) and len(xs):
+            parts.append(part[ys[0]:ys[-1] + 1, xs[0]:xs[-1] + 1])
+    return parts
+
+
+def segment_digits(crop: np.ndarray, min_height_ratio: float = 0.4, templates: "DigitTemplates | None" = None,
+                   n_expected: int | None = None) -> list[np.ndarray]:
+    """점수 영역에서 숫자 글리프들을 왼쪽부터 잘라 정규화(GLYPH_W x GLYPH_H)해 돌려준다.
+
+    붙어 버린 숫자(예: '44' 처럼 가로획이 옆 숫자에 닿음)는 한 덩어리로 잡히므로 나눈다.
+    몇 개로 나눌지는 templates 가 있으면 나눈 조각들이 가장 확실하게 읽히는 쪽, n_expected(등록할 때 아는 자릿수)가
+    있으면 그 수에 맞게, 둘 다 없으면 폭으로 정한다.
+    """
     if crop.size == 0:
         return []
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
@@ -64,14 +93,35 @@ def segment_digits(crop: np.ndarray, min_height_ratio: float = 0.4) -> list[np.n
         x, y, w, h, area = stats[i]
         if h < min_height_ratio * H or h > 0.98 * H or area < 15:
             continue
-        if w > 1.5 * h:  # 가로로 긴 덩어리(밑줄·테두리)는 숫자가 아님
+        if w > 3.6 * h:  # 아주 가로로 긴 덩어리(밑줄·테두리)는 숫자가 아님. 숫자 2~3개가 붙은 것은 남긴다
             continue
         boxes.append((x, y, w, h, i))
     boxes.sort()
+    blobs = [(lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255 for x, y, w, h, i in boxes]
+    ks = [1] * len(blobs)
+    if n_expected is not None and 0 < len(blobs) < n_expected:
+        # 등록할 때: 모자란 만큼 가장 넓은 덩어리를 나눈다
+        j = int(np.argmax([b.shape[1] for b in blobs]))
+        ks[j] = n_expected - len(blobs) + 1
+    elif n_expected is None:
+        for j, b in enumerate(blobs):
+            h, w = b.shape
+            opts = [k for k in (1, 2, 3) if 0.3 * h <= w / k <= 1.3 * h]
+            if len(opts) <= 1:
+                ks[j] = opts[0] if opts else 1
+                continue
+            if templates is not None and templates.samples:
+                def conf(k):
+                    parts = _split_blob(b, k)
+                    return min(templates.classify(normalize_glyph(p))[1] for p in parts) if len(parts) == k else -1.0
+                scored = {k: conf(k) for k in opts}
+                best = max(scored, key=scored.get)
+                ks[j] = 1 if 1 in scored and scored[1] >= scored[best] - 0.05 else best
+            else:
+                ks[j] = 1 if w <= 1.25 * h else int(np.clip(round(w / (0.9 * h)), 1, 3))
     glyphs = []
-    for x, y, w, h, i in boxes:
-        g = (lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255
-        glyphs.append(normalize_glyph(g))
+    for b, k in zip(blobs, ks):
+        glyphs += [normalize_glyph(part) for part in _split_blob(b, k)]
     return glyphs
 
 
@@ -145,7 +195,7 @@ class DigitTemplates:
 
 def learn(templates: DigitTemplates, crop: np.ndarray, value: str) -> bool:
     """사람이 알려준 값(예: '47')으로 crop 의 글리프를 템플릿에 추가. 글리프 수가 안 맞으면 False."""
-    glyphs = segment_digits(crop)
+    glyphs = segment_digits(crop, n_expected=len(value))
     if len(glyphs) != len(value):
         return False
     for ch, g in zip(value, glyphs):
@@ -161,7 +211,7 @@ class Reading:
 
 
 def read_number(crop: np.ndarray, templates: DigitTemplates, max_digits: int = 3, min_conf: float = 0.15) -> Reading:
-    glyphs = segment_digits(crop)
+    glyphs = segment_digits(crop, templates=templates)
     if not glyphs or len(glyphs) > max_digits:
         return Reading(None, "", 0.0)
     out, confs = [], []

@@ -83,3 +83,46 @@ def test_shot_from_pixels():
     u, v = HG.court_to_image(Htrue, 1.575 + 7.4, 7.5)
     x, y = HG.image_to_court(Htrue, u, v)
     assert classify_shot(x, y, side="left").points == 3
+
+
+def _broadcast(t, mirror=False):
+    """합성 중계 한 장면 (bench 와 같은 카메라). mirror=True 면 반대쪽 골대 쪽 화면(가운데선 대칭으로 패닝)."""
+    import cv2
+
+    from gtt import bench
+
+    top, T = bench._court_texture(0)
+    Hc = bench._camera(t, top.shape[1::-1])
+    if mirror:  # 화면 가운데를 코트 반대쪽으로 옮긴 카메라
+        S = np.array([[1, 0, 2 * 640 - 2 * HG.court_to_image(Hc @ T, 14, 7.5)[0]], [0, 1, 0], [0, 0, 1]], float)
+        Hc = S @ Hc
+    frame = cv2.warpPerspective(top, Hc, (1280, 720), borderValue=(40, 40, 40))
+    return frame, Hc @ T
+
+
+def test_tracker_cut_to_other_basket_needs_anchor():
+    """실제 중계 126초처럼 반대쪽 골대로 확 넘어간 뒤: 기준 화면이 없으면 엉뚱하게 맞추지 않고, 있으면 정확히 다시 찾는다."""
+    from gtt import cli
+
+    fa, Ha = _broadcast(3.0)
+    fb, Hb = _broadcast(3.0, mirror=True)
+    fb2, Hb2 = _broadcast(3.5, mirror=True)
+    pts = np.array([[5.8, 5.05], [22.2, 9.95], [14, 7.5], [26.4, 7.5]])
+
+    def err(H, Ht):
+        return float(np.linalg.norm(HG.project(H, pts) - HG.project(Ht, pts), axis=1).mean())
+
+    # 기준 화면 없이: 다시 찾기 실패는 괜찮지만, 틀린 H 를 내면 안 된다
+    trk = HG.CourtTracker(Ha, fa, FIBA)
+    r = trk.update(fb2)
+    if r.H is not None:
+        assert err(r.H, Hb2) < 3
+    # 반대쪽 골대 화면을 기준(앵커)으로 넣으면 다시 찾는다
+    trk = HG.CourtTracker(Ha, fa, FIBA)
+    trk.add_anchor(fb, Hb)
+    r = trk.update(fb2)
+    if r.H is None:
+        Hr, sc = trk.relocalize(fb2)
+        assert Hr is not None and trk.last_inliers >= 80
+        r = HG.TrackResult(Hr, sc, "recovered")
+    assert err(r.H, Hb2) < 3

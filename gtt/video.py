@@ -43,6 +43,30 @@ class Video:
                     return
             i += every
 
+    def iterate_between(self, step: float = 0.2, start: float = 0.0, end: float | None = None, sub: float = 1 / 30):
+        """iterate 와 같지만 (t, frame, between) 을 준다. between: 이전 샘플과 이 샘플 사이를 sub 초 간격으로 뽑은 프레임들.
+        빠른 패닝 때 샘플 사이를 이어 붙이는 데 쓴다. 중간 프레임은 어차피 디코딩되므로 색 변환 비용만 든다."""
+        every = max(1, int(round(step * self.fps)))
+        sub_every = max(1, int(round(sub * self.fps)))
+        i = int(round(start * self.fps))
+        last = int(round(end * self.fps)) if end is not None else (self.n_frames or 10**12)
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        between: list[np.ndarray] = []
+        while i <= last:
+            ok, frame = self.cap.read()
+            if not ok:
+                return
+            yield i / self.fps, frame, between
+            between = []
+            for k in range(1, every):
+                if not self.cap.grab():
+                    return
+                if k % sub_every == 0:
+                    ok, f = self.cap.retrieve()
+                    if ok:
+                        between.append(f)
+            i += every
+
     def close(self) -> None:
         self.cap.release()
 

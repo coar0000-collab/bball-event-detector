@@ -83,6 +83,16 @@ gtt track-court --video videos/game1.mp4 --calib configs/calib.json --step 0.2
 gtt overlay --video videos/game1.mp4 --t 1500 --track out/court_track.npz --out out/check_1500.png
 ```
 
+**양쪽 골대를 미리 맞춰 두세요.** 중계 카메라가 하프코트를 휙 가로지르면 반대쪽 골대 화면이 좌우만 바뀐 비슷한 모양이라, 기준이 없으면 다시 찾기가 어렵습니다. 왼쪽·오른쪽 골대가 잘 보이는 시각에서 각각 `calibrate`를 해 두고 `--calib`을 여러 번 주면, 첫 번째에서 출발하고 나머지는 놓쳤을 때 다시 찾는 기준으로 씁니다.
+
+```bash
+gtt calibrate --video videos/game1.mp4 --t 120 --refine --out configs/calib_right.json
+gtt calibrate --video videos/game1.mp4 --t 15 --refine --out configs/calib_left.json
+gtt track-court --video videos/game1.mp4 --calib configs/calib_right.json --calib configs/calib_left.json --step 0.2
+```
+
+빠른 패닝 때는 샘플 사이 프레임까지 이어서 카메라 이동을 계산하고, 화면이 흐린 동안이나 라인 일치율이 0.5(`--min-score`)보다 낮을 때는 좌표를 내지 않습니다(틀린 좌표보다 빈칸이 낫다). 득점 장면에 코트가 비어 있으면 그 시각으로 `calibrate`를 한 번 더 하고 `--calib`에 추가해 다시 돌리면 됩니다.
+
 `overlay` 이미지에서 노란 선이 라인에 겹쳐 있으면 추적이 잘 된 것입니다. 리플레이·클로즈업 뒤에 비슷한 화면으로 돌아오면 자동으로 다시 맞추고, 못 맞추면 그 구간은 코트 좌표가 비어 있습니다(그때는 그 시각으로 `calibrate`를 다시 하고 `track-court --start`로 이어서 실행).
 
 ### 4. 슛 위치 기록과 2점/3점 판정
@@ -96,7 +106,9 @@ gtt click-shots --video videos/game1.mp4 --track out/court_track.npz --out out/g
 | space | 재생/멈춤 |
 | a / d, j / l | ±1초, ±5초 |
 | , / . | 한 프레임 앞뒤 |
-| 클릭 | 릴리스 순간 슈터 두 발 가운데 → 화면에 2점/3점, 라인까지 거리 표시 |
+| 클릭 | 릴리스 순간 슈터 두 발 가운데 → 화면에 2점/3점, 라인까지 거리 표시 (오른쪽 위에 4배 확대 보기) |
+| Shift+클릭 | 같은 발을 다른 프레임에서 한 번 더 찍어 평균 (NEAR LINE 일 때) |
+| f / r | 자유투 표시 / 리플레이 화면에서 찍은 슛 표시 |
 | m / x | 성공 / 실패로 저장 |
 | t | 홈/원정 전환 |
 | z | 마지막 기록 삭제 |

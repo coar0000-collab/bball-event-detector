@@ -290,7 +290,13 @@ class CourtTracker:
     """
 
     def __init__(self, H0: np.ndarray, frame0: np.ndarray, spec: CourtSpec = FIBA, refine_every: int = 1,
-                 min_score: float = 0.2, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None):
+                 min_score: float = 0.5, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None,
+                 keyframe_score: float = 0.6, max_jump_px: float = 15.0, weak_inliers: int = 100):
+        """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
+        0.36~0.47 이었으므로 0.5. keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
+        max_jump_px: 라인 정합이 화면 이동으로 예측한 위치에서 이보다 많이 끌고 가면 다른 선(다른 종목 선, 반대쪽 키)에
+        붙은 것으로 보고 받지 않는다. weak_inliers: 화면 간 변환의 맞은 점이 이보다 적으면 빠른 패닝으로 보고
+        샘플 사이 프레임들로 이어서 다시 구한다."""
         self.spec = spec
         self.H = H0.copy()
         self.prev = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
@@ -298,15 +304,32 @@ class CourtTracker:
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
         self.refine_every = refine_every
         self.min_score = min_score
+        self.keyframe_score = keyframe_score
+        self.max_jump_px = max_jump_px
+        self.weak_inliers = weak_inliers
+        self.sure_score = 0.8
+        self._fast = False
         self.n = 0
         self.lost = False
+        self.coast_n = 0  # 연속 coast 횟수
+        self.chained = 0  # 샘플 사이 프레임으로 이어 붙인 횟수 (통계)
+        self.last_inliers = 0
         # overlay_mask: 미리 찾은 방송 그래픽 마스크(특징점 찾을 곳 = 255). 없으면 최근 프레임으로 그때그때 찾는다.
         self.overlay_mask = overlay_mask
         self.static = StaticMask() if (use_static_mask and overlay_mask is None) else None
         if self.static is not None:
             self.static.update(self.prev)
         self.keyframes: list[tuple] = []  # (keypoints, descriptors, H)
-        self._add_keyframe(self.prev, self.H)
+        self.anchors: list[tuple] = []  # 사람이 맞춘 캘리브레이션 화면들 — 지워지지 않는 키프레임
+        self._court_pts = np.concatenate([densify(p, 0.5) for p in court_polylines(spec).values()])
+        self.add_anchor(frame0, H0)
+
+    def add_anchor(self, frame: np.ndarray, H: np.ndarray) -> None:
+        """캘리브레이션한 화면(예: 왼쪽 골대, 오른쪽 골대)을 다시 찾기 기준으로 넣는다."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        kp, des = self.orb.detectAndCompute(gray, self._mask(gray))
+        if des is not None and len(kp) >= 50:
+            self.anchors.append((kp, des, H.copy()))
 
     def _mask(self, gray):
         if self.overlay_mask is not None:
@@ -319,13 +342,46 @@ class CourtTracker:
             self.keyframes.append((kp, des, H.copy()))
             self.keyframes = self.keyframes[-max_keep:]
 
-    def update(self, frame: np.ndarray) -> TrackResult:
-        """한 프레임 진행. 라인 일치율이 낮으면 H 를 내지 않되(lost) 화면 이동은 계속 따라가다가(코스팅)
-        라인이 다시 잘 보이면 그대로 이어 간다. 화면 전환으로 이동을 못 구하면(cut) 다시 찾기 전까지 멈춘다."""
+    def _jump(self, Ha: np.ndarray, Hb: np.ndarray, shape) -> float:
+        """두 H 로 투영한 코트 점들이 화면 안에서 평균 몇 px 떨어지는지."""
+        h, w = shape[:2]
+        a = project(Ha, self._court_pts)
+        b = project(Hb, self._court_pts)
+        vis = (a[:, 0] >= 0) & (a[:, 0] < w) & (a[:, 1] >= 0) & (a[:, 1] < h)
+        return float(np.linalg.norm(a[vis] - b[vis], axis=1).mean()) if vis.any() else 0.0
+
+    def _motion(self, gray, between) -> np.ndarray | None:
+        """이전 샘플 → 지금 화면 변환. 직접 구한 변환이 약하면(빠른 패닝·흐림) 샘플 사이 프레임들을 차례로 이어 붙인다."""
+        mask = self._mask(gray)
+        F, n = frame_to_frame(self.prev, gray, self.orb, self.matcher, mask=mask, return_inliers=True)
+        self.last_inliers = n
+        self._fast = False
+        if (F is None or n < self.weak_inliers) and between:
+            G = np.eye(3)
+            g0 = self.prev
+            for b in list(between) + [gray]:
+                g1 = b if b.ndim == 2 else cv2.cvtColor(b, cv2.COLOR_BGR2GRAY)
+                Fi = frame_to_frame(g0, g1, self.orb, self.matcher, mask=mask)
+                if Fi is None:
+                    G = None
+                    break
+                G = Fi @ G
+                g0 = g1
+            if G is not None:
+                self.chained += 1
+                self._fast = True
+                return G / G[2, 2]
+        return F
+
+    def update(self, frame: np.ndarray, between=None) -> TrackResult:
+        """한 샘플 진행. between: 이전 샘플과 이 샘플 사이의 프레임들(빠른 패닝일 때만 쓴다).
+
+        라인 일치율이 낮으면 H 를 내지 않되(coast) 화면 이동은 계속 따라가다가, 라인이 다시 잘 보이면 그대로 이어 간다.
+        화면 전환으로 이동을 못 구하면(cut) 다시 찾기 전까지 멈춘다."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if self.static is not None:
             self.static.update(gray)
-        F = None if self.lost else frame_to_frame(self.prev, gray, self.orb, self.matcher, mask=self._mask(gray))
+        F = None if self.lost else self._motion(gray, between)
         self.prev = gray
         if F is None:
             was_lost = self.lost
@@ -336,11 +392,21 @@ class CourtTracker:
         self.n += 1
         score = float("nan")
         if self.refine_every and self.n % self.refine_every == 0:
-            self.H, score = refine_homography(frame, self.H, self.spec)
-            if score < self.min_score:
+            Hr, score = refine_homography(frame, self.H, self.spec)
+            sure = score >= self.sure_score
+            if self._jump(self.H, Hr, frame.shape) > self.max_jump_px and not sure:
+                # 화면 이동으로 예측한 자리에서 멀리 끌려갔는데 라인도 확실히 맞지 않는다 → 다른 선(반대쪽 키, 다른 종목 선)에
+                # 붙었을 수 있다. 예측을 믿고 좌표는 내지 않는다. (라인이 거의 다 맞으면 흐린 패닝 뒤의 정상 보정으로 본다)
+                self.coast_n += 1
                 return TrackResult(None, score, "coast")
-            if score >= 0.35 and self.n % 2 == 0:
+            self.H = Hr
+            if score < self.min_score or (self._fast and not sure):
+                # 빠른 패닝(흐림) 중에는 라인이 확실히 맞을 때만 좌표를 낸다
+                self.coast_n += 1
+                return TrackResult(None, score, "coast")
+            if score >= self.keyframe_score and self.n % 2 == 0:
                 self._add_keyframe(gray, self.H)
+        self.coast_n = 0
         return TrackResult(self.H.copy(), score, "ok")
 
     def relocalize(self, frame: np.ndarray, min_inliers: int = 40) -> tuple[np.ndarray | None, float]:
@@ -355,7 +421,11 @@ class CourtTracker:
         if d2 is None or len(kp2) < min_inliers:
             return None, 0.0
         best = (None, 0)
-        for kp1, d1, Hk in reversed(self.keyframes):
+        # 앵커 전부 + 최근 키프레임 10개 + 그 이전은 띄엄띄엄 (놓친 동안 매 샘플 호출되므로 비용을 묶어 둔다)
+        recent = list(reversed(self.keyframes))
+        older = recent[10:]
+        cands = list(self.anchors) + recent[:10] + older[:: max(1, len(older) // 14 + 1)]
+        for kp1, d1, Hk in cands:
             m = self.matcher.match(d1, d2)
             if len(m) < min_inliers:
                 continue
@@ -377,22 +447,26 @@ class CourtTracker:
         self.H = H.copy()
         self.prev = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.lost = False
+        self.coast_n = 0
 
 
-def frame_to_frame(prev_gray, gray, orb=None, matcher=None, min_inliers: int = 25, mask=None) -> np.ndarray | None:
-    """두 프레임 사이 화면 변환(3x3). 실패하면 None (화면 전환 가능성). mask: 특징점을 찾을 곳(255)."""
+def frame_to_frame(prev_gray, gray, orb=None, matcher=None, min_inliers: int = 25, mask=None,
+                   return_inliers: bool = False):
+    """두 프레임 사이 화면 변환(3x3). 실패하면 None (화면 전환 가능성). mask: 특징점을 찾을 곳(255).
+    return_inliers=True 면 (F, 맞은 점 수)."""
     orb = orb or make_orb()
     matcher = matcher or cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    fail = (None, 0) if return_inliers else None
     k1, d1 = orb.detectAndCompute(prev_gray, mask)
     k2, d2 = orb.detectAndCompute(gray, mask)
     if d1 is None or d2 is None or len(k1) < min_inliers or len(k2) < min_inliers:
-        return None
+        return fail
     matches = matcher.match(d1, d2)
     if len(matches) < min_inliers:
-        return None
+        return fail
     p1 = np.float32([k1[m.queryIdx].pt for m in matches])
     p2 = np.float32([k2[m.trainIdx].pt for m in matches])
     F, inl = cv2.findHomography(p1, p2, ROBUST, 3.0)
     if F is None or inl is None or int(inl.sum()) < min_inliers:
-        return None
-    return F
+        return fail
+    return (F, int(inl.sum())) if return_inliers else F

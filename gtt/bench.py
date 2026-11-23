@@ -62,7 +62,9 @@ SHOTS = [
 ]
 GLITCHES = [(9.0, 9.3), (29.0, 29.3), (51.0, 51.3)]  # 이 동안 홈 점수가 +10 으로 잘못 보임
 SCORE_LAG = 1.5  # 슛 → 스코어버그 반영
-FAST_PANS = [(0.0, 3.0), (52.0, 54.0)]  # 속공 따라가는 빠른 팬 (블러 심함)
+FAST_PANS = [(0.0, 3.0), (52.0, 54.0), (60.0, 61.5)]  # 속공 따라가는 빠른 팬 (블러 심함)
+# 하프코트를 가로지르는 휙 패닝 (실제 B-LAB 중계 126초에서 추적이 깨진 장면): 1초 동안 반대쪽 골대 쪽으로 넘어갔다가 돌아온다
+WHIPS = [(52.0, 53.0, 60.0, 61.0)]  # (넘어가기 시작, 다 넘어감, 돌아오기 시작, 다 돌아옴)
 START = (31, 27)
 
 
@@ -75,7 +77,13 @@ def _camera(t: float, size) -> np.ndarray:
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
     dst = np.float32([[150, 120], [1130, 120], [1400, 700], [-120, 700]])
     zoom = 1.0 + 0.45 * (0.5 - 0.5 * math.cos(2 * math.pi * t / 22))
-    center = np.float32([640 + 260 * math.sin(2 * math.pi * t / 14), 420])
+    cx = 640 + 260 * math.sin(2 * math.pi * t / 14)
+    for a, b, c, d in WHIPS:  # 휙 패닝: 화면 가운데를 코트 반대쪽(가운데선 기준 대칭)으로 옮긴다
+        w = min(1.0, max(0.0, (t - a) / (b - a))) if t < c else 1.0 - min(1.0, max(0.0, (t - c) / (d - c)))
+        if a <= t < d:
+            w = 0.5 - 0.5 * math.cos(math.pi * w)  # 부드럽게 가속·감속
+            cx = cx + w * (1280 - 2 * cx)
+    center = np.float32([cx, 420])
     dst = (dst - center) * zoom + [640, 400] + [0, 10 * math.sin(2 * math.pi * t / 11)]
     return cv2.getPerspectiveTransform(src, np.float32(dst))
 
@@ -220,6 +228,35 @@ def _camera_truth(t: float, seed: int) -> tuple[np.ndarray, bool]:
     return Hc @ T, k is not None
 
 
+def _display_times(s: dict) -> list[float]:
+    """슛 릴리스 장면이 화면에 나오는 시각: 본 화면(그 순간이 리플레이가 아니면) 먼저, 그다음 그 장면을 다시 보여 주는 리플레이."""
+    shows = [] if _in(s["t"], REPLAYS) else [s["t"]]
+    shows += [s["t"] + d for (a, b), d in zip(REPLAYS, REPLAY_DELAY) if d is not None and a <= s["t"] + d < b]
+    return shows
+
+
+def _calibrate_at(video: Path, t: float, seed: int, path: Path, names=None) -> bool:
+    """사람이 calibrate 창에서 하던 일: t초 화면에 보이는 코트 랜드마크를 손 떨림(1.5px)만큼 틀리게 찍고 흰 라인에 맞춘다."""
+    from .video import Video
+
+    lm = landmarks(FIBA)
+    rng = np.random.default_rng(seed + int(t * 10))
+    Ht, _ = _camera_truth(t, seed)
+    pts = {}
+    for n in names or lm:
+        u, v = HG.court_to_image(Ht, *lm[n])
+        if 0 <= u < W and 0 <= v < H_IMG:
+            pts[n] = [float(u + rng.normal(0, 1.5)), float(v + rng.normal(0, 1.5))]
+    if len(pts) < 4:
+        return False
+    H0, _ = HG.fit_homography(pts, FIBA)
+    vv = Video(video)
+    H0, _ = HG.refine_homography(vv.frame_at(t), H0, FIBA)
+    vv.close()
+    path.write_text(json.dumps({"spec": "FIBA", "t_sec": t, "image_points": pts, "H_court_to_image": H0.tolist()}), encoding="utf-8")
+    return True
+
+
 def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, review: bool = True) -> list[dict]:
     """사람(나중에는 검출 모델)이 슛마다 발 위치를 화면에서 찍었다고 보고 코트로 판정한다.
 
@@ -243,11 +280,8 @@ def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, 
         return u + rng.normal(0, noise_px), v + rng.normal(0, noise_px), rep
 
     for s in shots:
-        # 언제 화면에 나오나: 본 화면(그 순간이 리플레이가 아니면) 먼저, 아니면 그 장면을 다시 보여 주는 리플레이
-        shows = [] if _in(s["t"], REPLAYS) else [s["t"]]
-        shows += [s["t"] + d for (a, b), d in zip(REPLAYS, REPLAY_DELAY) if d is not None and a <= s["t"] + d < b]
         c = None
-        for td in shows:
+        for td in _display_times(s):
             c = click(td, s)
             if c is not None:
                 break
@@ -316,25 +350,28 @@ def run(out_dir: str | Path, seconds: float = 90.0, seed: int = 0, step: float =
                                            "잘못 읽은 것": [f"{t:.1f}s {team} +{d}" for t, team, d in fp]}}
 
     # 코트: 첫 프레임에서 점 찍기 + 라인 정합 (calibrate --refine)
-    lm = landmarks(FIBA)
-    rng = np.random.default_rng(seed)
-    H0t = truth[0]
-    names = [n for n in ("L_baseline_bot", "L_baseline_top", "L_ft_bot", "L_ft_top", "mid_sideline_bot", "mid_sideline_top",
-                         "L_corner3_arc_top", "center")]
-    pts = {}
-    for n in names:
-        u, v = HG.court_to_image(H0t, *lm[n])
-        if 0 <= u < W and 0 <= v < H_IMG:
-            pts[n] = [float(u + rng.normal(0, 1.5)), float(v + rng.normal(0, 1.5))]
-    H0, _ = HG.fit_homography(pts, FIBA)
-    from .video import Video
-    vv = Video(video)
-    H0, _ = HG.refine_homography(vv.frame_at(0.0), H0, FIBA)
-    vv.close()
-    (out / "calib.json").write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "image_points": pts, "H_court_to_image": H0.tolist()}),
-                                    encoding="utf-8")
+    _calibrate_at(video, 0.0, seed, out / "calib.json", names=("L_baseline_bot", "L_baseline_top", "L_ft_bot", "L_ft_top",
+                                                               "mid_sideline_bot", "mid_sideline_top", "L_corner3_arc_top", "center"))
     track = out / "court_track.npz"
-    cli.main(["track-court", "--video", str(video), "--calib", str(out / "calib.json"), "--step", str(step), "--out", str(track)])
+    calibs = ["--calib", str(out / "calib.json")]
+    cli.main(["track-court", "--video", str(video), *calibs, "--step", str(step), "--out", str(track)])
+    # 득점 장면인데 코트가 안 잡힌 화면(예: 확 당겨 찍은 리플레이)은 사람이 그 화면을 한 번 캘리브레이션해서 기준으로 넣고 다시 돈다
+    from .cli import _CourtLookup
+    look = _CourtLookup(None, str(track))
+    extra = 0
+    for s in shots:
+        if not s["made"]:
+            continue
+        for td in _display_times(s)[:1]:
+            rep = _camera_truth(td, seed)[1]
+            same = [dt for dt in (0.0, -0.5, 0.5, -1.0) if _camera_truth(td + dt, seed)[1] == rep]  # 같은 화면(본/리플레이)만
+            if all(look.at(td + dt, tol=0.05) is None for dt in same):
+                c = out / f"calib_extra{extra + 1}.json"
+                if _calibrate_at(video, td, seed, c):
+                    extra += 1
+                    calibs += ["--calib", str(c)]
+    if extra:
+        cli.main(["track-court", "--video", str(video), *calibs, "--step", str(step), "--out", str(track)])
     z = np.load(track)
     probe = np.array([[5.8, 5.05], [5.8, 9.95], [14, 0], [14, 15], [8.3, 7.5], [22.2, 7.5], [1.575, 7.5], [26.425, 7.5]])
     cnt = {"정확(<3px)": 0, "약간 어긋남(3~8px)": 0, "틀림(>=8px)": 0, "좌표 없음": 0}
@@ -379,7 +416,7 @@ def run(out_dir: str | Path, seconds: float = 90.0, seed: int = 0, step: float =
                     break
         recover.append(rec)
     n_main = sum(cnt.values())
-    res["코트 추적"] = {"본 카메라 샘플": n_main, **cnt, "중앙값 오차(px)": round(float(np.median(errs)), 2) if errs else None,
+    res["코트 추적"] = {"본 카메라 샘플": n_main, "추가 캘리브레이션(사람)": extra, **cnt, "중앙값 오차(px)": round(float(np.median(errs)), 2) if errs else None,
                      "리플레이 중 틀린 좌표": int(replay_wrong), "리플레이 중 맞은 좌표": int(replay_right), "리플레이 뒤 복구(초)": recover}
 
     # 핵심 지표: 점수판을 보지 않고 코트(슛 위치)로만 정한 점수가 점수판(OCR 결과) 변화와 맞는가
