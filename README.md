@@ -1,0 +1,155 @@
+# bball-event-detector (garbage-time-tracker)
+
+농구 중계 영상에서 **스코어버그(점수판)를 읽어 점수 변화 이벤트를 뽑고**, **코트 라인을 기준으로 슛 위치가 2점인지 3점인지(코너·45도·탑)** 판정하는 도구입니다. GARBAGE TIME PROJECT의 자동 기록 파이프라인 1단계입니다.
+
+지금 되는 것
+
+| 기능 | 명령 | 결과 |
+| --- | --- | --- |
+| 스코어버그 점수 인식 | `scorebug-setup` → `scorebug-learn` → `scorebug-read` | `out/score_events.csv` (언제, 어느 팀이 +1/+2/+3) |
+| 코트 라인 캘리브레이션 | `calibrate` | `configs/calib.json` (화면 ↔ 코트 좌표 변환) |
+| 팬·줌 카메라 추적 | `track-court` | `out/court_track.npz` (프레임별 코트 변환) |
+| 라인 확인 | `overlay` | 영상 위에 코트 라인을 겹친 이미지 |
+| 슛 위치 기록 + 2점/3점 판정 | `click-shots` | `out/shots.csv` (시각, 팀, 등번호, 성공/실패, 2점/3점, 구역, 라인까지 거리) |
+| 기록지 점검 | `check-records` | 기록지 엑셀의 이상한 값 목록 |
+| 설치 점검 | `demo` | 합성 중계로 전체 흐름을 돌린 결과와 걸린 시간 |
+| 기록지와 비교 | `compare` | `out/compare.xlsx` (팀·선수별 기록지 vs 자동, 3점 구역 제안) + 구역을 채운 기록지 사본 |
+| 코트 점수 검증 | `score-check` | 슛 위치(코트)로 정한 자유투/2점/3점이 스코어버그 +1/+2/+3 과 맞는 비율 |
+| 정확도 벤치 | `bench` | 빠른 팬·줌, 리플레이, 방송 로고, 밝은 조명, 라인 근처 슛을 넣은 합성 중계로 점수 인식·코트 추적·코트 점수 정확도 측정 |
+
+아직 안 되는 것: 슛을 사람이 클릭하지 않아도 자동으로 찾는 기능(공·림·선수 검출 모델)은 다음 단계입니다. `click-shots`로 쌓은 기록이 그 모델의 학습·평가 데이터가 됩니다.
+
+## 데스크톱 설치
+
+Python 3.10 이상이 필요합니다. (Windows는 [python.org](https://www.python.org/downloads/)에서 설치할 때 "Add python.exe to PATH" 체크)
+
+```bash
+git clone https://github.com/coar0000-collab/bball-event-detector.git
+cd bball-event-detector
+python -m venv .venv
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
+source .venv/bin/activate
+
+pip install -e ".[dev]"
+pytest            # 테스트가 모두 통과하면 설치 완료
+gtt demo          # 영상 없이 합성 중계 60초로 전체 흐름 점검 (1분 이내)
+```
+
+`gtt demo`는 팬·줌하는 합성 중계 영상을 만들어 `scorebug-read` → `track-court` → `overlay` → `shot`을 실제 명령과 똑같이 돌리고, 정답과 비교한 결과와 걸린 시간(40분 경기 예상)을 보여 줍니다. 창에서 사람이 하던 단계(스코어버그 영역·숫자 등록, 코트 점 찍기)는 정답 좌표로 대신합니다. `out/demo/overlay_grid.png`에서 코트 라인이 맞게 겹쳤는지 볼 수 있습니다.
+
+영상 파일은 `videos/` 폴더에 두면 됩니다(깃에는 올라가지 않음). 유튜브 중계를 받을 때는 [yt-dlp](https://github.com/yt-dlp/yt-dlp)를 쓸 수 있습니다. **B-LAB 등 중계사 영상을 학습·서비스에 쓰려면 채널의 허락이 필요합니다.**
+
+```bash
+pip install yt-dlp
+yt-dlp -f "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[ext=mp4]" -o videos/game1.mp4 "<유튜브 주소>"
+```
+
+## 사용 순서
+
+아래 예시는 `videos/game1.mp4` 기준입니다. 시간(`--t`)은 초 단위입니다.
+
+### 1. 스코어버그 점수 인식
+
+```bash
+# (1) 점수 숫자 영역 지정: 창이 뜨면 왼쪽 팀 점수 숫자만 드래그 → Enter, 오른쪽 팀도 같은 방법
+gtt scorebug-setup --video videos/game1.mp4 --t 900 --home 고려대 --away 연세대
+
+# (2) 숫자 글꼴 등록: 화면에 나온 점수를 콘솔에 입력 (예: 47 52). 0~9가 다 나올 때까지
+gtt scorebug-learn --video videos/game1.mp4 --n 12
+
+# (3) 전체 경기 읽기 → 점수 변화 이벤트 CSV
+gtt scorebug-read --video videos/game1.mp4 --out out/game1_score_events.csv
+```
+
+결과 CSV의 `flag`가 `ok`면 정상(+1/+2/+3), `check`나 `correction`이면 판독 오류나 점수 정정일 수 있으니 확인합니다. `t_sec`는 스코어버그가 바뀐 시각이라 실제 슛보다 보통 1~5초 늦습니다. 엑셀에서 바로 열 수 있게 UTF-8(BOM)으로 저장합니다.
+
+### 2. 코트 라인 캘리브레이션
+
+```bash
+gtt calibrate --video videos/game1.mp4 --t 900 --refine
+```
+
+- 오른쪽 `court reference` 창의 **빨간 점**이 지금 찍을 지점입니다. 영상 창에서 같은 지점을 클릭하세요.
+- 안 보이는 지점은 `n`으로 건너뜁니다. 4개 이상 찍고 `f`를 누르면 노란 코트 라인이 겹쳐 보입니다.
+- 노란 선이 실제 라인과 맞으면 `s`로 저장합니다. 베이스라인 점만 찍는 것처럼 한 직선 위의 점만 고르면 안 됩니다.
+- 기본 규격은 FIBA(3점 6.75m, 코너 6.6m)입니다. 체육관 라인이 다르면 `gtt/court.py`의 `CourtSpec`에 규격을 추가하세요.
+
+### 3. 카메라를 따라가며 코트 변환 계산
+
+```bash
+gtt track-court --video videos/game1.mp4 --calib configs/calib.json --step 0.2
+gtt overlay --video videos/game1.mp4 --t 1500 --track out/court_track.npz --out out/check_1500.png
+```
+
+`overlay` 이미지에서 노란 선이 라인에 겹쳐 있으면 추적이 잘 된 것입니다. 리플레이·클로즈업 뒤에 비슷한 화면으로 돌아오면 자동으로 다시 맞추고, 못 맞추면 그 구간은 코트 좌표가 비어 있습니다(그때는 그 시각으로 `calibrate`를 다시 하고 `track-court --start`로 이어서 실행).
+
+### 4. 슛 위치 기록과 2점/3점 판정
+
+```bash
+gtt click-shots --video videos/game1.mp4 --track out/court_track.npz --out out/game1_shots.csv
+```
+
+| 키 | 동작 |
+| --- | --- |
+| space | 재생/멈춤 |
+| a / d, j / l | ±1초, ±5초 |
+| , / . | 한 프레임 앞뒤 |
+| 클릭 | 릴리스 순간 슈터 두 발 가운데 → 화면에 2점/3점, 라인까지 거리 표시 |
+| m / x | 성공 / 실패로 저장 |
+| t | 홈/원정 전환 |
+| z | 마지막 기록 삭제 |
+| q | 종료 |
+
+라인에서 30cm 안쪽이거나, 그 자리에서 발 위치를 3px 잘못 찍었을 때 흔들리는 거리(`margin_sigma_m`)의 2배 안쪽이면 `NEAR LINE!`이 뜨고 CSV의 `near_line`이 `True`가 됩니다. 카메라에서 먼 코너는 1px 이 코트에서 5cm 넘게 되므로 더 넓게 잡힙니다. 이 슛들은 사람이 한 번 더 보는 것을 권합니다.
+
+슛을 저장하기 전에 숫자키로 슈터 등번호를 치면 같이 저장되고, 이 번호로 기록지 선수와 연결됩니다. `t`(홈/원정)는 스코어버그 **왼쪽/오른쪽** 팀이라는 뜻이며, 기록지의 홈/원정과 다르더라도 `compare`가 최종 스코어로 알아서 맞춥니다.
+
+슛 하나만 빠르게 판정하려면:
+
+```bash
+gtt shot --track out/court_track.npz --t 1500 --u 812 --v 455
+```
+
+### 5. 기록지 엑셀과 비교
+
+기록지 엑셀(`D3 기록지_1R-11R.xlsx` 형식)은 개인 기록이 들어 있으니 `data/` 폴더처럼 깃에 올라가지 않는 곳에 두세요(`.gitignore`에 `*.xlsx` 포함).
+
+```bash
+# 기준 데이터 점검: 득점 합계 불일치, 리바운드 열 뒤바뀜, 성공 > 시도 등
+gtt check-records --records "data/D3 기록지_1R-11R.xlsx"
+
+# 하루치 중계(여러 경기)를 읽은 점수 이벤트와 슛 기록을 경기별로 비교
+gtt compare --records "data/D3 기록지_1R-11R.xlsx" --game D101,D102,D103 \
+    --score-events out/day1_score_events.csv --shots out/day1_shots.csv \
+    --out out/compare.xlsx --apply-zones "out/D3 기록지_구역채움.xlsx"
+```
+
+- 하루 중계 하나에 여러 경기가 들어 있어도 됩니다. 점수가 0:0 근처로 돌아가는 지점에서 경기를 나누고, 기록지 최종 스코어와 가장 가까운 구간을 그 경기로 고릅니다. 스코어버그 왼쪽 팀이 기록지의 홈인지 원정인지도 스코어로 정합니다(`--left-team`으로 직접 지정 가능).
+- 보고서 엑셀 시트: **팀 비교**(득점, 스코어버그 +1/+2/+3 횟수, 슛 기록의 2점/3점/구역별 시도·성공), **선수 비교**(등번호를 입력한 슛만), **3점 구역 제안**. 차이가 있는 줄은 빨간색입니다.
+- **3점 구역 제안**: 기록지 [3점슛_구역체크]의 3점 시도(공식 문자중계 순서)와 영상에서 클릭한 3점 시도를 팀별로 짝지어 코너/45도/탑을 제안합니다. 결과(성공/실패), 그 순간 스코어버그 점수와 '직전 스코어', 등번호가 맞을수록 확실하게 짝짓습니다.
+- `--apply-zones`를 주면 상태가 "일치"인 제안만 기록지 **사본**의 구역 칸에 채웁니다. 원본은 건드리지 않고, 이미 구역이 있는 칸은 덮어쓰지 않으며, 드롭다운·수식은 그대로 둡니다.
+- 스코어버그 +2 횟수에는 자유투 2개가 한 번에 반영된 경우가 섞일 수 있어, 2점 성공 수와 정확히 같지 않을 수 있습니다. 득점 합계와 +3 횟수가 가장 믿을 만한 비교 지표입니다.
+
+## 코드 구성
+
+| 파일 | 내용 |
+| --- | --- |
+| `gtt/court.py` | 코트 규격(FIBA/NBA), 랜드마크, 2점/3점·구역 판정 |
+| `gtt/homography.py` | 화면↔코트 변환, 흰 라인 자동 정합, 팬·줌 카메라 추적 |
+| `gtt/scorebug.py` | 스코어버그 숫자 분리·템플릿 인식, 점수 변화 이벤트 검출 |
+| `gtt/records.py` | D3 기록지 엑셀 읽기와 이상값 점검 |
+| `gtt/compare.py` | 경기 구간 찾기, 팀·선수 비교, 3점 구역 짝짓기, 보고서·구역 채우기 |
+| `gtt/cli.py` | 명령줄 도구 |
+| `gtt/demo.py` | `gtt demo`: 합성 중계로 전체 흐름 점검 |
+| `gtt/bench.py` | `gtt bench`: 어려운 장면을 넣은 합성 중계로 정확도 측정 (같은 seed 면 같은 영상) |
+| `gtt/scorecheck.py` | 코트로 정한 점수 vs 스코어버그 점수 변화 짝짓기·일치율 |
+| `tests/` | 합성 영상으로 만든 테스트 |
+
+## 다음 단계
+
+1. 실제 중계 영상 1경기로 `scorebug-read` 결과를 기록지와 비교해 정확도 확인
+2. `click-shots`로 3경기 정도 슛 위치를 쌓아, 공·림 검출 모델(YOLO 계열) 학습 데이터로 사용
+3. 스코어버그 점수 변화 시각 근처에서 공이 림을 통과하는 장면을 자동으로 찾아 슛 위치를 자동 제안
+4. 스코어버그 점수 변화로 찾은 성공 슛 시각을 click-shots에 미리 띄워, 클릭할 장면으로 바로 이동

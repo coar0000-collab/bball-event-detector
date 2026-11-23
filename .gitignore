@@ -9,3 +9,6 @@ videos/
 *.mkv
 *.webm
 .pytest_cache/
+# 기록지 등 개인 기록이 든 엑셀은 올리지 않음
+*.xlsx
+data/
