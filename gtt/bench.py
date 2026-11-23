@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -24,7 +25,10 @@ from . import scorebug as SB
 from .court import FIBA, classify_shot, landmarks
 from .demo import BUG_ROIS, FPS, H_IMG, W, _court_texture, _draw_bug
 
-REPLAYS = [(17.0, 21.5), (38.0, 42.5), (70.0, 74.0)]
+# 리플레이 구간. REPLAY_DELAY 가 있으면 '몇 초 전 장면'을 그 득점 자리를 중심으로 다시 보여 준다(놓친 득점 리플레이).
+# 없으면 앞서 지나간 장면의 다른 각도 클로즈업. 리플레이 동안 스코어버그는 숨는다.
+REPLAYS = [(17.0, 20.0), (22.0, 24.0), (38.0, 42.5), (70.0, 74.0)]
+REPLAY_DELAY = [None, 4.0, None, None]
 RIM = 1.575
 R3 = 6.75
 
@@ -44,7 +48,7 @@ SHOTS = [
     (4.5, "FG", (0.5, -6.85), True),     # 코너 3점 (사이드라인 쪽 0.25m 바깥)
     (11.0, "FG", _wing(0.3), True),      # 45도 3점
     (15.0, "FG", (4.0, 1.0), False),     # 페인트 실패
-    (19.0, "FG", (3.0, -1.5), True),     # 리바운드 뒤 골밑 (리플레이 중이라 점수는 늦게 보임 — 슛 자체는 본 카메라에서 안 보임)
+    (18.5, "FG", (3.0, -1.5), True),     # 리플레이가 나가는 동안 난 골밑 득점: 본 화면에는 안 나오고, 22~24초 리플레이로 다시 나온다
     (24.5, "FG", _top(-0.15), True),     # 3점 라인 바로 안쪽 (2점)
     (29.5, "FG", _top(0.12), True),      # 3점 라인 바로 바깥 (3점)
     (34.0, "FG", _wing(-0.2, -1), True), # 45도 라인 바로 안쪽 (2점)
@@ -76,11 +80,11 @@ def _camera(t: float, size) -> np.ndarray:
     return cv2.getPerspectiveTransform(src, np.float32(dst))
 
 
-def _replay_camera(t: float, size, k: int) -> np.ndarray:
-    """리플레이: 다른 위치·각도의 클로즈업."""
+def _replay_camera(t: float, size, k: int, focus_px=None) -> np.ndarray:
+    """리플레이: 다른 위치·각도의 클로즈업. focus_px(탑다운 그림 px)가 있으면 그곳을 화면 가운데 근처에 둔다."""
     w, h = size
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-    cx, cy = (w * (0.2 + 0.55 * k), h * 0.5)
+    cx, cy = focus_px if focus_px is not None else (w * (0.2 + 0.55 * k), h * 0.5)
     a = math.radians(10 + 5 * k)
     s = 2.4
     pts = []
@@ -116,6 +120,26 @@ def _resolve_shots(seconds: float, size, T) -> list[dict]:
     return out
 
 
+def _replay_focus(k: int, size, T) -> tuple | None:
+    """놓친 득점 리플레이가 비출 자리(탑다운 그림 px): 그 리플레이가 보여 주는 시간대에 난 성공 슛 위치."""
+    d = REPLAY_DELAY[k]
+    if d is None:
+        return None
+    a, b = REPLAYS[k]
+    for s in _resolve_shots(1e9, size, T):
+        if s["made"] and a - d <= s["t"] <= b - d:
+            return tuple(HG.court_to_image(T, s["x"], s["y"]))
+    return None
+
+
+def _frame_camera(t: float, size, T) -> tuple[np.ndarray, int | None, float]:
+    """t초 화면의 카메라(탑다운 그림 → 화면), 리플레이 번호(본 화면이면 None), 화면에 나오는 장면의 시각."""
+    k = next((j for j, (a, b) in enumerate(REPLAYS) if a <= t < b), None)
+    if k is None:
+        return _camera(t, size), None, t
+    return _replay_camera(t - REPLAYS[k][0], size, k, _replay_focus(k, size, T)), k, t - (REPLAY_DELAY[k] or 0.0)
+
+
 def make_video(path: Path, seconds: float = 90.0, seed: int = 0) -> tuple[list, list, list]:
     """어려운 합성 중계를 쓰고 (프레임별 정답 H 또는 None(리플레이), 정답 점수 이벤트, 슛 목록)을 돌려준다."""
     top, T = _court_texture(seed)
@@ -139,13 +163,13 @@ def make_video(path: Path, seconds: float = 90.0, seed: int = 0) -> tuple[list, 
         while plan and plan[0][0] <= t:
             _, team, d = plan.pop(0)
             home, away = (home + d, away) if team == "home" else (home, away + d)
-        replay = next((k for k, (a, b) in enumerate(REPLAYS) if a <= t < b), None)
-        Hc = _replay_camera(t - REPLAYS[replay][0], size, replay) if replay is not None else _camera(t, size)
+        Hc, replay, ts = _frame_camera(t, size, T)
         frame = cv2.warpPerspective(top, Hc, (W, H_IMG), borderValue=(40, 40, 40))
         Ht = Hc @ T
-        movers = [(1 + (x0 + vx * t - 1) % 26, 1 + (y0 + vy * t - 1) % 13) for x0, y0, vx, vy in players]
+        # ts: 화면에 나오는 장면의 시각 (놓친 득점 리플레이면 몇 초 전)
+        movers = [(1 + (x0 + vx * ts - 1) % 26, 1 + (y0 + vy * ts - 1) % 13) for x0, y0, vx, vy in players]
         # 슈터: 릴리스 1초 전부터 0.5초 뒤까지 그 자리에 선다
-        movers += [(s["x"], s["y"]) for s in shots if s["t"] - 1.0 <= t <= s["t"] + 0.5]
+        movers += [(s["x"], s["y"]) for s in shots if s["t"] - 1.0 <= ts <= s["t"] + 0.5]
         for x, y in movers:
             u, v = HG.court_to_image(Ht, x, y)
             hgt = 70 * (2.4 if replay is not None else 1.0)
@@ -185,11 +209,24 @@ def _score_metrics(got, want, tol=1.5):
     return tp, fp
 
 
-def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int) -> list[dict]:
+_texture = lru_cache(maxsize=4)(_court_texture)
+
+
+def _camera_truth(t: float, seed: int) -> tuple[np.ndarray, bool]:
+    """t초 화면의 정답 H(코트 m → 화면 px)와 리플레이 여부. 리플레이도 같은 코트를 다른 각도로 찍은 화면이다."""
+    top, T = _texture(seed)
+    size = top.shape[1::-1]
+    Hc, k, _ = _frame_camera(t, size, T)
+    return Hc @ T, k is not None
+
+
+def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, review: bool = True) -> list[dict]:
     """사람(나중에는 검출 모델)이 슛마다 발 위치를 화면에서 찍었다고 보고 코트로 판정한다.
 
     noise_px: 발 위치를 찍을 때의 화면 오차(표준편차, px).
     ft_rule: "label" = 자유투인지는 사람이 f 로 표시 / "spot" = 자유투 자리에서 쏘면 무조건 자유투로 본다(위치만).
+    review: 라인 근처로 뜬 슛은 click-shots 에서처럼 앞뒤 프레임에서 발을 더 찍어(Shift+클릭) 평균한다.
+    리플레이 중에 난 슛은 리플레이 화면에서 찍는다(replay=True). 화면 밖이면 못 찍는다.
     """
     from .cli import _CourtLookup
     from .video import fmt_time
@@ -197,20 +234,55 @@ def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int) 
     look = _CourtLookup(None, str(track))
     rng = np.random.default_rng(seed + 100)
     rows = []
+
+    def click(t, s):
+        Ht, rep = _camera_truth(t, seed)
+        u, v = HG.court_to_image(Ht, s["x"], s["y"])
+        if not (0 <= u < W and 0 <= v < H_IMG):
+            return None
+        return u + rng.normal(0, noise_px), v + rng.normal(0, noise_px), rep
+
     for s in shots:
-        i = min(int(round(s["t"] * FPS)), len(truth) - 1)
-        if truth[i] is None:  # 리플레이 중: 본 카메라에 안 보임
+        # 언제 화면에 나오나: 본 화면(그 순간이 리플레이가 아니면) 먼저, 아니면 그 장면을 다시 보여 주는 리플레이
+        shows = [] if _in(s["t"], REPLAYS) else [s["t"]]
+        shows += [s["t"] + d for (a, b), d in zip(REPLAYS, REPLAY_DELAY) if d is not None and a <= s["t"] + d < b]
+        c = None
+        for td in shows:
+            c = click(td, s)
+            if c is not None:
+                break
+        if c is None:  # 어디에도 안 나온 슛은 찍을 수 없다
             continue
-        u, v = HG.court_to_image(truth[i], s["x"], s["y"])
-        u, v = u + rng.normal(0, noise_px), v + rng.normal(0, noise_px)
-        H = look.at(s["t"])
-        row = {"t_sec": s["t"], "time": fmt_time(s["t"]), "team": s["team"], "result": "MADE" if s["made"] else "MISSED",
-               "u": round(u, 1), "v": round(v, 1)}
+        u, v, rep = c
+        lag = td - s["t"]  # 리플레이면 실제 슛보다 늦게 나온다
+        H = look.at(td, tol=0.05)
         if H is None:
-            row.update({"points": "", "zone": "", "zone_kr": "", "near_line": ""})
+            # 릴리스 프레임에 코트가 없으면(click-shots 의 NO COURT) 슈터가 아직 서 있는 앞뒤 프레임에서 찍는다
+            for dt in (-0.5, 0.5, -1.0):
+                c2 = click(td + dt, s)
+                H2 = look.at(td + dt, tol=0.05)
+                if c2 is not None and c2[2] == rep and H2 is not None:
+                    u, v, _ = c2
+                    H = H2
+                    break
+        row = {"t_sec": td, "time": fmt_time(td), "team": s["team"], "result": "MADE" if s["made"] else "MISSED",
+               "u": round(u, 1), "v": round(v, 1), "replay": rep}
+        if H is None:
+            row.update({"points": "", "zone": "", "zone_kr": "", "near_line": "", "clicks": 0})
         else:
+            clicks = [(H, u, v)]
             call = HG.classify_click(H, u, v, FIBA, side=s["side"])
+            if review and call.near_line:
+                # 슈터는 릴리스 1초 전부터 0.5초 뒤까지 그 자리에 있다 → 같은 화면 종류(본/리플레이)의 앞뒤 추적 프레임에서 더 찍기
+                for dt in (-1.0, -0.5, 0.5):
+                    t2 = s["t"] + lag + dt
+                    H2 = look.at(t2, tol=0.05)
+                    c2 = click(t2, s)
+                    if H2 is not None and c2 is not None and c2[2] == rep:
+                        clicks.append((H2, c2[0], c2[1]))
+                call = HG.classify_clicks(clicks, FIBA, side=s["side"])
             row.update(call.as_dict())
+            row["clicks"] = len(clicks)
             if (ft_rule == "label" and s["kind"] == "FT") or (ft_rule == "spot" and call.ft_spot):
                 row.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
         rows.append(row)
@@ -277,8 +349,7 @@ def run(out_dir: str | Path, seconds: float = 90.0, seed: int = 0, step: float =
         if truth[i] is None:
             # 리플레이도 같은 코트를 다른 각도로 찍은 것이라, 좌표를 냈다면 그 화면에서 맞는지만 본다
             if has:
-                k = next(j for j, (a, b) in enumerate(REPLAYS) if a <= i / FPS < b)
-                Hr = _replay_camera(i / FPS - REPLAYS[k][0], size, k) @ T
+                Hr = _frame_camera(i / FPS, size, T)[0] @ T
                 pt = HG.project(Hr, probe)
                 vis = (pt[:, 0] > -50) & (pt[:, 0] < W + 50) & (pt[:, 1] > -50) & (pt[:, 1] < H_IMG + 50)
                 e = float(np.linalg.norm(HG.project(Hk, probe[vis]) - pt[vis], axis=1).mean()) if vis.any() else 99.0
@@ -316,14 +387,15 @@ def run(out_dir: str | Path, seconds: float = 90.0, seed: int = 0, step: float =
     events = SC.read_csv(ev_csv)
     court = {}
     for noise in (0.0, 3.0, 6.0):
-        for rule in ("label", "spot"):
-            rows = _label_shots(shots, truth, track, noise, rule, seed)
+        for rule, review in (("label", False), ("label", True), ("spot", True)):
+            rows = _label_shots(shots, truth, track, noise, rule, seed, review=review)
             sm = SC.check(events, rows).summary()
-            key = f"발 위치 오차 {noise:g}px, 자유투 {'라벨' if rule == 'label' else '위치만'}"
+            key = (f"발 위치 오차 {noise:g}px, 자유투 {'라벨' if rule == 'label' else '위치만'}, "
+                   f"라인 근처 {'다시 찍어 평균' if review else '한 번만'}")
             court[key] = {k: sm[k] for k in ("점수판 변화", "일치", "일치율(전체 변화 중)", "확실한 판정", "확실한 판정 일치",
                                              "라인 근처 슛이 낀 변화", "라인 근처에서 틀림", "슛 없이 바뀐 점수", "점수 변화 없는 성공 슛",
                                              "점수 비교")}
-            if noise == 3.0 and rule == "label":
+            if noise == 3.0 and rule == "label" and review:
                 cli._write_csv(str(out / "shots_court.csv"), rows)
     res["코트로 계산한 점수 vs 점수판"] = court
     (out / "bench.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")

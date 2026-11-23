@@ -75,3 +75,29 @@ def test_classify_click_uncertainty():
     # 라인에서 멀면 확실한 판정
     mid = HG.classify_click(H, *HG.court_to_image(H, 5.0, 7.5), FIBA, side="left")
     assert mid.points == 2 and not mid.near_line
+
+
+def test_check_late_scorebug_keeps_order():
+    """실제 중계처럼 점수판이 16초 늦게 바뀌어도, 늦은 변화가 다음 슛을 가로채지 않는다."""
+    events = [ev(325.5, "home", 2), ev(329.0, "home", 3)]
+    shots = [shot(309.5, "home", 2), shot(327.0, "home", 3)]
+    res = SC.check(events, shots)
+    got = {p.event["t_sec"]: [x["t_sec"] for x in p.shots] for p in res.pairs}
+    assert got == {"325.5": ["309.5"], "329.0": ["327.0"]}
+    assert res.summary()["일치"] == 2
+
+
+def test_check_counts_shots_without_court_separately():
+    events = [ev(10, "home", 2), ev(20, "home", 3)]
+    shots = [shot(8, "home", ""), shot(18, "home", 3)]
+    s = SC.check(events, shots).summary()
+    assert s["짝지은 변화"] == 2 and s["코트 좌표 없음"] == 1
+    assert s["확실한 판정"] == 1 and s["확실한 판정 일치"] == 1 and s["일치율(짝지은 것 중)"] == 1.0
+
+
+def test_check_replay_shot_after_event():
+    """본 화면에서 놓친 득점을 리플레이(득점보다 늦게 나옴)에서 찍은 슛과 짝짓는다."""
+    events = [ev(20.0, "away", 2)]
+    rep = dict(shot(22.5, "away", 2), replay="True")
+    res = SC.check(events, [rep])
+    assert res.pairs[0].shots == [rep] and res.summary()["일치"] == 1

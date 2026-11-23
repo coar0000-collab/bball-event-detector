@@ -293,6 +293,16 @@ class _CourtLookup:
         self.fixed = _load_calib(calib)[0] if calib else None
         self.track = np.load(track, allow_pickle=False) if track else None
 
+    def nearest(self, t: float, tol: float = 0.6) -> tuple[np.ndarray | None, float]:
+        """(H, 그 H 가 계산된 시각과의 차이 초). 고정 캘리브레이션이면 차이 0."""
+        if self.track is not None:
+            times = self.track["times"]
+            i = int(np.argmin(np.abs(times - t)))
+            if abs(times[i] - t) <= tol and np.all(np.isfinite(self.track["H"][i])):
+                return self.track["H"][i], float(times[i] - t)
+            return None, 0.0
+        return self.fixed, 0.0
+
     def at(self, t: float, tol: float = 0.6) -> np.ndarray | None:
         if self.track is not None:
             times = self.track["times"]
@@ -342,14 +352,32 @@ def cmd_click_shots(a):
     call = None
     jersey = ""
     ft = False  # 자유투 모드 (f 로 켜고 끔)
-    state = {"click": None}
+    replay = False  # 리플레이 화면에서 찍은 슛 (r 로 켜고 끔)
+    clicks: list[tuple] = []  # 같은 슛을 여러 번 찍은 것 [(H, u, v)] — Shift+클릭으로 추가
+    state = {"click": None, "add": False}
+    h_cache: dict = {}
     win = "click-shots"
     cv2.namedWindow(win)
     s = 1.0
 
-    def on_mouse(ev, x, y, *_):
+    def on_mouse(ev, x, y, flags, *_):
         if ev == cv2.EVENT_LBUTTONDOWN:
             state["click"] = (x, y)
+            state["add"] = bool(flags & cv2.EVENT_FLAG_SHIFTKEY)
+
+    def court_at(t, frame):
+        """이 프레임의 코트 변환. 추적 샘플(예: 0.2초 간격) 사이 프레임이면 카메라가 그새 움직였을 수 있어
+        가장 가까운 샘플의 H 를 이 프레임의 흰 라인에 다시 맞춘다."""
+        key = round(t, 3)
+        if key not in h_cache:
+            H, dt = look.nearest(t)
+            if H is not None and abs(dt) > 0.5 / v.fps:
+                Hr, sc = HG.refine_homography(frame, H, spec)
+                if sc >= 0.3:
+                    H = Hr
+            h_cache.clear()
+            h_cache[key] = H
+        return h_cache[key]
 
     cv2.setMouseCallback(win, on_mouse)
     print(__SHOTS_HELP)
@@ -361,24 +389,38 @@ def cmd_click_shots(a):
             ok2 = v.cap.grab()
             if not (ok and ok2):
                 playing = False
-        H = look.at(t)
+        H = court_at(t, frame)
         if state["click"] is not None:
             u, vv = state["click"][0] / s, state["click"][1] / s
             point = (u, vv)
+            if not (state["add"] and clicks):
+                clicks = []
             state["click"] = None
             playing = False
             if H is not None:
-                call = HG.classify_click(H, u, vv, spec, side=a.side)
+                clicks.append((H.copy(), u, vv))
+                call = (HG.classify_clicks(clicks, spec, side=a.side) if len(clicks) > 1
+                        else HG.classify_click(H, u, vv, spec, side=a.side))
             else:
                 call = None
         view = frame.copy()
         if H is not None:
             HG.draw_court(view, H, spec, (0, 255, 255), 2)
+        zoom = None
         if point is not None:
             col = (0, 255, 0) if (call and call.points == 3) else (255, 160, 0)
-            cv2.circle(view, (int(point[0]), int(point[1])), 7, col, -1)
+            # 확대 보기: 찍은 자리 주변을 4배로 키워 발과 라인이 닿았는지 본다 (점 찍기 전 그림에서)
+            px, py, r = int(point[0]), int(point[1]), 30
+            hh, ww = view.shape[:2]
+            if r <= px < ww - r and r <= py < hh - r:
+                zoom = cv2.resize(view[py - r:py + r, px - r:px + r], (8 * r, 8 * r), interpolation=cv2.INTER_NEAREST)
+                cv2.drawMarker(zoom, (4 * r, 4 * r), col, cv2.MARKER_CROSS, 24, 1)
+            cv2.circle(view, (px, py), 7, col, -1)
         view, s = _fit_window(view)
-        info = f"{fmt_time(t)}  team={team}  no={jersey or '-'}  shots={len(rows)}" + ("  [FREE THROW]" if ft else "")
+        if zoom is not None and view.shape[0] > zoom.shape[0] + 100 and view.shape[1] > zoom.shape[1]:
+            view[100:100 + zoom.shape[0], view.shape[1] - zoom.shape[1]:] = zoom
+        info = (f"{fmt_time(t)}  team={team}  no={jersey or '-'}  shots={len(rows)}" + ("  [FREE THROW]" if ft else "")
+                + ("  [REPLAY]" if replay else "") + (f"  avg of {len(clicks)} clicks" if len(clicks) > 1 else ""))
         if H is None:
             info += "  [NO COURT - recalibrate]"
         _put(view, info, (10, 28), 0.65, (0, 255, 255))
@@ -387,6 +429,8 @@ def cmd_click_shots(a):
             _put(view, txt, (10, 58), 0.65, (0, 255, 0) if call.points == 3 else (255, 200, 0))
             if call.ft_spot and not ft:
                 _put(view, "FT spot: press f if this is a free throw", (10, 88), 0.6, (0, 200, 255))
+            elif call.near_line:
+                _put(view, "NEAR LINE: Shift+click the feet again (other frames) to average", (10, 88), 0.6, (0, 200, 255))
         cv2.imshow(win, view)
         key = cv2.waitKey(1 if playing else 30) & 0xFF
         if key == ord(" "):
@@ -396,7 +440,7 @@ def cmd_click_shots(a):
         elif key in (ord("a"), ord("d"), ord("j"), ord("l")):
             t = max(0.0, t + {ord("a"): -1, ord("d"): 1, ord("j"): -5, ord("l"): 5}[key])
             frame = v.frame_at(t)
-            point, call = None, None
+            point, call, clicks = None, None, []
         elif key == ord(","):
             t = max(0.0, t - 1 / v.fps)
             frame = v.frame_at(t)
@@ -407,6 +451,8 @@ def cmd_click_shots(a):
             team = "away" if team == "home" else "home"
         elif key == ord("f"):
             ft = not ft
+        elif key == ord("r"):
+            replay = not replay
         elif ord("0") <= key <= ord("9"):
             jersey = (jersey + chr(key))[-3:]
         elif key in (8, 127):  # Backspace
@@ -415,12 +461,13 @@ def cmd_click_shots(a):
             row = {"t_sec": round(t, 2), "time": fmt_time(t), "team": team, "no": jersey, "result": "MADE" if key == ord("m") else "MISSED",
                    "u": round(point[0], 1), "v": round(point[1], 1)}
             row.update(call.as_dict() if call else {"points": "", "zone": "", "zone_kr": "", "near_line": ""})
+            row.update({"replay": replay, "clicks": len(clicks)})
             if ft:
                 row.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
             rows.append(row)
             _write_csv(a.out, rows)
             print(f"기록: {row['time']} {team} #{jersey or '?'} {row['result']} {row.get('points')}점 {row.get('zone_kr')}")
-            point, call, jersey = None, None, ""
+            point, call, jersey, clicks = None, None, "", []
         elif key == ord("z") and rows:
             print(f"삭제: {rows.pop()}")
             _write_csv(a.out, rows)
@@ -438,6 +485,8 @@ __SHOTS_HELP = """
   숫자키로 슈터 등번호 입력 (Backspace 지우기, 모르면 비워 둠)
   m 성공으로 저장   x 실패로 저장   t 홈/원정(스코어버그 왼쪽/오른쪽 팀) 전환   z 마지막 기록 삭제   q 종료
   f 자유투 모드 켜기/끄기 (켜 있으면 1점·자유투로 저장, 자유투가 끝나면 다시 f 로 끄기)
+  NEAR LINE 이 뜨면: , . 로 한두 프레임 옮겨 Shift+클릭으로 같은 발을 더 찍으면 평균해서 다시 판정 (오른쪽 위 확대 보기 참고)
+  r 리플레이 표시 켜기/끄기 (본 화면에서 못 본 슛을 리플레이에서 찍을 때. 점수 변화와 짝지을 때 뒤로 더 넓게 찾음)
 """
 
 
@@ -623,7 +672,7 @@ def build_parser() -> argparse.ArgumentParser:
     q = add("score-check", cmd_score_check, "코트(슛 위치)로 정한 자유투/2점/3점이 스코어버그 점수 변화와 맞는지 측정")
     q.add_argument("--score-events", required=True, help="scorebug-read 결과 CSV (정답)")
     q.add_argument("--shots", required=True, help="click-shots 결과 CSV (또는 자동 슛 검출 결과)")
-    q.add_argument("--max-lag", type=float, default=8.0, help="슛 뒤 스코어버그가 바뀌기까지 최대 몇 초")
+    q.add_argument("--max-lag", type=float, default=20.0, help="슛 뒤 스코어버그가 바뀌기까지 최대 몇 초 (실제 중계에서 16초 지연도 있었음)")
     q.add_argument("--start", type=float, default=None)
     q.add_argument("--end", type=float, default=None)
     q.add_argument("--out", default="out/score_check.csv")

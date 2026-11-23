@@ -70,6 +70,26 @@ def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, si
     return call
 
 
+def classify_clicks(clicks, spec: CourtSpec = FIBA, side: str | None = None,
+                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3):
+    """같은 슛의 발 위치를 여러 프레임(또는 확대해서 여러 번) 찍은 것을 코트에서 평균해 판정한다.
+
+    clicks: [(H, u, v), ...] — 프레임마다 카메라가 움직여도 각자의 H 로 코트 좌표를 구한 뒤 평균한다.
+    찍기 오차는 서로 독립이라 n 번 찍으면 흔들림이 1/√n 로 준다. 라인 근처 슛을 확실히 가를 때 쓴다.
+    """
+    from .court import classify_shot
+
+    calls = [classify_click(H, u, v, spec, side=side, click_px=click_px, k=k, min_near_m=min_near_m) for H, u, v in clicks]
+    side = side or calls[0].side
+    x = float(np.mean([c.court_xy[0] for c in calls]))
+    y = float(np.mean([c.court_xy[1] for c in calls]))
+    call = classify_shot(x, y, spec, side=side)
+    sigma = float(np.sqrt(np.sum([c.margin_sigma ** 2 for c in calls]))) / len(calls)
+    call.margin_sigma = sigma
+    call.near_line = abs(call.margin) < max(min_near_m, k * sigma)
+    return call
+
+
 # ---------------------------------------------------------------- 그리기
 def render_topdown(spec: CourtSpec = FIBA, px_per_m: float = 40.0, margin_m: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
     """위에서 본 코트 그림과, 코트(m)→그림(px) 변환 행렬을 돌려준다. 테스트·디버그용."""
