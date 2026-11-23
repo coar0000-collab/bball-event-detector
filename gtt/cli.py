@@ -138,7 +138,14 @@ def cmd_scorebug_read(a):
             print(f"... {fmt_time(t)} 처리 중", file=sys.stderr)
     from .scorecheck import resolve_corrections
 
+    before = [(e["flag"], e["delta"]) for e in events]
     events = resolve_corrections(events)
+    # 읽는 동안 찍은 줄은 정정 정리 전이라, 정리로 바뀐 변화는 따로 알려 준다
+    for (f0, d0), e in zip(before, events):
+        if (f0, d0) != (e["flag"], e["delta"]):
+            note = {"revert": "잠깐 내렸다 되돌림 → 득점 아님", "reverted": "뒤에 지움 → 득점 아님",
+                    "merged": "앞 득점을 고친 것"}.get(e["flag"], e.get("note", ""))
+            print(f"정정 정리: {e['time']}  {e['team_name']} {d0:+d} {f0} → {int(e['delta']):+d} {e['flag']} ({note})")
     _write_csv(a.out, events)
     if a.raw:
         _write_csv(a.raw, raw)
@@ -290,6 +297,7 @@ def cmd_track_court(a):
             last_good, last_good_gray = H0, cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY)
             print(f"시작 화면({fmt_time(start)})을 기준 화면과 맞추지 못해 놓친 상태로 시작합니다", file=sys.stderr)
 
+    support = [tuple(trk.last_support) + (0,) * (3 - len(trk.last_support))]
     for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
         if t <= start:
             continue
@@ -310,7 +318,7 @@ def cmd_track_court(a):
                 Hr, sc = None, 0.0
                 if F is not None and n >= 80:
                     Hr, sc, sup = HG.refine_homography(frame, F @ last_good, spec, return_support=True)
-                    if not trk.supported(sup):
+                    if not trk.supported(sup) or not trk.sane(Hr, frame.shape):
                         Hr, sc = None, 0.0
             if strong(Hr, sc) or (Hr is not None and sc >= a.recover_score):
                 trk.reset(Hr, frame)
@@ -321,9 +329,12 @@ def cmd_track_court(a):
         Hs.append(r.H if r.H is not None else np.full((3, 3), np.nan))
         scores.append(r.line_score)
         status.append(r.status)
+        support.append(tuple(trk.last_support) + (0,) * (3 - len(trk.last_support)))
         if len(times) % int(max(1, 60 / a.step)) == 0:
             print(f"{fmt_time(t)} 상태={r.status} 라인일치={r.line_score:.2f}", file=sys.stderr)
-    np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status), spec=spec.name)
+    # support: 샘플마다 (보이는 라인 줄, 맞은 줄, 방향 엇갈림) — 틀린 정합을 찾을 때 본다
+    np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status),
+                        support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name)
     ok = sum(s in ("ok", "recovered", "calib") for s in status)
     print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번)")
 
@@ -661,13 +672,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--video", required=True)
     q.add_argument("--calib", action="append", default=None,
                    help="캘리브레이션 JSON. 여러 번 주면 첫 번째에서 시작하고 나머지(예: 반대쪽 골대 화면)는 다시 찾기 기준으로 씀")
-    q.add_argument("--min-score", type=float, default=0.5, help="라인 일치율이 이보다 낮으면 좌표를 내지 않음")
+    q.add_argument("--min-score", type=float, default=0.65, help="라인 일치율이 이보다 낮으면 좌표를 내지 않음")
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
     q.add_argument("--start", type=float, default=None)
     q.add_argument("--end", type=float, default=None)
     q.add_argument("--step", type=float, default=0.2)
     q.add_argument("--refine-every", type=int, default=1)
-    q.add_argument("--recover-score", type=float, default=0.55)
+    q.add_argument("--recover-score", type=float, default=0.7, help="놓친 뒤 다시 찾은 화면을 받는 라인 일치율")
     q.add_argument("--out", default="out/court_track.npz")
 
     q = add("overlay", cmd_overlay, "코트 라인을 영상 프레임에 겹쳐 그려 확인")

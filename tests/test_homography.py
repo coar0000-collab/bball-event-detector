@@ -144,8 +144,8 @@ def test_refine_does_not_collapse_onto_one_line(offset):
     """실제 중계에서 선 하나만 보일 때 코트 전체가 그 선으로 쪼그라든 H 가 일치율 0.9~1.0 으로 통과했다 (예전 코드: 370~480 px 틀림)."""
     one, Htrue = _one_line_scene()
     Hbad = np.array([[1, 0, offset[0]], [0, 1, offset[1]], [0, 0, 1]], float) @ Htrue
-    Hr, score, (n_vis, n_good) = HG.refine_homography(one, Hbad, FIBA, return_support=True)
-    assert 0.6 <= HG.key_area(Hr) / HG.key_area(Hbad) <= 1.67
+    Hr, score, (n_vis, n_good, _) = HG.refine_homography(one, Hbad, FIBA, return_support=True)
+    assert 0.8 <= HG.key_area(Hr) / HG.key_area(Hbad) <= 1.25
     pts = np.array([[5.8, 5.05], [5.8, 9.95], [14, 0], [8.3, 7.5]])
     assert np.linalg.norm(HG.project(Hr, pts) - HG.project(Htrue, pts), axis=1).mean() < 20
     # 보이는 라인 줄 대부분이 안 맞으므로 추적기는 좌표를 내지 않는다
@@ -162,5 +162,50 @@ def test_tracker_does_not_emit_on_one_line_frame():
 
 def test_line_support_full_scene():
     frame, Htrue = make_scene()
-    _, score, (n_vis, n_good) = HG.refine_homography(frame, Htrue, FIBA, return_support=True)
-    assert score > 0.8 and n_good >= 0.9 * n_vis
+    _, score, (n_vis, n_good, cross) = HG.refine_homography(frame, Htrue, FIBA, return_support=True)
+    assert score > 0.8 and n_good >= 0.9 * n_vis and cross == 1
+
+
+def _parallel_lines_scene():
+    """먼쪽 사이드라인과 그와 평행한 다른 종목 선 두 줄만 보이는 화면 (실제 영상 31s·87s 처럼 키가 화면 밖)."""
+    import cv2
+
+    frame, Htrue = make_scene()
+    mask = np.zeros(frame.shape[:2], np.uint8)
+    for y in (0.0, 1.2):
+        seg = HG.project(Htrue, HG.densify([(0, y), (28, y)], 0.2)).astype(np.int32)
+        cv2.polylines(mask, [seg], False, 255, 7)
+    return np.where(mask[..., None] > 0, np.full_like(frame, 235), np.full_like(frame, 90)), Htrue
+
+
+def test_parallel_lines_only_is_not_supported():
+    """평행한 가로선만 맞으면 선 방향으로 미끄러진 H 도 똑같이 맞는다 → 좌표를 내면 안 된다."""
+    frame, Htrue = _parallel_lines_scene()
+    slid = Htrue @ np.array([[1, 0, 3.0], [0, 1, 0], [0, 0, 1]])  # 사이드라인 방향으로 3m 밀린 틀린 H
+    dist = cv2_dist(frame)
+    for H in (Htrue, slid):
+        n_vis, n_good, cross = HG.line_support(dist, H, FIBA)
+        assert cross == 0
+    trk = HG.CourtTracker(Htrue, make_scene()[0], FIBA)
+    assert not trk.supported(HG.line_support(dist, slid, FIBA))
+
+
+def cv2_dist(frame):
+    import cv2
+
+    return cv2.distanceTransform((HG.line_mask(frame) == 0).astype(np.uint8), cv2.DIST_L2, 5)
+
+
+def test_sane_rejects_collapsed_court():
+    """코트가 흰 선 하나로 찌그러진 H(실제 영상: 키 넓이 0~60px²)는 캘리브레이션과 비교해 거른다. 줌은 통과."""
+    frame, Htrue = make_scene()
+    trk = HG.CourtTracker(Htrue, frame, FIBA)
+    assert trk.sane(Htrue, frame.shape)
+    zoom = np.array([[2.0, 0, -640], [0, 2.0, -360], [0, 0, 1]]) @ Htrue  # 화면 가운데로 2배 줌
+    assert trk.sane(zoom, frame.shape)
+    squash = np.array([[1.0, 0, 0], [0, 0.02, 360 * 0.98], [0, 0, 1]]) @ Htrue  # 세로로 납작 → 거의 한 줄
+    assert not trk.sane(squash, frame.shape)
+    assert HG.view_aspect(squash, frame.shape) < 0.05 < 0.5 < HG.view_aspect(Htrue, frame.shape)
+    shrink = np.array([[0.2, 0, 512], [0, 0.2, 288], [0, 0, 1]]) @ Htrue  # 점 하나로 쪼그라듦(넓이 1/25)
+    assert not trk.sane(shrink, frame.shape)
+    assert not trk.sane(np.full((3, 3), np.nan), frame.shape)
