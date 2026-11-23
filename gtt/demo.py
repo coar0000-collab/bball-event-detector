@@ -54,7 +54,7 @@ def _camera(t: float, size) -> np.ndarray:
     return cv2.getPerspectiveTransform(src, np.float32(dst))
 
 
-def make_video(path: Path, seconds: float = 60.0) -> list[np.ndarray]:
+def make_video(path: Path, seconds: float = 60.0, start: tuple[int, int] = START) -> list[np.ndarray]:
     """합성 중계 영상을 쓰고, 프레임별 정답 H(코트 m → 화면 px)를 돌려준다."""
     top, T = _court_texture()
     rng = np.random.default_rng(7)
@@ -63,7 +63,7 @@ def make_video(path: Path, seconds: float = 60.0) -> list[np.ndarray]:
     if not w.isOpened():
         raise RuntimeError(f"영상 파일을 쓸 수 없습니다: {path}")
     truth = []
-    home, away = START
+    home, away = start
     plan = list(SCORE_PLAN)
     for i in range(int(seconds * FPS)):
         t = i / FPS
@@ -89,6 +89,33 @@ def _truth_events(seconds: float) -> list[tuple[float, str, int]]:
     return [(float(t), team, d) for t, team, d in SCORE_PLAN if t < seconds - 2]
 
 
+def build_scorebug_profile(out: Path) -> None:
+    """scorebug-setup / scorebug-learn 창에서 사람이 하던 일(영역 지정, 숫자 등록)을 정답으로 대신한다."""
+    cfg = SB.ScorebugConfig(rois=BUG_ROIS, reference_size=(W, H_IMG), home_name="HOME", away_name="AWAY")
+    cfg.save(out / "scorebug.json")
+    tpl = SB.DigitTemplates()
+    for val in ["10", "23", "45", "67", "89"]:
+        img = np.zeros((H_IMG, W, 3), np.uint8)
+        _draw_bug(img, int(val), int(val))
+        SB.learn(tpl, cfg.crop(img, "home"), val)
+    tpl.save(out / "digits.npz")
+
+
+def build_calib(video: Path, truth: list[np.ndarray], path: Path) -> None:
+    """calibrate 창에서 코트 점을 찍는 일을 대신한다: 정답 위치에 손 떨림 정도의 오차를 더하고, --refine 처럼 흰 라인에 맞춘다."""
+    lm = landmarks(FIBA)
+    rng = np.random.default_rng(0)
+    names = ["L_baseline_bot", "L_baseline_top", "L_ft_bot", "L_ft_top", "mid_sideline_bot", "mid_sideline_top", "L_corner3_arc_top"]
+    pts = {n: [float(c) for c in np.array(HG.court_to_image(truth[0], *lm[n])) + rng.normal(0, 1.5, 2)] for n in names}
+    H0, _ = HG.fit_homography(pts, FIBA)
+    from .video import Video
+    v = Video(video)
+    H0, _ = HG.refine_homography(v.frame_at(0.0), H0, FIBA)
+    v.close()
+    path.write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "image_points": pts, "H_court_to_image": H0.tolist()},
+                               ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def run(out_dir: str | Path, seconds: float = 60.0) -> dict:
     from . import cli
 
@@ -106,15 +133,7 @@ def run(out_dir: str | Path, seconds: float = 60.0) -> dict:
     video = out / "demo_game.avi"
     truth = step("합성 영상 만들기", lambda: make_video(video, seconds))
 
-    # 1) 스코어버그 영역·숫자 (원래는 scorebug-setup / scorebug-learn 창에서 사람이 함)
-    cfg = SB.ScorebugConfig(rois=BUG_ROIS, reference_size=(W, H_IMG), home_name="HOME", away_name="AWAY")
-    cfg.save(out / "scorebug.json")
-    tpl = SB.DigitTemplates()
-    for val in ["10", "23", "45", "67", "89"]:
-        img = np.zeros((H_IMG, W, 3), np.uint8)
-        _draw_bug(img, int(val), int(val))
-        SB.learn(tpl, cfg.crop(img, "home"), val)
-    tpl.save(out / "digits.npz")
+    build_scorebug_profile(out)
 
     ev_csv = out / "score_events.csv"
     step("scorebug-read", lambda: cli.main(["scorebug-read", "--video", str(video), "--config", str(out / "scorebug.json"),
@@ -126,19 +145,7 @@ def run(out_dir: str | Path, seconds: float = 60.0) -> dict:
     hit = sum(any(team == gt and d == gd and abs(t - tt) <= 1.0 for t, team, d in got) for tt, gt, gd in want)
     res["점수 변화"] = f"정답 {len(want)}개 중 {hit}개 맞음, 읽은 이벤트 {len(got)}개"
 
-    # 2) 코트 점 찍기 (원래는 calibrate 창에서 클릭) — 정답 위치에 손 떨림 정도의 오차를 더함
-    lm = landmarks(FIBA)
-    rng = np.random.default_rng(0)
-    names = ["L_baseline_bot", "L_baseline_top", "L_ft_bot", "L_ft_top", "mid_sideline_bot", "mid_sideline_top", "L_corner3_arc_top"]
-    pts = {n: [float(c) for c in np.array(HG.court_to_image(truth[0], *lm[n])) + rng.normal(0, 1.5, 2)] for n in names}
-    H0, err = HG.fit_homography(pts, FIBA)
-    # calibrate --refine 처럼 흰 라인에 한 번 더 맞춘다
-    from .video import Video
-    v = Video(video)
-    H0, _ = HG.refine_homography(v.frame_at(0.0), H0, FIBA)
-    v.close()
-    (out / "calib.json").write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "image_points": pts, "H_court_to_image": H0.tolist()},
-                                               ensure_ascii=False, indent=1), encoding="utf-8")
+    build_calib(video, truth, out / "calib.json")
 
     track = out / "court_track.npz"
     step("track-court", lambda: cli.main(["track-court", "--video", str(video), "--calib", str(out / "calib.json"),

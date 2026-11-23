@@ -581,6 +581,32 @@ def cmd_demo(a):
     print(f"  확인용 그림: {Path(a.out) / 'overlay_grid.png'}")
 
 
+def cmd_analyze(a):
+    from . import analyze as AN
+
+    if a.demo:
+        res = AN.run_demo(a.out or "out/analysis_demo", a.seconds, a.metrics)
+    elif not a.video:
+        sys.exit("영상을 주세요: gtt analyze --video videos/game1.mp4  (영상 없이 보려면 gtt analyze --demo)")
+    else:
+        out = a.out or str(Path("out") / f"analysis_{Path(a.video).stem}")
+        res = AN.run(a.video, out, a.profile, shots=a.shots, roster=a.roster, metrics_path=a.metrics, game_id=a.game_id,
+                     game_date=a.date, home=a.home, away=a.away, step=a.step, track_step=a.track_step, start=a.start, end=a.end)
+    out = Path(a.out or ("out/analysis_demo" if a.demo else f"out/analysis_{Path(a.video).stem}"))
+    g = res["경기"]
+    print(f"[분석 완료] {g['홈팀']} {g['홈 득점']} : {g['원정 득점']} {g['원정팀']}  (점수판 변화 {res['점수판 변화']}건)")
+    if res.get("코트 점수 vs 점수판") and res["코트 점수 vs 점수판"].get("점수판 변화"):
+        c = res["코트 점수 vs 점수판"]
+        print(f"  코트로 정한 점수 = 점수판: {c['일치']}/{c['점수판 변화']}")
+    for n in res["메모"]:
+        print(f"  확인: {n}")
+    print(f"  보고서: {out / 'report.html'}")
+    print(f"  기록지: {out / '기록지_자동.xlsx'}")
+    if a.open:
+        import webbrowser
+        webbrowser.open((out / "report.html").resolve().as_uri())
+
+
 # ---------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gtt", description="GARBAGE TIME tracker: 스코어버그 인식 + 코트 라인 기반 2점/3점 판정")
@@ -696,6 +722,25 @@ def build_parser() -> argparse.ArgumentParser:
     q = add("demo", cmd_demo, "영상 없이 합성 중계로 전체 흐름 점검 (설치 확인용)")
     q.add_argument("--out", default="out/demo")
     q.add_argument("--seconds", type=float, default=60.0)
+
+    q = add("analyze", cmd_analyze, "영상 하나 → 자동 분석: 점수판·코트 추적·(슛 기록) → 기록지 엑셀 + 평가지표 + 보고서 HTML")
+    q.add_argument("--video", help="경기 영상")
+    q.add_argument("--demo", action="store_true", help="영상 없이 합성 중계로 전체 흐름 보기")
+    q.add_argument("--profile", default="configs", help="방송별 준비 파일 폴더 (scorebug.json, digits.npz, calib*.json)")
+    q.add_argument("--shots", help="슛 기록 CSV (click-shots 결과). 있으면 시도·구역·선수별 기록과 코트 점수 검증")
+    q.add_argument("--roster", help="명단 CSV (열: team,no,name). team 은 home/away 또는 팀 이름")
+    q.add_argument("--metrics", help="평가지표 수식 JSON (기본: gtt/metrics_default.json)")
+    q.add_argument("--game-id", default="G001")
+    q.add_argument("--date", help="경기 날짜 (예: 2026-05-16)")
+    q.add_argument("--home", help="점수판 왼쪽 팀 이름")
+    q.add_argument("--away", help="점수판 오른쪽 팀 이름")
+    q.add_argument("--step", type=float, default=0.5, help="점수판 몇 초마다 읽을지")
+    q.add_argument("--track-step", type=float, default=0.2, help="코트 추적 간격(초)")
+    q.add_argument("--start", type=float, default=None)
+    q.add_argument("--end", type=float, default=None)
+    q.add_argument("--seconds", type=float, default=60.0, help="--demo 영상 길이")
+    q.add_argument("--out", help="결과 폴더 (기본 out/analysis_<영상 이름>)")
+    q.add_argument("--open", action="store_true", help="끝나면 보고서를 브라우저로 열기")
 
     q = add("bench", cmd_bench, "어려운 합성 중계(빠른 팬·리플레이·로고·자유투)로 정확도 측정")
     q.add_argument("--out", default="out/bench")
