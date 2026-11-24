@@ -76,7 +76,10 @@ def test_unassigned_points_reported():
 
 def test_demo_end_to_end(tmp_path):
     res = AN.run_demo(tmp_path, seconds=30)
-    assert res["코트 점수 vs 점수판"]["일치"] == res["코트 점수 vs 점수판"]["점수판 변화"] >= 3
+    c = res["코트 점수 vs 점수판"]
+    # 발이 가려진 3점 1개는 코트 좌표가 없어 코트 단독으로는 못 맞힘 → 점수판으로 보정
+    assert c["일치"] + c["코트 좌표 없음"] == c["점수판 변화"] >= 3 and c["코트 좌표 없음"] == 1
+    assert res["점수 출처"]["점수판 보정"] == 1 and res["점수 출처"]["코트≠점수판"] == 0
     assert (tmp_path / "report.html").read_text(encoding="utf-8").count("계산 불가") > 0
     wb = openpyxl.load_workbook(tmp_path / "기록지_자동.xlsx")
     ws = wb["기록입력"]
@@ -101,3 +104,21 @@ def test_zones_from_court_coordinates():
                   {"team": "home", "result": "MISSED", "court_x": rim + 7.2, "court_y": 7.4},
                   {"team": "home", "result": "MADE", "zone": "FT", "court_x": 6, "court_y": 7.5}])
     assert t["zone"][("home", "탑")] == [2, 1]
+
+
+def test_hybrid_resolves_only_uncertain_made_shots():
+    from gtt.resolve import resolve
+
+    ev = [{"t_sec": "10", "team": "home", "delta": "3", "home": "3", "away": "0", "flag": "ok"},
+          {"t_sec": "30", "team": "home", "delta": "2", "home": "5", "away": "0", "flag": "ok"}]
+    shots = [
+        {"t_sec": "8", "team": "home", "result": "MADE", "points": "2", "near_line": "True", "court_x": "8.3", "court_y": "7.5"},
+        {"t_sec": "20", "team": "home", "result": "MISSED", "points": "3", "near_line": "True"},
+        {"t_sec": "28", "team": "home", "result": "MADE", "points": "2", "near_line": "False"},
+    ]
+    out, st = resolve(ev, shots)
+    assert out[0]["points"] == 3 and out[0]["points_source"] == "점수판" and out[0]["zone_kr"] == "탑"
+    assert out[1]["points_source"].startswith("판정 불가")
+    assert out[2]["points_source"] == "코트"
+    assert shots[0]["points"] == "2"  # 원본은 그대로
+    assert st == {"코트": 1, "점수판 보정": 1, "판정 불가": 1, "코트≠점수판": 0}

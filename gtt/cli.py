@@ -665,13 +665,16 @@ def cmd_analyze(a):
     else:
         out = a.out or str(Path("out") / f"analysis_{Path(a.video).stem}")
         res = AN.run(a.video, out, a.profile, shots=a.shots, roster=a.roster, metrics_path=a.metrics, game_id=a.game_id,
-                     game_date=a.date, home=a.home, away=a.away, step=a.step, track_step=a.track_step, start=a.start, end=a.end)
+                     game_date=a.date, home=a.home, away=a.away, step=a.step, track_step=a.track_step, start=a.start, end=a.end,
+                     hybrid=not a.court_only)
     out = Path(a.out or ("out/analysis_demo" if a.demo else f"out/analysis_{Path(a.video).stem}"))
     g = res["경기"]
     print(f"[분석 완료] {g['홈팀']} {g['홈 득점']} : {g['원정 득점']} {g['원정팀']}  (점수판 변화 {res['점수판 변화']}건)")
     if res.get("코트 점수 vs 점수판") and res["코트 점수 vs 점수판"].get("점수판 변화"):
         c = res["코트 점수 vs 점수판"]
-        print(f"  코트로 정한 점수 = 점수판: {c['일치']}/{c['점수판 변화']}")
+        print(f"  코트로 정한 점수 = 점수판 (코트 단독): {c['일치']}/{c['점수판 변화']}")
+    if res.get("점수 출처"):
+        print(f"  2점/3점 출처: {res['점수 출처']}")
     for n in res["메모"]:
         print(f"  확인: {n}")
     print(f"  보고서: {out / 'report.html'}")
@@ -817,6 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--seconds", type=float, default=60.0, help="--demo 영상 길이")
     q.add_argument("--out", help="결과 폴더 (기본 out/analysis_<영상 이름>)")
     q.add_argument("--open", action="store_true", help="끝나면 보고서를 브라우저로 열기")
+    q.add_argument("--court-only", action="store_true", help="코트로 못 정한 성공 슛을 점수판으로 보정하지 않음")
 
     q = add("bench", cmd_bench, "어려운 합성 중계(빠른 팬·리플레이·로고·자유투)로 정확도 측정")
     q.add_argument("--out", default="out/bench")

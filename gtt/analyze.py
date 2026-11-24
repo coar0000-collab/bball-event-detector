@@ -108,7 +108,7 @@ def _overlay_grid(video: Path, track: Path, out: Path, duration: float) -> Path 
 def run(video: str | Path, out_dir: str | Path, profile: str | Path = "configs", shots: str | None = None,
         roster: str | None = None, metrics_path: str | None = None, game_id: str = "G001", game_date: str | None = None,
         home: str | None = None, away: str | None = None, step: float = 0.5, track_step: float = 0.2,
-        start: float | None = None, end: float | None = None, demo_note: str | None = None, shots_fn=None) -> dict:
+        start: float | None = None, end: float | None = None, demo_note: str | None = None, shots_fn=None, hybrid: bool = True) -> dict:
     from . import cli
     from . import scorebug as SB
     from .video import Video
@@ -161,10 +161,13 @@ def run(video: str | Path, out_dir: str | Path, profile: str | Path = "configs",
     if shots_fn is not None and track is not None:
         shots = shots_fn(track)
     shot_rows = read_csv(shots) if shots else None
-    agree = None
+    agree, resolve_stats = None, None
     if shot_rows is not None:
-        res = score_check(events, shot_rows, start=start, end=end)
+        res = score_check(events, shot_rows, start=start, end=end)  # 코트 단독 지표: 보정 전 슛으로
         agree = res.summary()
+        if hybrid:
+            from .resolve import resolve
+            shot_rows, resolve_stats = resolve(events, shot_rows)
         with open(out / "score_check.csv", "w", encoding="utf-8-sig", newline="") as f:
             rows = res.rows()
             if rows:
@@ -188,7 +191,7 @@ def run(video: str | Path, out_dir: str | Path, profile: str | Path = "configs",
             "영상": video.name, "영상 길이(초)": round(duration, 1)}
     summary = {"경기": game, "걸린 시간(초)": timing, "점수판 변화": len(events),
                "점수판 확인 필요": sum(1 for e in events if e.get("flag", "ok") != "ok"),
-               "코트 추적": track_info, "코트 점수 vs 점수판": agree, "메모": box.notes,
+               "코트 추적": track_info, "코트 점수 vs 점수판": agree, "점수 출처": resolve_stats, "메모": box.notes,
                "슛 기록": shots or None, "프로필": str(profile), "데모": demo_note}
     if duration:
         per = sum(timing.values()) / duration
@@ -347,8 +350,8 @@ def write_xlsx(path: Path, game, box: BX.Box, met, events, shots, summary, metri
         cell.font, cell.fill = bold, head
     if shots:
         s = wb.create_sheet("슛 기록")
-        cols = ["time", "team", "no", "result", "points", "zone_kr", "margin_m", "near_line", "court_x", "court_y"]
-        s.append(["시각", "팀", "등번호", "결과", "점수", "구역", "3점 라인까지(m)", "라인 근처", "코트 x(m)", "코트 y(m)",
+        cols = ["time", "team", "no", "result", "points", "points_source", "zone_kr", "margin_m", "near_line", "court_x", "court_y"]
+        s.append(["시각", "팀", "등번호", "결과", "점수", "점수 출처", "구역", "3점 라인까지(m)", "라인 근처", "코트 x(m)", "코트 y(m)",
                   "세부 구역", "거리대", "림까지(m)", "각도(°)"])
         for r_ in shots:
             row = [r_.get(k) if k != "team" else box.team_names.get(r_.get("team"), r_.get("team")) for k in cols]
@@ -661,6 +664,17 @@ def write_html(path: Path, game, box: BX.Box, met, events, shots, summary, metri
         P.append("<h2>슛 위치</h2><div class=panel>" + _court_svg(shots, names)
                  + f"<div class=legend><span>● 성공</span><span>✕ 실패</span><span><i class=sw style='background:var(--home)'></i>{_e(names['home'])}</span>"
                    f"<span><i class=sw style='background:var(--away)'></i>{_e(names['away'])}</span></div></div>")
+    rs = summary.get("점수 출처")
+    if rs:
+        P.append("<h2>2점/3점은 어떻게 정했나</h2><p class=sub>코트 좌표로 확실한 슛은 코트로, 라인 근처이거나 발이 가려져 "
+                 "코트로 못 정한 <b>성공</b> 슛만 그 순간 점수판(+2/+3)으로 정했습니다. 실패 슛은 점수판이 안 바뀌어 보정할 수 없습니다. "
+                 "위의 '코트로 정한 점수 = 점수판' 일치율은 보정 전 코트 판정만으로 잰 값입니다.</p><div class=panel><table><tbody>")
+        for k, lab in (("코트", "코트 좌표로 확실히 판정"), ("점수판 보정", "점수판으로 보정 (코트로 못 정한 성공 슛)"),
+                       ("판정 불가", "판정 불가 (실패 슛 등, 사람 확인)"), ("코트≠점수판", "코트 판정과 점수판이 다름 (사람 확인)")):
+            v = rs.get(k, 0)
+            cls = " class=bad" if k in ("판정 불가", "코트≠점수판") and v else ""
+            P.append(f"<tr><td class=l>{_e(lab)}</td><td{cls}>{v}</td></tr>")
+        P.append("</tbody></table></div>")
     if shots:
         P.append(_zone_tables(shots, names))
     if ag and ag.get("짝지은 변화"):
@@ -692,14 +706,14 @@ DEMO_SHOTS = [
     (2.5, "away", "9", "MISSED", (8.6, 9.6)),
     (4.5, "home", "7", "MADE", (2.6, 7.9)),
     (11.0, "home", "23", "MISSED", (1.575 + 7.25, 7.5)),
-    (12.5, "away", "5", "MADE", (0.9, 0.6)),
+    (12.5, "away", "5", "MADE", (0.9, 0.6), "hidden"),  # 수비수에 발이 가려 좌표 없음 → 점수판 +3 으로 보정
     (17.0, "away", "9", "MISSED", (1.575 + 5.3, 11.6)),
     (19.5, "home", "11", "MADE", "FT"),
     (25.5, "home", "11", "MADE", "FT"),
     (30.0, "home", "7", "MISSED", (1.575 + 3.8, 3.4)),
     (31.5, "away", "13", "MADE", (5.4, 9.2)),
     (36.0, "away", "5", "MISSED", (1.575 + 7.0 * 0.7, 7.5 + 7.0 * 0.7)),
-    (38.5, "home", "23", "MADE", (1.575 + 7.3, 7.2)),
+    (38.5, "home", "23", "MADE", (1.575 + 6.8, 7.3)),  # 라인 바로 뒤 (라인 근처) → 점수판 +3 으로 보정
     (44.0, "home", "7", "MISSED", (1.2, 14.3)),
     (47.5, "away", "9", "MADE", (3.4, 6.2)),
 ]
@@ -713,7 +727,7 @@ def _demo_shots(track: Path, truth: list, fps: int) -> list[dict]:
 
     z = np.load(track)
     out = []
-    for t, team, no, res, pos in DEMO_SHOTS:
+    for t, team, no, res, pos, *flag in DEMO_SHOTS:
         row = {"t_sec": t, "time": fmt_time(t), "team": team, "no": no, "result": res}
         i = int(np.argmin(np.abs(z["times"] - t)))
         Ht = z["H"][i]
@@ -727,6 +741,8 @@ def _demo_shots(track: Path, truth: list, fps: int) -> list[dict]:
             row.update(HG.classify_click(Ht, float(u), float(v), FIBA, side="left").as_dict())
         if pos == "FT":
             row.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
+        if flag and flag[0] == "hidden":  # 발이 안 보여 찍지 못함
+            row.update({k: "" for k in ("u", "v", "points", "zone", "zone_kr", "margin_m", "near_line", "court_x", "court_y")})
         row.update({"replay": False, "clicks": 1})
         out.append(row)
     return out
