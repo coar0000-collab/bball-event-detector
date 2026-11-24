@@ -79,7 +79,7 @@ def _overlay_grid(video: Path, track: Path, out: Path, duration: float) -> Path 
     from . import cli
 
     z = np.load(track)
-    good = [float(t) for t, s in zip(z["times"], z["status"]) if s in ("ok", "recovered", "calib", "bridged")]
+    good = [float(t) for t, s in zip(z["times"], z["status"]) if s in ("ok", "recovered", "calib", "bridged", "consensus")]
     if not good:
         return None
     picks = [good[int(round(k * (len(good) - 1) / 3))] for k in range(4)]
@@ -154,7 +154,7 @@ def run(video: str | Path, out_dir: str | Path, profile: str | Path = "configs",
             args += ["--end", str(end)]
         step_("코트 추적", lambda: _quiet(cli.main, args))
         z = np.load(track)
-        ok = int(sum(s in ("ok", "recovered", "calib", "bridged") for s in z["status"]))
+        ok = int(sum(s in ("ok", "recovered", "calib", "bridged", "consensus") for s in z["status"]))
         track_info = {"프레임": int(len(z["times"])), "코트 좌표 있음": ok, "비율": round(ok / max(1, len(z["times"])), 3)}
         grid = step_("코트 라인 확인 그림", lambda: _overlay_grid(video, track, out, duration))
 
