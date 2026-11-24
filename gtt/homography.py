@@ -224,7 +224,7 @@ def _snap_three(m, H, u, v, spec, side, exclude_px, reach_px, search_px, min_sam
 def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, side: str | None = None,
                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3, frame: np.ndarray | None = None,
                    foot: str = "mid", line_mask_img: np.ndarray | None = None, ignore: np.ndarray | None = None,
-                   hidden_near_m: float = 1.2):
+                   hidden_near_m: float = 1.2, wide_flip_px: float = 12.0):
     """화면에서 찍은 발 위치(u, v)로 2점/3점을 판정하고, 찍기 오차를 반영해 '라인 근처'를 정한다.
 
     같은 1px 이라도 카메라에서 먼 쪽(특히 먼 코너)은 코트에서 수 cm~10cm 가 된다. 그래서 고정 30cm 대신
@@ -234,12 +234,15 @@ def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, si
     그때 발 근처 라인이 방송 그래픽(ignore)이나 화면 가장자리에 걸려 있고 라인까지 hidden_near_m 안이면, 계산만으로는
     믿을 수 없으므로 line_hidden=True, near_line=True (사람 판정). 실제 영상: 스코어버그 바로 위 윙 3점 2개를 계산 라인이
     20px 어긋나 2점으로 냈다.
+    라인 보정이 wide_flip_px 보다 크게 옮겼는데(넓힌 창에서 찾음) 그 때문에 2점↔3점이 바뀌면, 다른 선을 잡았을 수도 있으므로
+    near_line=True (실제 영상: 골밑 슛에서 17~23px 보정이 나옴 — 다른 선을 잡은 것으로 보임, 판정은 그대로였음).
     foot: "mid" = 두 발 가운데를 찍음 / "toe" = 림 쪽 발끝을 찍음 (court.classify_shot 참고).
     """
     from .court import classify_shot, three_point_margin
 
     x, y = image_to_court(H, u, v)
     call = classify_shot(x, y, spec, side=side, foot=foot)
+    pts0 = call.points
     snap = None
     if frame is not None:
         snap = snap_three_line(frame, H, u, v, spec, call.side, mask=line_mask_img, ignore=ignore)
@@ -257,6 +260,8 @@ def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, si
     sigma = click_px * float(np.hypot(mu, mv))
     call.margin_sigma = sigma
     call.near_line = abs(m0) < max(min_near_m, k * sigma)
+    if snap is not None and abs(snap[0]) > wide_flip_px and call.points != pts0:
+        call.near_line = True
     if frame is not None and snap is None and abs(m0) < hidden_near_m:
         call.line_hidden = _line_blocked(H, u, v, spec, call.side, frame.shape, ignore)
         call.near_line = call.near_line or call.line_hidden

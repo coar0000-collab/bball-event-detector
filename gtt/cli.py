@@ -673,9 +673,10 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
       (실제 B-LAB: 스코어버그 바로 위 슛 장면에서 라인이 적게 보여 3~4초씩 좌표를 못 냈다 — 18건 중 6건)
     - 한쪽뿐이거나 둘이 어긋나면: near_s 초 안의 가까운 쪽 이동은 그대로 믿고 ("near"), 그보다 멀면 그 H 를 그 화면 흰 라인에
       다시 맞춰 추적과 같은 기준(일치율 min_score, 보이는 줄 대부분 맞고 방향 엇갈림)을 통과할 때만 ("verified").
+    - 그래도 안 되면 앞뒤 2분 안의 정상 화면들과 직접 맞춰 여러 장이 같은 답을 낼 때만 ("multi-view", _multi_view).
     - 아니면 None.
-    정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길의 발 자리 차이 m)."""
-    info = {"h_source": "none", "h_gap_s": "", "h_agree_m": ""}
+    정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길·여러 화면의 발 자리 차이 m), h_votes."""
+    info = {"h_source": "none", "h_gap_s": "", "h_agree_m": "", "h_votes": ""}
     if look.track is None:
         info["h_source"] = "calib"
         return look.fixed, info
@@ -692,19 +693,19 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
     after = np.flatnonzero(good & (times > t) & (times <= t + window))
     ia = int(before[-1]) if len(before) else None
     ib = int(after[0]) if len(after) else None
+    mask = None
+    if look.ignore is not None:
+        mask = np.where(cv2.dilate(look.ignore.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0, 0, 255).astype(np.uint8)
+    orb = HG.make_orb()
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     if ia is None and ib is None:
-        return None, info
+        return _multi_view(look, v, t, look.undistort(v.frame_at(t)), spec, uv, mask, orb, matcher, info, agree_m=agree_m)
     gaps = [abs(t - times[i]) for i in (ia, ib) if i is not None]
     info["h_gap_s"] = round(float(min(gaps)), 2)
     fps = v.fps or 30.0
     it = int(round(t * fps))
     i0 = int(round(times[ia] * fps)) if ia is not None else it
     i1 = int(round(times[ib] * fps)) if ib is not None else it
-    mask = None
-    if look.ignore is not None:
-        mask = np.where(cv2.dilate(look.ignore.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0, 0, 255).astype(np.uint8)
-    orb = HG.make_orb()
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     kept, motions = _read_motions(v, look, i0, i1, {it}, int(round(step * fps)), mask, orb, matcher)
     if it not in kept:
         return None, info
@@ -741,9 +742,7 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
     # 한쪽 길만: 가까우면 그대로, 멀면 그 화면 라인에 다시 맞춰 확인
     cands = sorted([(abs(t - times[i]), Hx) for i, Hx in ((ia, Hf), (ib, Hb)) if i is not None and Hx is not None],
                    key=lambda c: c[0])
-    if not cands:
-        return None, info
-    if cands[0][0] <= near_s:
+    if cands and cands[0][0] <= near_s:
         info["h_source"] = "near"
         return cands[0][1], info
     frame = look.undistort(v.frame_at(t))
@@ -757,7 +756,71 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
         if sc >= min_score and HG.support_ok(sup) and HG.h_distance(Hr, Hx, frame.shape, spec) <= 10.0:
             info["h_source"] = "verified"
             return Hr, info
-    return None, info
+    return _multi_view(look, v, t, frame, spec, uv, mask, orb, matcher, info, agree_m=agree_m)
+
+
+def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, matcher, info: dict, span: float = 120.0,
+                n_src: int = 30, min_inliers: int = 60, agree_m: float = 0.2, min_votes: int = 2, min_sep: float = 2.0):
+    """슛 프레임을 추적이 잘 된 다른 화면들(앞뒤 span 초 안, 서로 min_sep 초 이상 떨어진 n_src 장 + 사람 캘리브레이션 화면)과
+    직접 특징점으로 맞춘다. 중계 카메라는 한 자리에서 돌고 당기기만 하므로 두 화면 사이는 관중석까지 통째로 하나의 화면 변환이다.
+    서로 다른 시각의 화면 min_votes 장 이상에서 옮겨 온 H 가 발 자리에서 agree_m 안으로 같은 곳을 가리킬 때만 쓴다
+    ("multi-view"). 따로따로 맞춘 것이 같은 답을 내야 하므로 한 화면과 잘못 맞은 경우는 걸러진다.
+    (실제 B-LAB: 스코어버그 근처 장면에서 20~80초씩 정상 샘플이 없어 앞뒤 8초 이어 오기로는 6건을 못 살렸다)"""
+    times, Hs, st = look.track["times"], look.track["H"], look.track["status"].astype(str)
+    fin = np.all(np.isfinite(Hs.reshape(len(Hs), -1)), axis=1)
+    good = fin & np.isin(st, _GOOD)
+    near_idx = [int(i) for i in np.flatnonzero(good & (np.abs(times - t) <= span))]
+    near_idx.sort(key=lambda i: abs(times[i] - t))
+    picks: list[int] = []
+    for i in near_idx:
+        if len(picks) >= n_src:
+            break
+        if all(abs(times[i] - times[j]) >= min_sep for j in picks):
+            picks.append(i)
+    picks += [int(i) for i in np.flatnonzero(fin & (st == "calib")) if int(i) not in picks]
+    if not picks:
+        return None, info
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    A0 = abs(HG.key_area(Hs[picks[0]], spec)) or 1.0
+    cands = []  # (시각, 맞은 점, H, 발 자리 코트 좌표)
+    for i in picks:
+        try:
+            g = cv2.cvtColor(look.undistort(v.frame_at(float(times[i]))), cv2.COLOR_BGR2GRAY)
+        except ValueError:
+            continue
+        F, n = HG.frame_to_frame(g, gray, orb, matcher, mask=mask, return_inliers=True)
+        if F is None or n < min_inliers:
+            continue
+        Hc = F @ Hs[i]
+        Hc = Hc / Hc[2, 2]
+        A = HG.key_area(Hc, spec)
+        if not np.isfinite(A) or abs(A) < 0.1 * A0 or A * HG.key_area(Hs[i], spec) <= 0:
+            continue  # 코트가 쪼그라들거나 뒤집힌 변환
+        p = np.array(HG.image_to_court(Hc, *uv)) if uv is not None else HG.project(Hc, [[14.0, 7.5]])[0]
+        cands.append((float(times[i]), n, Hc, p))
+    info["h_votes"] = 0
+    if len(cands) < min_votes:
+        return None, info
+    best = None
+    for c in cands:
+        grp = [d for d in cands if np.linalg.norm(d[3] - c[3]) <= agree_m]
+        ts = sorted({round(d[0], 1) for d in grp})
+        distinct = sum(1 for k, x in enumerate(ts) if k == 0 or x - ts[k - 1] >= min_sep - 1e-6)
+        key = (distinct, sum(d[1] for d in grp))
+        if best is None or key > best[0]:
+            best = (key, grp)
+    (votes, _), grp = best
+    info["h_votes"] = votes
+    if votes < min_votes:
+        return None, info
+    w = np.array([d[1] for d in grp], float)
+    Hm = sum(wi * d[2] for wi, d in zip(w, grp)) / w.sum()
+    Hm = Hm / Hm[2, 2]
+    cen = np.average(np.stack([d[3] for d in grp]), axis=0, weights=w)
+    info["h_source"] = "multi-view"
+    info["h_agree_m"] = round(float(max(np.linalg.norm(d[3] - cen) for d in grp)) * 2, 3)
+    info["h_gap_s"] = round(float(min(abs(d[0] - t) for d in grp)), 2)
+    return Hm, info
 
 
 def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0):
@@ -767,12 +830,12 @@ def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, windo
         H, info = _court_at_shot(look, v, t, spec, uv=(u, vv), window=window)
     else:
         H = look.at(t)
-        info = {"h_source": "track" if H is not None else "none", "h_gap_s": "", "h_agree_m": ""}
+        info = {"h_source": "track" if H is not None else "none", "h_gap_s": "", "h_agree_m": "", "h_votes": ""}
     if H is None:
         return None, info, (u, vv)
     frame = look.undistort(v.frame_at(t)) if v is not None else None
     call = HG.classify_click(H, u, vv, spec, side=side, frame=frame, ignore=look.ignore)
-    if info.get("h_agree_m") not in ("", None) and info["h_source"] == "two-way":
+    if info.get("h_agree_m") not in ("", None) and info["h_source"] in ("two-way", "multi-view"):
         # 두 길이 발 자리에서 어긋난 만큼 위치가 흔들릴 수 있다 → 라인 근처 기준을 넓힌다
         call.margin_sigma = float(np.hypot(call.margin_sigma, float(info["h_agree_m"])))
         call.near_line = call.near_line or abs(call.margin) < max(0.3, 2.0 * call.margin_sigma)

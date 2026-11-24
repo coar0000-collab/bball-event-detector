@@ -319,3 +319,22 @@ def cv2_gray(f):
     import cv2
 
     return cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+
+
+def test_wide_snap_that_flips_call_goes_to_human():
+    """코트 변환이 18px 어긋나 넓힌 창(±28px)에서 라인을 찾아 2점→3점으로 바꿨다면, 다른 선을 잡았을 수도 있으니 사람 판정.
+    (실제 영상 골밑 슛에서 17~23px 보정이 나옴.) 판정이 안 바뀌는 큰 보정이나 ±12px 안 보정은 그대로 믿는다."""
+    frame, Ht = make_scene()
+    F = FIBA
+
+    def call(dx, marg):
+        Hb = np.array([[1, 0, dx], [0, 1, 0], [0, 0, 1.0]]) @ Ht
+        u, v = HG.court_to_image(Ht, 1.575 + F.three_radius + marg + F.foot_reach, 7.5)
+        return HG.classify_click(Hb, u, v, F, side="left", frame=frame)
+
+    c = call(18, 0.3)
+    assert c.points == 3 and abs(c.line_snap_px) > 12 and c.near_line
+    c = call(14, 0.5)  # 큰 보정이지만 판정은 그대로 3점
+    assert c.points == 3 and not c.near_line
+    c = call(8, 0.5)  # 작은 보정
+    assert c.points == 3 and abs(c.line_snap_px) <= 12 and not c.near_line

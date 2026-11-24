@@ -332,3 +332,21 @@ def test_graphics_box_with_calib_flags_hidden_line(tmp_path, capsys):
     assert res["line_hidden"] and res["near_line"] and res["line_snap_px"] == ""
     m = cli._graphics_boxes([str(box), "0,0,10,10"], (720, 1280))
     assert m[y0, x0] and m[5, 5] and not m[y0 - 20, x0 - 20]
+
+
+def test_shot_multi_view_when_no_good_sample_nearby(synthetic, capsys, tmp_path):
+    """앞뒤 정상 샘플이 이어 오기 창(--window) 밖에 있으면(실제 B-LAB: 20~80초씩 정상 샘플 없음), 앞뒤 2분 안의 정상 화면들과
+    직접 맞춰 서로 다른 시각의 화면 여러 장이 같은 답을 낼 때만 쓴다."""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    holes = tmp_path / "holes.npz"
+    _punch_holes(track, holes, 3.9, 9.1)
+    i = 65
+    u, v = HG.court_to_image(Hs[i], 1.575 + 7.4, 7.5)
+    capsys.readouterr()
+    cli.main(["shot", "--track", str(holes), "--video", str(video), "--t", "6.5", "--u", str(u), "--v", str(v),
+              "--side", "left", "--window", "2"])
+    res = json.loads(capsys.readouterr().out)
+    assert res["h_source"] == "multi-view" and res["h_votes"] >= 2, res
+    assert res["points"] == 3 and abs(res["court_x"] - (1.575 + 7.4)) < 0.15
