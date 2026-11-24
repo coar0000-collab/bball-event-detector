@@ -213,3 +213,122 @@ def test_lens_fit_and_track_with_lens(tmp_path, capsys):
     cli.main(["shot", "--track", str(track), "--t", "0", "--u", str(u), "--v", str(v), "--video", str(video), "--side", "left"])
     out = json.loads(capsys.readouterr().out)
     assert out["points"] == 3 and abs(out["margin_m"] - 0.06) < 0.04
+
+
+def _punch_holes(src, dst, lo, hi):
+    """추적 결과에서 lo~hi 초 샘플을 '좌표 없음(coast)'으로 바꾼 사본 (실제 중계: 스코어버그 바로 위 슛 장면에서 3~4초씩 놓침)."""
+    z = dict(np.load(src))
+    gap = (z["times"] > lo) & (z["times"] < hi)
+    H = z["H"].copy()
+    H[gap] = np.nan
+    st = z["status"].astype("<U10")
+    st[gap] = "coast"
+    z["H"], z["status"] = H, st
+    np.savez(dst, **z)
+
+
+def test_shot_bridges_missing_frames_from_both_sides(synthetic, capsys, tmp_path):
+    """슛 프레임 앞뒤 3초가 좌표 없음이어도, 앞(4초)·뒤(8초) 정상 화면에서 각각 화면 이동으로 따라온 두 H 가 발 자리에서
+    만나면 그것으로 판정한다. 영상이 없으면(이동을 못 따라가면) 예전처럼 좌표 없음."""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    holes = tmp_path / "holes.npz"
+    _punch_holes(track, holes, 4.4, 7.6)
+    i = 60  # 6.0초
+    capsys.readouterr()
+    for x, y, pts in ((1.575 + 7.4, 7.5, 3), (1.575 + 4.0, 9.0, 2)):
+        u, v = HG.court_to_image(Hs[i], x, y)
+        cli.main(["shot", "--track", str(holes), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v),
+                  "--side", "left"])
+        res = json.loads(capsys.readouterr().out)
+        assert res["h_source"] == "two-way" and res["points"] == pts, res
+        assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15
+        assert res["h_agree_m"] < 0.1
+    with pytest.raises(SystemExit):
+        cli.main(["shot", "--track", str(holes), "--t", "6.0", "--u", str(u), "--v", str(v)])
+    # 샘플 사이 프레임(6.3초)도 가까운 샘플 H 를 그대로 쓰지 않고 화면 이동만큼 옮겨서 쓴다
+    u, v = HG.court_to_image(Hs[63], 1.575 + 7.4, 7.5)
+    cli.main(["shot", "--track", str(track), "--video", str(video), "--t", "6.3", "--u", str(u), "--v", str(v), "--side", "left"])
+    res = json.loads(capsys.readouterr().out)
+    assert res["h_source"] in ("two-way", "near") and abs(res["court_x"] - (1.575 + 7.4)) < 0.1
+
+
+def test_shot_inside_cut_has_no_court(tmp_path, capsys):
+    """슛 시각이 화면 전환(리플레이·광고) 안이면 앞뒤에서 이어 올 수 없다 → 지어내지 않고 좌표 없음."""
+    video = tmp_path / "cut.avi"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (1280, 720))
+    rng = np.random.default_rng(3)
+    Hs = []
+    for i in range(80):
+        frame, H = make_scene(shift=(-1.5 * i, 0.0))
+        if 40 <= i < 50:  # 4~5초: 전혀 다른 화면
+            frame = cv2.GaussianBlur(rng.integers(0, 255, (720, 1280, 3), dtype=np.uint8), (7, 7), 0)
+        w.write(frame)
+        Hs.append(H)
+    w.release()
+    (tmp_path / "calib.json").write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "H_court_to_image": Hs[0].tolist()}))
+    track = tmp_path / "t.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(tmp_path / "calib.json"), "--step", "0.5", "--out", str(track)])
+    u, v = HG.court_to_image(Hs[45], 1.575 + 7.4, 7.5)
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["shot", "--track", str(track), "--video", str(video), "--t", "4.5", "--u", str(u), "--v", str(v)])
+    assert "none" in str(e.value)
+
+
+def test_rejudge_cli(synthetic, tmp_path, capsys):
+    """click-shots CSV 를 다시 판정: 자유투·사람 라인 판정은 지키고, 좌표 없던 슛도 이어 와서 판정한다."""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    holes = tmp_path / "holes.npz"
+    _punch_holes(track, holes, 4.4, 7.6)
+    rows = []
+    for t, x, y, zone, line_call in ((3.0, 1.575 + 7.4, 7.5, "", ""), (6.0, 1.575 + 4.0, 9.0, "", ""),
+                                     (6.5, 5.8 + 0.3, 7.5, "FT", ""), (10.0, 1.575 + 7.4, 7.5, "", "on")):
+        u, v = HG.court_to_image(Hs[int(round(t * FPS))], x, y)
+        rows.append({"t_sec": t, "team": "home", "result": "MADE", "u": round(u, 1), "v": round(v, 1), "zone": zone,
+                     "points": "", "line_call": line_call})
+    src = tmp_path / "shots.csv"
+    cli._write_csv(str(src), rows)
+    out = tmp_path / "re.csv"
+    cli.main(["rejudge", "--shots", str(src), "--track", str(holes), "--video", str(video), "--side", "left", "--out", str(out)])
+    got = list(csv.DictReader(open(out, encoding="utf-8-sig")))
+    assert [g["points"] for g in got] == ["3", "2", "1", "2"]
+    assert [g["court_points"] for g in got] == ["3", "2", "2", "3"]  # 사람 판정·자유투 전 코트만의 점수
+    assert got[1]["h_source"] == "two-way" and got[0]["h_source"] in ("two-way", "track")
+
+
+def test_graphics_box_with_calib_flags_hidden_line(tmp_path, capsys):
+    """캘리브레이션(--calib)으로 판정할 때도 --graphics-box 로 준 스코어버그 자리는 라인으로 쓰지 않는다.
+    실제 B-LAB 447s: 추적 결과가 아니라 캘리브레이션으로 판정하니 그래픽 자리가 비어, 가려진 3점 라인 대신 스코어버그 윗변을
+    라인으로 잡아(+1.9px) 2점으로 확정했다. 이제 라인이 가려진 것으로 보고 사람 판정(near_line)으로 넘긴다."""
+    from test_homography import _bug
+
+    from gtt.court import FIBA as F
+
+    frame, Htrue = make_scene()
+    x, y = 1.575 + F.three_radius * np.cos(np.radians(60)), 7.5 + F.three_radius * np.sin(np.radians(60))
+    u, v = HG.court_to_image(Htrue, x, y)
+    x0, y0 = int(u) - 170, int(v) - 160
+    fb = _bug(frame.copy(), x0=x0, y0=y0, w=340, h=320)
+    cv2.line(fb, (x0, y0), (x0 + 340, y0), (255, 255, 255), 2)  # 그래픽 윗변의 흰 테두리
+    video = tmp_path / "still.avi"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), FPS, (1280, 720))
+    for _ in range(20):
+        w.write(fb)
+    w.release()
+    calib = tmp_path / "c.json"
+    calib.write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "H_court_to_image": Htrue.tolist()}))
+    xi, yi = 1.575 + (F.three_radius - 0.4) * np.cos(np.radians(60)), 7.5 + (F.three_radius - 0.4) * np.sin(np.radians(60))
+    uf, vf = HG.court_to_image(Htrue, xi, yi)
+    box = tmp_path / "graphics.json"
+    box.write_text(json.dumps({"boxes": [[(x0 - 6) / 2, (y0 - 6) / 2, 352 / 2, 332 / 2]], "reference_size": [640, 360]}))
+    capsys.readouterr()
+    cli.main(["shot", "--calib", str(calib), "--video", str(video), "--t", "1.0", "--u", str(uf), "--v", str(vf),
+              "--side", "left", "--graphics-box", str(box)])
+    res = json.loads(capsys.readouterr().out)
+    assert res["line_hidden"] and res["near_line"] and res["line_snap_px"] == ""
+    m = cli._graphics_boxes([str(box), "0,0,10,10"], (720, 1280))
+    assert m[y0, x0] and m[5, 5] and not m[y0 - 20, x0 - 20]

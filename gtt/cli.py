@@ -258,16 +258,50 @@ def _sample_frames(v, start: float, end: float, n: int = 12) -> list:
     return out
 
 
-def _calib_on_canvas(H: np.ndarray, d: dict, frame_raw: np.ndarray, lens, spec, ignore) -> tuple[np.ndarray, float]:
+def _graphics_boxes(specs, shape) -> np.ndarray | None:
+    """--graphics-box 값들(원본 화면 x,y,w,h 또는 {"boxes": [[x,y,w,h], ...], "reference_size": [w,h]} JSON 파일)을
+    원본 화면 크기(shape)의 마스크로. 스코어버그처럼 늘 같은 자리에 있는 그래픽을 확실히 빼고 싶을 때 쓴다
+    (자동 찾기는 카메라가 거의 안 움직이는 구간에서 '못 찾음'이 된다: 실제 B-LAB 앞 구간)."""
+    if not specs:
+        return None
+    h, w = shape[:2]
+    m = np.zeros((h, w), bool)
+    for sp_ in specs:
+        boxes, ref = [], None
+        if str(sp_).lower().endswith(".json"):
+            d = json.loads(Path(sp_).read_text(encoding="utf-8"))
+            boxes, ref = d.get("boxes", []), d.get("reference_size")
+        else:
+            boxes = [[float(x) for x in str(sp_).split(",")]]
+        sx, sy = (w / ref[0], h / ref[1]) if ref else (1.0, 1.0)
+        for b in boxes:
+            if len(b) != 4:
+                sys.exit(f"--graphics-box 는 x,y,w,h 네 값이어야 합니다: {b}")
+            x0, y0 = int(np.floor(b[0] * sx)), int(np.floor(b[1] * sy))
+            x1, y1 = int(np.ceil((b[0] + b[2]) * sx)), int(np.ceil((b[1] + b[3]) * sy))
+            m[max(0, y0):max(0, y1), max(0, x0):max(0, x1)] = True
+    return m if m.any() else None
+
+
+def _graphics_raw(raw_v, start: float, end: float, boxes, auto: bool = True) -> np.ndarray | None:
+    """원본 화면 기준 방송 그래픽 자리 = 자동으로 찾은 곳(구간에서 띄엄띄엄 뽑은 화면) ∪ --graphics-box."""
+    g = HG.graphics_mask(_sample_frames(raw_v, start, end)) if auto else None
+    b = _graphics_boxes(boxes, (raw_v.height, raw_v.width))
+    if g is None:
+        return b
+    return g if b is None else (g | b)
+
+
+def _calib_on_canvas(H: np.ndarray, d: dict, frame_raw: np.ndarray, lens, spec, ignore) -> tuple[np.ndarray, float | None]:
     """원본 화면에서 맞춘 캘리브레이션 H 를 렌즈 휨을 편 화면(canvas) 용으로 바꾼다. (H, 일치율)
 
     사람이 찍은 점(image_points)이 있으면 그 점을 펴서 다시 맞추고, 없으면 H 를 옮긴 뒤 흰 라인에 다시 맞춘다."""
     from .lens import convert_h
 
     if lens is None or lens.is_identity:
-        return H, float("nan")
+        return H, None  # 휨 보정 없음(k1=0): 원본 화면 그대로
     if d.get("lens") and abs(float(d["lens"].get("k1", 0.0)) - lens.k1) < 1e-9:
-        return H, float("nan")  # 이미 편 화면에서 맞춘 캘리브레이션
+        return H, None  # 이미 편 화면에서 맞춘 캘리브레이션
     Hc = None
     pts = d.get("image_points") or {}
     if len(pts) >= 4:
@@ -312,7 +346,7 @@ def cmd_lens_fit(a):
     if not samples:
         sys.exit("렌즈 휨을 잴 화면이 없습니다 (--calib 에 t_sec 가 있는 캘리브레이션, 또는 --track).")
     end = v.duration or 600.0
-    graphics = HG.graphics_mask(_sample_frames(v, 0.0, end))
+    graphics = _graphics_raw(v, 0.0, end, a.graphics_box)
     print(f"화면 {len(samples)}장: " + ", ".join(n for _, _, n in samples))
     print("방송 그래픽 자리: " + (f"{int(graphics.sum())}px 제외" if graphics is not None else "못 찾음(전부 사용)"))
     best, table = LN.fit_k1([(f, H) for f, H, _ in samples], spec, graphics_raw=graphics, log=print)
@@ -354,6 +388,9 @@ def cmd_track_court(a):
     # 라인 정합·라인 보정에서도 뺀다(ignore: 그래픽의 흰 글자를 라인으로 쓰지 않고, 가려진 라인을 '틀림'으로 세지 않음)
     raw_samples = _sample_frames(raw_v, start, end)
     graphics_raw = HG.graphics_mask(raw_samples) if not a.no_graphics_mask else None
+    boxes = _graphics_boxes(a.graphics_box, (raw_v.height, raw_v.width))
+    if boxes is not None:
+        graphics_raw = boxes if graphics_raw is None else (graphics_raw | boxes)
     if lens is not None:
         from .lens import canvas_ignore
 
@@ -368,7 +405,8 @@ def cmd_track_court(a):
     frame0 = frame_c if abs(start - t_calib) < 1e-3 else v.frame_at(start)
     if lens is not None:
         H0, sc0 = _calib_on_canvas(H0, d, raw_v.frame_at(t_calib), lens, spec, ignore)
-        print(f"캘리브레이션 {calibs[0]} → 편 화면에서 다시 맞춤 (일치율 {sc0:.2f})", file=sys.stderr)
+        print(f"캘리브레이션 {calibs[0]} → " + ("휨 보정 없음(k1=0), 그대로 씀" if sc0 is None
+                                              else f"편 화면에서 다시 맞춤 (일치율 {sc0:.2f})"), file=sys.stderr)
     sm = HG.StaticMask.from_frames(samples)
     overlay = sm.mask(frame0.shape[:2])
     if overlay is not None and lens is not None and lens.invalid_mask() is not None:
@@ -395,7 +433,8 @@ def cmd_track_court(a):
             continue
         if lens is not None:
             Hc, scc = _calib_on_canvas(Hc, dc, raw_v.frame_at(tc), lens, spec, ignore)
-            print(f"캘리브레이션 {c} → 편 화면에서 다시 맞춤 (일치율 {scc:.2f})", file=sys.stderr)
+            print(f"캘리브레이션 {c} → " + ("휨 보정 없음(k1=0), 그대로 씀" if scc is None
+                                         else f"편 화면에서 다시 맞춤 (일치율 {scc:.2f})"), file=sys.stderr)
         trk.add_anchor(fc, Hc)
         cal_list.append((tc, Hc, cv2.cvtColor(fc, cv2.COLOR_BGR2GRAY)))
     for tc, _, _ in cal_list:
@@ -547,6 +586,20 @@ class _CourtLookup:
                 shp = tuple(int(x) for x in self.track["ignore_shape"])
                 self.ignore = np.unpackbits(self.track["ignore"])[: shp[0] * shp[1]].reshape(shp).astype(bool)
 
+    def add_graphics(self, raw_mask: np.ndarray | None) -> None:
+        """원본 화면 기준 그래픽 마스크(--graphics-box·자동 찾기)를 ignore 에 더한다 (렌즈 보정이면 편 화면으로 옮겨서)."""
+        if raw_mask is None:
+            return
+        if self.lens is not None:
+            from .lens import canvas_ignore
+
+            m = canvas_ignore(self.lens, raw_mask)
+        else:
+            m = raw_mask
+        if self.ignore is not None and self.ignore.shape != m.shape:
+            return
+        self.ignore = m if self.ignore is None else (self.ignore | m)
+
     def undistort(self, frame: np.ndarray) -> np.ndarray:
         return self.lens.undistort(frame) if self.lens is not None else frame
 
@@ -582,10 +635,154 @@ class _CourtLookup:
         return self.nearest(t, tol)[0]
 
 
+_GOOD = ("ok", "recovered", "calib", "bridged")
+
+
+def _read_motions(v, look, i0: int, i1: int, keep: set, every: int, mask=None, orb=None, matcher=None):
+    """프레임 i0~i1 을 차례로 읽으며, every 간격 프레임과 keep 프레임 사이의 화면 변환을 구한다.
+    반환: (남긴 프레임 번호들, 이웃끼리의 변환들 (len-1, 실패는 None)). 화면은 렌즈 보정 화면(canvas) 기준."""
+    idx = sorted(set(range(i0, i1 + 1, max(1, every))) | {i0, i1} | {k for k in keep if i0 <= k <= i1})
+    kept, motions = [], []
+    sub = max(1, int(round(v.fps / 30.0)))  # 빠른 패닝이면 1/30초 간격 사이 프레임으로 이어 붙인다
+    v.cap.set(cv2.CAP_PROP_POS_FRAMES, i0)
+    prev, between = None, []
+    want = set(idx)
+    for i in range(i0, i1 + 1):
+        ok, frame = v.cap.read()
+        if not ok:
+            break
+        if i not in want:
+            if (i - (kept[-1] if kept else i0)) % sub == 0:
+                between.append(cv2.cvtColor(look.undistort(frame), cv2.COLOR_BGR2GRAY))
+            continue
+        g = cv2.cvtColor(look.undistort(frame), cv2.COLOR_BGR2GRAY)
+        if prev is not None:
+            motions.append(HG.pair_motion(prev, g, between, orb, matcher, mask=mask))
+        kept.append(i)
+        prev, between = g, []
+    return kept, motions
+
+
+def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: float = 0.1, agree_m: float = 0.2,
+                   near_s: float = 0.6, min_score: float = 0.65) -> tuple[np.ndarray | None, dict]:
+    """슛 시각 t 의 코트 변환 (H, 정보). 추적 결과에 그 프레임 좌표가 없으면(coast·lost) 앞뒤 정상 샘플에서 화면 이동으로 이어 온다.
+
+    - 그 프레임에 좌표가 있으면 그대로 ("track").
+    - 앞(window 초 안 마지막 정상)과 뒤(첫 정상)에서 각각 화면 이동만으로 t 까지 따라온 두 H 가 발 자리에서 agree_m 안으로
+      같은 곳을 가리키면 둘의 평균 ("two-way"). 서로 따로 구한 두 길이 만나야 하므로 한쪽 이동 계산이 틀린 경우는 걸러진다.
+      (실제 B-LAB: 스코어버그 바로 위 슛 장면에서 라인이 적게 보여 3~4초씩 좌표를 못 냈다 — 18건 중 6건)
+    - 한쪽뿐이거나 둘이 어긋나면: near_s 초 안의 가까운 쪽 이동은 그대로 믿고 ("near"), 그보다 멀면 그 H 를 그 화면 흰 라인에
+      다시 맞춰 추적과 같은 기준(일치율 min_score, 보이는 줄 대부분 맞고 방향 엇갈림)을 통과할 때만 ("verified").
+    - 아니면 None.
+    정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길의 발 자리 차이 m)."""
+    info = {"h_source": "none", "h_gap_s": "", "h_agree_m": ""}
+    if look.track is None:
+        info["h_source"] = "calib"
+        return look.fixed, info
+    times, Hs, st = look.track["times"], look.track["H"], look.track["status"]
+    fin = np.all(np.isfinite(Hs.reshape(len(Hs), -1)), axis=1)
+    good = fin & np.isin(st.astype(str), _GOOD)
+    half = 0.5 / (v.fps or 30.0)
+    exact = np.flatnonzero(fin & (np.abs(times - t) <= half))
+    if len(exact):
+        i = int(exact[np.argmin(np.abs(times[exact] - t))])
+        info.update(h_source="track", h_gap_s=0.0)
+        return Hs[i], info
+    before = np.flatnonzero(good & (times < t) & (times >= t - window))
+    after = np.flatnonzero(good & (times > t) & (times <= t + window))
+    ia = int(before[-1]) if len(before) else None
+    ib = int(after[0]) if len(after) else None
+    if ia is None and ib is None:
+        return None, info
+    gaps = [abs(t - times[i]) for i in (ia, ib) if i is not None]
+    info["h_gap_s"] = round(float(min(gaps)), 2)
+    fps = v.fps or 30.0
+    it = int(round(t * fps))
+    i0 = int(round(times[ia] * fps)) if ia is not None else it
+    i1 = int(round(times[ib] * fps)) if ib is not None else it
+    mask = None
+    if look.ignore is not None:
+        mask = np.where(cv2.dilate(look.ignore.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0, 0, 255).astype(np.uint8)
+    orb = HG.make_orb()
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    kept, motions = _read_motions(v, look, i0, i1, {it}, int(round(step * fps)), mask, orb, matcher)
+    if it not in kept:
+        return None, info
+    k = kept.index(it)
+    Hf = Hb = None
+    if ia is not None:
+        Hf = Hs[ia] / Hs[ia][2, 2]
+        for F in motions[:k]:
+            if F is None:
+                Hf = None
+                break
+            Hf = F @ Hf
+            Hf = Hf / Hf[2, 2]
+    if ib is not None:
+        Hb = Hs[ib] / Hs[ib][2, 2]
+        for F in reversed(motions[k:]):
+            if F is None:
+                Hb = None
+                break
+            Hb = np.linalg.inv(F) @ Hb
+            Hb = Hb / Hb[2, 2]
+    if Hf is not None and Hb is not None:
+        if uv is not None:
+            pf = np.array(HG.image_to_court(Hf, *uv))
+            pb = np.array(HG.image_to_court(Hb, *uv))
+            dm = float(np.linalg.norm(pf - pb))
+        else:
+            dm = HG.h_distance(Hf, Hb, (v.height, v.width), spec) * 0.05
+        info["h_agree_m"] = round(dm, 3)
+        if dm <= agree_m:
+            Hm = 0.5 * (Hf + Hb)
+            info["h_source"] = "two-way"
+            return Hm / Hm[2, 2], info
+    # 한쪽 길만: 가까우면 그대로, 멀면 그 화면 라인에 다시 맞춰 확인
+    cands = sorted([(abs(t - times[i]), Hx) for i, Hx in ((ia, Hf), (ib, Hb)) if i is not None and Hx is not None],
+                   key=lambda c: c[0])
+    if not cands:
+        return None, info
+    if cands[0][0] <= near_s:
+        info["h_source"] = "near"
+        return cands[0][1], info
+    frame = look.undistort(v.frame_at(t))
+    for _, Hx in cands:
+        Hr, sc, sup = HG.refine_homography(frame, Hx, spec, return_support=True, ignore=look.ignore)
+        for _ in range(3):
+            H2, s2, sup2 = HG.refine_homography(frame, Hr, spec, return_support=True, ignore=look.ignore)
+            if s2 <= sc + 0.005:
+                break
+            Hr, sc, sup = H2, s2, sup2
+        if sc >= min_score and HG.support_ok(sup) and HG.h_distance(Hr, Hx, frame.shape, spec) <= 10.0:
+            info["h_source"] = "verified"
+            return Hr, info
+    return None, info
+
+
+def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0):
+    """원본 화면 발 위치 하나를 판정 (shot·rejudge 공용). 반환: (ShotCall 또는 None, H 정보, 편 화면 좌표)."""
+    u, vv = look.to_canvas(u_raw, v_raw)
+    if v is not None:
+        H, info = _court_at_shot(look, v, t, spec, uv=(u, vv), window=window)
+    else:
+        H = look.at(t)
+        info = {"h_source": "track" if H is not None else "none", "h_gap_s": "", "h_agree_m": ""}
+    if H is None:
+        return None, info, (u, vv)
+    frame = look.undistort(v.frame_at(t)) if v is not None else None
+    call = HG.classify_click(H, u, vv, spec, side=side, frame=frame, ignore=look.ignore)
+    if info.get("h_agree_m") not in ("", None) and info["h_source"] == "two-way":
+        # 두 길이 발 자리에서 어긋난 만큼 위치가 흔들릴 수 있다 → 라인 근처 기준을 넓힌다
+        call.margin_sigma = float(np.hypot(call.margin_sigma, float(info["h_agree_m"])))
+        call.near_line = call.near_line or abs(call.margin) < max(0.3, 2.0 * call.margin_sigma)
+    return call, info, (u, vv)
+
+
 def cmd_overlay(a):
     spec = _spec(a.spec)
     v = Video(a.video)
-    look = _CourtLookup(a.calib, a.track)
+    look = _lookup(a, v)
     frame = look.undistort(v.frame_at(a.t))  # 렌즈 휨 보정한 추적이면 편 화면에 그린다
     H = look.at(a.t)
     if H is None:
@@ -598,28 +795,84 @@ def cmd_overlay(a):
     print(f"저장: {a.out}")
 
 
+def _lookup(a, video=None) -> "_CourtLookup":
+    """추적 결과·캘리브레이션 + 그래픽 자리(추적에 저장된 것 ∪ --graphics-box, 영상이 있고 추적에 없으면 자동으로 찾음)."""
+    look = _CourtLookup(a.calib, a.track)
+    if video is not None:
+        auto = look.ignore is None and not getattr(a, "no_graphics_mask", False)
+        look.add_graphics(_graphics_raw(video, 0.0, video.duration or 600.0, getattr(a, "graphics_box", None), auto=auto))
+    return look
+
+
 def cmd_shot(a):
     """원본 화면에서 찍은 발 위치(--u --v) 하나를 판정. --video 를 주면 그 화면에 보이는 3점 라인으로 보정하고(click-shots 와 같음),
-    추적 결과에 렌즈 휨 보정이 있으면 점과 화면을 편 화면으로 옮겨 판정한다."""
+    추적 결과에 그 프레임 좌표가 없으면 앞뒤 정상 화면에서 화면 이동으로 이어 온다. 렌즈 휨 보정이 있으면 편 화면에서 판정한다."""
     spec = _spec(a.spec)
-    look = _CourtLookup(a.calib, a.track)
+    v = Video(a.video) if a.video else None
+    look = _lookup(a, v)
     t = a.t or 0.0
-    H = look.at(t)
-    if H is None:
-        sys.exit("코트 변환이 없습니다.")
-    frame = look.undistort(Video(a.video).frame_at(t)) if a.video else None
-    u, v = look.to_canvas(a.u, a.v)
-    call = HG.classify_click(H, u, v, spec, side=a.side, frame=frame, ignore=look.ignore)
+    call, info, (u, vv) = _judge(look, v, t, a.u, a.v, spec, side=a.side, window=a.window)
+    if call is None:
+        sys.exit("코트 변환이 없습니다 (" + json.dumps(info, ensure_ascii=False) + ")")
     out = call.as_dict()
+    out.update(info)
     if look.lens is not None:
-        out["canvas_uv"] = [round(u, 1), round(v, 1)]
+        out["canvas_uv"] = [round(u, 1), round(vv, 1)]
     print(json.dumps(out, ensure_ascii=False, indent=2))
+
+
+def cmd_rejudge(a):
+    """click-shots CSV 의 발 위치(원본 화면 u, v)를 지금 코드로 모두 다시 판정 → CSV. 자유투 표시와 사람 라인 판정(line_call)은 지킨다.
+    court_points = 코트만으로 낸 점수(사람 판정 전), points = score-check 가 쓰는 점수."""
+    from . import scorecheck as SC
+
+    spec = _spec(a.spec)
+    v = Video(a.video)
+    look = _lookup(a, v)
+    rows = SC.read_csv(a.shots)
+    out = []
+    n_none = 0
+    for r in rows:
+        r2 = dict(r)
+        try:
+            t, u, vv = float(r["t_sec"]), float(r["u"]), float(r["v"])
+        except (KeyError, TypeError, ValueError):
+            out.append(r2)
+            continue
+        side = r.get("side") if r.get("side") in ("left", "right") else a.side
+        call, info, _ = _judge(look, v, t, u, vv, spec, side=side, window=a.window)
+        is_ft = str(r.get("zone", "")).upper() == "FT"
+        for k in ("points", "zone", "zone_kr", "near_line", "margin_m", "line_snap_px", "line_hidden", "ft_spot", "court_points"):
+            r2.pop(k, None)
+        if call is None:
+            n_none += 1
+            r2.update({"points": "", "zone": "", "zone_kr": "", "near_line": "", "court_points": ""})
+        else:
+            r2.update(call.as_dict())
+            r2["court_points"] = call.points
+        r2.update(info)
+        if r.get("line_call") in ("on", "behind") and call is not None:
+            r2["points"] = 2 if r["line_call"] == "on" else 3
+        if is_ft:
+            r2.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
+        out.append(r2)
+        print(f"{r.get('time') or t} {r.get('team', '')} {r.get('result', '')}: "
+              + (f"{r2['points']}점 {r2.get('zone_kr', '')} 라인까지 {r2.get('margin_m', '')}m"
+                 + (" 라인근처" if str(r2.get("near_line")) == "True" else "") if call is not None else "좌표 없음")
+              + f"  [{info['h_source']}" + (f", {info['h_gap_s']}s" if info["h_gap_s"] != "" else "")
+              + (f", 두 길 차이 {info['h_agree_m']}m" if info["h_agree_m"] != "" else "") + "]")
+    keys = list(dict.fromkeys(k for r in out for k in r))
+    _write_csv(a.out, [{k: r.get(k, "") for k in keys} for r in out])
+    src = {}
+    for r in out:
+        src[r.get("h_source", "")] = src.get(r.get("h_source", ""), 0) + 1
+    print(f"저장: {a.out} ({len(out)}개, 좌표 없음 {n_none}개, 코트 변환 출처 {src})")
 
 
 def cmd_click_shots(a):
     spec = _spec(a.spec)
     v = Video(a.video)
-    look = _CourtLookup(a.calib, a.track)
+    look = _lookup(a, v)
     rows = []
     if Path(a.out).exists():
         with open(a.out, encoding="utf-8-sig") as f:
@@ -942,6 +1195,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="좌표를 못 낸 구간이 이 초 이하이고 앞뒤가 정상이면, 양쪽에서 화면 이동으로 따라와 서로 맞을 때만 메움 (0 = 끔)")
     q.add_argument("--lens", default=None, help="lens-fit 결과 JSON. 주면 렌즈 휨을 편 화면에서 추적·판정 (화면 가장자리 정확도)")
     q.add_argument("--no-graphics-mask", action="store_true", help="방송 그래픽 자리를 라인 정합에서 빼지 않음 (비교용)")
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--out", default="out/court_track.npz")
 
     q = add("lens-fit", cmd_lens_fit, "캘리브레이션 화면들로 렌즈 휨(k1)을 재서 저장 → track-court --lens")
@@ -951,6 +1206,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--n-extra", type=int, default=8)
     q.add_argument("--min-score", type=float, default=0.8)
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--out", default="configs/lens.json")
 
     q = add("overlay", cmd_overlay, "코트 라인을 영상 프레임에 겹쳐 그려 확인")
@@ -960,6 +1217,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track")
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
     q.add_argument("--refine", action="store_true")
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
+    q.add_argument("--no-graphics-mask", action="store_true")
     q.add_argument("--out", default="out/overlay.png")
 
     q = add("shot", cmd_shot, "화면 좌표(슈터 발) 하나로 2점/3점 판정")
@@ -971,6 +1231,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track")
     q.add_argument("--side", choices=["left", "right"], default=None, help="공격 방향 림. 모르면 가까운 림")
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--window", type=float, default=8.0, help="그 프레임 좌표가 없을 때 앞뒤 몇 초 안의 정상 화면에서 이어 올지")
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
+    q.add_argument("--no-graphics-mask", action="store_true")
 
     q = add("click-shots", cmd_click_shots, "영상을 보며 슛 위치를 클릭해 기록 (2점/3점 자동 판정)")
     q.add_argument("--video", required=True)
@@ -979,7 +1243,23 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--start", type=float, default=0.0)
     q.add_argument("--side", choices=["left", "right"], default=None)
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
+    q.add_argument("--no-graphics-mask", action="store_true")
     q.add_argument("--out", default="out/shots.csv")
+
+    q = add("rejudge", cmd_rejudge, "click-shots CSV 의 발 위치를 지금 코드로 모두 다시 판정 (좌표 없는 프레임은 앞뒤 화면에서 이어 옴)")
+    q.add_argument("--shots", required=True, help="click-shots 결과 CSV (t_sec, u, v 필요)")
+    q.add_argument("--video", required=True)
+    q.add_argument("--track")
+    q.add_argument("--calib")
+    q.add_argument("--side", choices=["left", "right"], default=None, help="CSV 에 side 가 없을 때 공격 방향 림")
+    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--window", type=float, default=8.0)
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
+    q.add_argument("--no-graphics-mask", action="store_true")
+    q.add_argument("--out", default="out/shots_rejudged.csv")
 
     q = add("check-records", cmd_check_records, "기록지 엑셀의 이상한 값 점검 (득점 합계, 리바운드, 성공>시도 등)")
     q.add_argument("--records", required=True)
@@ -1017,7 +1297,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
-    if getattr(a, "calib", None) is None and getattr(a, "track", None) is None and a.cmd in ("overlay", "shot", "click-shots"):
+    if getattr(a, "calib", None) is None and getattr(a, "track", None) is None and a.cmd in ("overlay", "shot", "click-shots", "rejudge"):
         sys.exit("--calib 또는 --track 중 하나가 필요합니다.")
     a.fn(a)
 

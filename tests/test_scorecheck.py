@@ -150,3 +150,20 @@ def test_ft_spot_whole_semicircle():
     assert is_ft_spot(5.79 + 1.6, 7.9, FIBA)
     assert not is_ft_spot(5.79 + 2.3, 7.5, FIBA)  # 반원 밖
     assert not is_ft_spot(5.79 + 1.75, 7.5 + 1.15, FIBA)  # 반원(+찍기 오차 0.2m) 바깥 대각선
+
+
+def test_misread_detour_is_merged():
+    """점수판 한 번 바뀐 것을 중간에 말이 안 되는 값으로 읽으면(실제 D201: 67→'6'→69, B-LAB: 22→'114'→24) 합친다."""
+    events = [ev(4000, "away", 2), ev(4241, "away", -61, "correction"), ev(4247, "away", 63, "check"),
+              ev(533.5, "home", 92, "check"), ev(536, "home", -90, "correction"),
+              ev(900, "home", 2), ev(917, "home", -10, "correction"), ev(919, "home", 10, "check")]
+    fixed = SC.resolve_corrections(events)
+    got = [(float(e["t_sec"]), int(e["delta"]), e["flag"]) for e in fixed]
+    assert got[1] == (4241, 2, "ok") and got[2][2] == "merged"
+    assert got[3] == (533.5, 2, "ok") and got[4][2] == "merged"
+    assert got[6][2] == "merged" and got[7][2] == "merged"  # 14→'4'→14: 합 0 → 득점 아님
+    assert "오독" in fixed[1]["note"]
+    assert SC.resolve_corrections(fixed) == fixed
+    # 진짜 큰 정정(경기 시작 전 7:7 → 0:0)은 뒤따르는 짝이 없으므로 그대로 둔다
+    alone = SC.resolve_corrections([ev(143, "home", -7, "correction"), ev(200, "home", 2)])
+    assert [e["flag"] for e in alone] == ["correction", "ok"]
