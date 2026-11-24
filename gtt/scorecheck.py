@@ -25,11 +25,43 @@ def resolve_corrections(rows: list[dict], window: float = 30.0, lookback: float 
     - 그것도 아니면 늦게 몰아서 고친 것으로 본다: 감소 앞 lookback 초 안의 같은 팀 정상 변화를 최근 것부터 더해 가다
       감소량과 딱 맞으면 그 변화들을 모두 취소(flag "reverted", note "늦은 정정"). 실제 영상: 147s·173s 에 슛 없이 +1 이
       두 번 올랐다가 341s 에 -2 로 한꺼번에 지워졌다.
-    정상(ok)만 득점으로 세므로 score-check 는 고친 뒤의 점수로 비교한다."""
+    정상(ok)만 득점으로 세므로 score-check 는 고친 뒤의 점수로 비교한다.
+
+    먼저 '오독 구간'을 합친다: 같은 팀에서 말이 안 되는 변화(check/correction, 3점보다 큼)가 window 초 안에 이어지고
+    그 합이 1~3 이면 점수판이 한 번 바뀐 것을 잘못 읽은 것이다 → 첫 변화를 그 합의 정상 득점으로, 나머지는 "merged".
+    실제 영상: 67→69 를 67→'6'(-61)→69(+63) 로 읽음, 22→24 를 '114'(+92)→24(-90) 로 읽음. 합이 0 이면 모두 "merged"."""
     out = [dict(r) for r in rows]
     order = sorted(range(len(out)), key=lambda i: float(out[i]["t_sec"]))
     for team in {r["team"] for r in out}:
         idx = [i for i in order if out[i]["team"] == team]
+        p = 0
+        while p < len(idx):
+            e = out[idx[p]]
+            if e.get("flag") not in ("check", "correction") or abs(int(e["delta"])) <= 3:
+                p += 1
+                continue
+            t0, acc, run = float(e["t_sec"]), int(e["delta"]), [idx[p]]
+            q = p + 1
+            while q < len(idx) and len(run) < 4:
+                r = out[idx[q]]
+                if r.get("flag") not in ("check", "correction") or float(r["t_sec"]) - t0 > window:
+                    break
+                acc += int(r["delta"])
+                run.append(idx[q])
+                q += 1
+                if 0 <= acc <= 3:
+                    break
+            if len(run) >= 2 and 0 <= acc <= 3:
+                deltas = ", ".join(f"{int(out[i]['delta']):+d}" for i in run)
+                for i in run[1:]:
+                    out[i]["flag"] = "merged"
+                if acc == 0:
+                    e["flag"] = "merged"
+                else:
+                    e["flag"], e["delta"], e["note"] = "ok", acc, f"오독 구간 합침({deltas})"
+                p = q
+            else:
+                p += 1
         for p, j in enumerate(idx):
             e = out[j]
             d = int(e["delta"])

@@ -927,9 +927,7 @@ class CourtTracker:
 
     def supported(self, sup: tuple) -> bool:
         """보이는 코트 라인 줄 대부분이 실제 선과 겹치고, 맞은 줄의 방향이 엇갈리는가 (line_support 결과)."""
-        n_vis, n_good = sup[0], sup[1]
-        cross = sup[2] if len(sup) > 2 else 1
-        return n_good >= self.min_good_lines and n_good >= self.min_line_frac * n_vis and bool(cross)
+        return support_ok(sup, self.min_good_lines, self.min_line_frac)
 
     def sane(self, H: np.ndarray | None, shape) -> bool:
         """캘리브레이션 화면들과 비교해 코트가 찌그러지지 않았는가 (절대 기준)."""
@@ -947,6 +945,36 @@ class CourtTracker:
         self.prev = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.lost = False
         self.coast_n = 0
+
+
+def support_ok(sup: tuple, min_good_lines: int = 2, min_line_frac: float = 0.6) -> bool:
+    """line_support 결과 (보이는 줄, 맞은 줄, 방향 엇갈림) 로 좌표를 믿을 수 있는가 (CourtTracker 와 같은 기준)."""
+    n_vis, n_good = sup[0], sup[1]
+    cross = sup[2] if len(sup) > 2 else 1
+    return n_good >= min_good_lines and n_good >= min_line_frac * n_vis and bool(cross)
+
+
+def pair_motion(g0: np.ndarray, g1: np.ndarray, between=(), orb=None, matcher=None, mask=None, weak: int = 100,
+                min_ok: int = 40) -> np.ndarray | None:
+    """회색 화면 g0 → g1 화면 변환(3x3). 바로 구한 변환의 맞은 점이 weak 보다 적으면(빠른 패닝·흐림) between(사이 프레임들)을
+    차례로 이어 붙인다. 그것도 안 되면 맞은 점 min_ok 이상일 때만 바로 구한 것을 쓰고, 아니면 None(화면 전환일 수 있음)."""
+    orb = orb or make_orb()
+    matcher = matcher or cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    F, n = frame_to_frame(g0, g1, orb, matcher, mask=mask, return_inliers=True)
+    if F is not None and n >= weak:
+        return F / F[2, 2]
+    if between:
+        G, ga = np.eye(3), g0
+        for b in list(between) + [g1]:
+            Fi = frame_to_frame(ga, b, orb, matcher, mask=mask)
+            if Fi is None:
+                G = None
+                break
+            G = Fi @ G
+            ga = b
+        if G is not None:
+            return G / G[2, 2]
+    return F / F[2, 2] if (F is not None and n >= min_ok) else None
 
 
 def h_distance(Ha: np.ndarray, Hb: np.ndarray, shape, spec: CourtSpec = FIBA) -> float:
