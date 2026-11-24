@@ -273,7 +273,11 @@ def cmd_track_court(a):
     cal_list = [(t_calib, H0, cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY))]
     for c in calibs[1:]:
         Hc, dc = _load_calib(c)
-        tc = float(dc.get("t_sec") or 0.0)
+        if dc.get("t_sec") is None:
+            # 시각이 없으면 어느 화면의 H 인지 모른다 → 엉뚱한 화면과 짝지어지지 않게 뺀다
+            print(f"경고: {c} 에 t_sec(캘리브레이션한 화면 시각)가 없어 뺌", file=sys.stderr)
+            continue
+        tc = float(dc["t_sec"])
         try:
             fc = v.frame_at(tc)
         except ValueError:
@@ -281,6 +285,8 @@ def cmd_track_court(a):
             continue
         trk.add_anchor(fc, Hc)
         cal_list.append((tc, Hc, cv2.cvtColor(fc, cv2.COLOR_BGR2GRAY)))
+    for tc, _, _ in cal_list:
+        print(f"캘리브레이션 {fmt_time(tc)} ({tc:.2f}s) → 그 시각 좌표로 넣음", file=sys.stderr)
     print(f"기준 화면(캘리브레이션) {len(trk.anchors)}개", file=sys.stderr)
 
     def strong(Hr, sc):
@@ -313,10 +319,11 @@ def cmd_track_court(a):
         if t <= start:
             continue
         r = trk.update(frame, between)
-        if r.status == "coast" and trk.coast_n % 10 == 0:
-            # 오래 어긋나 있으면(2초) 기준 화면·키프레임과 맞춰 본다: 틀린 곳(반대쪽 골대 등)에 붙어 있었다면 여기서 바로잡힌다
+        if r.status == "coast" and trk.coast_n % a.reloc_every == 0:
+            # 좌표를 못 내는 동안 주기적으로 기준 화면·키프레임과 맞춰 본다: 틀린 곳(반대쪽 골대 등)에 붙어 있었다면
+            # 여기서 바로잡히고, 라인이 약해 못 잡던 화면도 기준 화면에서 옮겨 와 다시 맞추면 잡히는 경우가 많다
             Hr, sc = trk.relocalize(frame)
-            if strong(Hr, sc):
+            if strong(Hr, sc) or (Hr is not None and sc >= max(a.recover_score, 0.75)):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
         elif r.status in ("cut", "lost"):
@@ -812,6 +819,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--step", type=float, default=0.2)
     q.add_argument("--refine-every", type=int, default=1)
     q.add_argument("--recover-score", type=float, default=0.7, help="놓친 뒤 다시 찾은 화면을 받는 라인 일치율")
+    q.add_argument("--reloc-every", type=int, default=5, help="좌표를 못 내는(coast) 샘플이 이만큼 이어질 때마다 기준 화면과 다시 맞춰 봄")
     q.add_argument("--bridge", type=float, default=4.0,
                    help="좌표를 못 낸 구간이 이 초 이하이고 앞뒤가 정상이면, 양쪽에서 화면 이동으로 따라와 서로 맞을 때만 메움 (0 = 끔)")
     q.add_argument("--out", default="out/court_track.npz")

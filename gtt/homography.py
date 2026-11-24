@@ -671,6 +671,13 @@ class CourtTracker:
             return None, 0.0
         self.last_inliers = best[1]
         H, score, sup = refine_homography(frame, best[0] / best[0][2, 2], self.spec, return_support=True)
+        # 기준 화면에서 옮겨 온 H 는 멀리서 시작하는 경우가 많다. 한 번에 크기를 0.8~1.25배까지만 바꾸므로
+        # 일치율이 오르는 동안 몇 번 더 맞춘다 (실제 영상: 4번 반복해 0.86~0.88 로 잡힌 슛 장면들)
+        for _ in range(3):
+            H2, s2, sup2 = refine_homography(frame, H, self.spec, return_support=True)
+            if s2 <= score + 0.005:
+                break
+            H, score, sup = H2, s2, sup2
         self.last_support = sup
         if not self.supported(sup) or not self.sane(H, frame.shape):
             # 다시 찾은 자리의 라인이 대부분 안 겹치거나 찌그러졌다 → 믿지 않는다 (일치율을 0 으로 낮춰 받는 쪽이 버리게)
