@@ -243,7 +243,79 @@ def test_click_snaps_to_painted_three_line():
     # 라인이 다 가려지면(수비수) 보정하지 않고 표시만
     import cv2
 
+    # 발 근처(110px)가 가려져도 더 먼 라인 조각(150px 까지)으로 보정한다. 아크를 따라 바깥 방향이 돌아가도 발 자리 값으로 맞춘다
+    part = frame.copy()
+    cv2.circle(part, (int(u), int(v)), 110, (30, 30, 30), -1)
+    c = HG.classify_click(shift, u, v, FIBA, side="left", frame=part)
+    # (이 합성 화면은 3점 라인을 띠 가운데가 아니라 6.75m 에 칠해 1px 바깥에 있다 → 먼 조각에서는 그 차이가 조금 커진다)
+    assert c.line_snap_px is not None and abs(c.line_snap_px + 6) < 2.0 and c.points == 3
     hidden = frame.copy()
-    cv2.circle(hidden, (int(u), int(v)), 110, (30, 30, 30), -1)
+    cv2.circle(hidden, (int(u), int(v)), 170, (30, 30, 30), -1)
     c = HG.classify_click(shift, u, v, FIBA, side="left", frame=hidden)
     assert c.line_snap_px is None
+
+
+def _bug(frame, x0=420, y0=640, w=440, h=60, digits="47  52"):
+    """화면 아래 스코어버그: 어두운 상자 + 흰 테두리 + 흰 숫자 (라인처럼 보이는 흰 가는 획)."""
+    cv2 = __import__("cv2")
+    cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (30, 20, 20), -1)
+    cv2.rectangle(frame, (x0, y0), (x0 + w, y0 + h), (255, 255, 255), 2)
+    cv2.putText(frame, digits, (x0 + 30, y0 + 45), cv2.FONT_HERSHEY_DUPLEX, 1.3, (255, 255, 255), 2)
+    return frame
+
+
+def test_graphics_mask_finds_static_overlay_only():
+    """카메라가 움직이는 화면들에서 그대로인 스코어버그만 그래픽으로 잡는다 (코트 라인은 아님)."""
+    frames = [_bug(make_scene(shift=(dx, dy), seed=0)[0]) for dx, dy in [(0, 0), (60, 10), (-80, 20), (120, -10), (-30, 30), (90, 15)]]
+    g = HG.graphics_mask(frames)
+    assert g is not None
+    assert g[650:700, 430:850].mean() > 0.9   # 스코어버그
+    assert g[:600].mean() < 0.01               # 코트
+    # 카메라가 전혀 안 움직이면 판단하지 않는다
+    assert HG.graphics_mask([frames[0]] * 6) is None
+
+
+def test_refine_ignores_graphics_and_flags_blocked_line():
+    """스코어버그 흰 글자는 라인 정합에 쓰지 않고, 그 뒤에 가려진 3점 라인 근처 슛은 사람 판정(line_hidden)으로 넘긴다."""
+    frame, Htrue = make_scene()
+    # 오른쪽 아래 코너 쪽 3점 라인이 지나가는 자리에 스코어버그를 얹는다
+    from gtt.court import FIBA as F
+
+    x, y = 1.575 + F.three_radius * np.cos(np.radians(60)), 7.5 + F.three_radius * np.sin(np.radians(60))
+    u, v = HG.court_to_image(Htrue, x, y)
+    x0, y0 = int(u) - 170, int(v) - 160  # 발 근처(150px 안) 라인을 다 덮는 큰 그래픽
+    fb = _bug(frame.copy(), x0=x0, y0=y0, w=340, h=320)
+    ignore = np.zeros(frame.shape[:2], bool)
+    ignore[max(0, y0 - 6):y0 + 326, max(0, x0 - 6):x0 + 346] = True
+    # 맞는 H 에서 시작하면 그래픽을 빼고 맞춰도 그대로, 일치율은 가려진 점을 세지 않아 더 높다
+    H1, s_ign = HG.refine_homography(fb, Htrue, F, ignore=ignore)
+    _, s_all = HG.refine_homography(fb, Htrue, F)
+    assert HG.h_distance(H1, Htrue, frame.shape) < 1.5 and s_ign >= s_all
+    # 발이 라인 바로 안쪽(2점), 라인은 스코어버그 뒤 → 계산만 믿지 않고 사람 판정
+    xi, yi = 1.575 + (F.three_radius - 0.4) * np.cos(np.radians(60)), 7.5 + (F.three_radius - 0.4) * np.sin(np.radians(60))
+    uf, vf = HG.court_to_image(Htrue, xi, yi)
+    c = HG.classify_click(Htrue, uf, vf, F, side="left", frame=fb, ignore=ignore)
+    assert c.line_snap_px is None and c.line_hidden and c.near_line
+    # 그래픽이 없는 화면이면 라인을 직접 보고 확실하게 판정
+    c2 = HG.classify_click(Htrue, uf, vf, F, side="left", frame=frame, ignore=None)
+    assert not c2.line_hidden and c2.points == 2
+
+
+def test_relocalize_tries_anchor_when_best_keyframe_is_wrong():
+    """특징점이 가장 많이 맞는 키프레임의 H 가 틀렸어도, 기준 화면(앵커)에서 옮겨 온 후보로 다시 찾는다
+    (실제 영상 195~206s: 왼쪽 기준 화면에서 맞추면 0.81 인데 계속 lost)."""
+    f0, H0 = make_scene()
+    f1, H1 = make_scene(shift=(40, 15))
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    # 지금 화면과 똑같은 화면을 '틀린 H(옆으로 45px)' 로 키프레임에 넣어 둔다 → 특징점은 이쪽이 훨씬 많이 맞는다
+    bad = np.array([[1, 0, 45.0], [0, 1, 0], [0, 0, 1]]) @ H1
+    trk._add_keyframe(cv2_gray(f1), bad)
+    H, sc = trk.relocalize(f1)
+    assert H is not None and sc >= 0.8
+    assert HG.h_distance(H, H1, f1.shape) < 2.0
+
+
+def cv2_gray(f):
+    import cv2
+
+    return cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)

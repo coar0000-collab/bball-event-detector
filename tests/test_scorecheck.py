@@ -129,3 +129,24 @@ def test_line_call_counts_as_human_judgment():
     s = dict(shot(10, "home", 2, near=True), line_call="on")
     summ = SC.check([ev(12, "home", 2)], [s]).summary()
     assert summ["일치"] == 1 and summ["라인 근처 사람 판정"] == 1
+
+
+def test_correction_late_batch_cancels_recent_scores():
+    """슛 없이 +1 이 두 번 올랐다가 몇 분 뒤 -2 로 한꺼번에 지워지면 (실제 처음 보는 구간 147s·173s → 341s) 둘 다 득점 아님."""
+    events = [ev(19.5, "home", 1), ev(56.5, "home", 2), ev(147, "home", 1), ev(173, "home", 1), ev(200, "away", 3),
+              ev(341, "home", -2, "correction"), ev(474, "home", 2)]
+    fixed = SC.resolve_corrections(events)
+    assert [e["flag"] for e in fixed] == ["ok", "ok", "reverted", "reverted", "ok", "merged", "ok"]
+    assert "늦은 정정" in fixed[2]["note"]
+    assert SC.resolve_corrections(fixed) == fixed
+    # 감소량과 딱 맞는 묶음이 없으면 그대로 둔다 (사람이 볼 수 있게 correction 으로 남김)
+    odd = SC.resolve_corrections([ev(10, "home", 3), ev(100, "home", 3), ev(300, "home", -2, "correction")])
+    assert [e["flag"] for e in odd] == ["ok", "ok", "correction"]
+
+
+def test_ft_spot_whole_semicircle():
+    """자유투는 자유투 라인 뒤 반원 안 어디서나 쏠 수 있다 (실제 영상: 라인 1.1m 뒤)."""
+    assert is_ft_spot(5.79 + 1.1, 7.5, FIBA)
+    assert is_ft_spot(5.79 + 1.6, 7.9, FIBA)
+    assert not is_ft_spot(5.79 + 2.3, 7.5, FIBA)  # 반원 밖
+    assert not is_ft_spot(5.79 + 1.75, 7.5 + 1.15, FIBA)  # 반원(+찍기 오차 0.2m) 바깥 대각선

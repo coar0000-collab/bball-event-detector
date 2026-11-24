@@ -80,3 +80,25 @@ def test_detector_flags_odd_changes():
 def test_short_glitch_ignored():
     seq = [(10, 8)] * 3 + [(70, 8)] * 2 + [(10, 8)] * 5
     assert run(SB.ScoreChangeDetector(), seq) == []
+
+
+def test_split_digit_read_near_previous_score():
+    """중계 글꼴의 '4' 가 사선과 세로획 두 조각으로 끊겨 '241'·'221' 처럼 읽히던 경우 (실제 처음 보는 구간 533.5s: 22→24 를
+    114 로 읽어 +92). 직전 점수 근처 값 중 템플릿과 닮은 값으로 읽는다. 실제 화면에서 '4' 를 등록하지 않아 글꼴 대체
+    템플릿만 있는 경우."""
+    t = SB.DigitTemplates()
+    for v in ["10", "23", "56", "78", "90", "33", "15"]:
+        assert SB.learn(t, bug(v), v)
+    assert t.missing() == ["4"]
+    for g in SB.DigitTemplates.from_fonts().samples["4"]:
+        t.add("4", g)
+    img = bug("24")
+    img[:, 39:40] = (40, 20, 10)  # '4' 를 두 조각으로 끊는다
+    assert SB.read_number(img, t).value != 24
+    assert SB.read_number_near(img, t, 22).value == 24
+    # 정상 판독은 그대로, 크게 바뀐 값(다음 경기 0:0)은 닮은 값이 없으면 그냥 읽은 값
+    assert SB.read_number_near(bug("23"), t, 22).value == 23
+    assert SB.read_number_near(bug("0"), t, 87).value == 0
+    # 끊긴 조각도 자릿수를 알면 합쳐서 등록할 수 있다
+    t2 = SB.DigitTemplates()
+    assert SB.learn(t2, img, "24") and "4" in t2.samples

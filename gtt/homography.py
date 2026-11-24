@@ -4,6 +4,8 @@ H 는 항상 "코트(m) → 화면(px)" 방향으로 저장한다. 화면 → �
 """
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 
 import cv2
@@ -72,68 +74,166 @@ def _three_center_samples(H: np.ndarray, spec: CourtSpec, side: str, step_m: flo
 
 def snap_three_line(frame: np.ndarray, H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, side: str = "left",
                     exclude_px: float = 22.0, reach_px: float = 90.0, search_px: int = 12, min_samples: int = 6,
-                    mask: np.ndarray | None = None):
+                    mask: np.ndarray | None = None, ignore: np.ndarray | None = None, far_reach_px: float = 150.0,
+                    wide_px: int = 28):
     """찍은 발 근처에서 실제로 보이는 3점 라인이 H 로 계산한 라인보다 화면에서 몇 px 바깥(+)/안쪽(-)에 있는지.
 
-    코트 전체로 맞춘 H 는 군데군데 몇 px 어긋날 수 있다. 2점/3점은 발끝과 '칠해진 라인' 사이 거리로 정해지므로,
-    발 주변(신발이 가리는 exclude_px 안쪽은 빼고 reach_px 까지)에서 라인 가운데를 직접 찾아 그 차이를 잰다.
-    수비수·슈터 몸에 가려 보이는 라인 조각이 min_samples 보다 적거나 서로 안 맞으면(다른 종목 선 등) None → 보정하지 않는다.
-    반환: (차이 px, 쓴 조각 수, 발에서 가장 가까운 라인 점의 바깥 방향 단위 벡터) 또는 None.
+    코트 전체로 맞춘 H 는 군데군데 몇 px(화면 가장자리는 렌즈 휨 때문에 20px 넘게도) 어긋날 수 있다. 2점/3점은 발끝과
+    '칠해진 라인' 사이 거리로 정해지므로, 발 주변(신발이 가리는 exclude_px 안쪽은 빼고 reach_px 까지)에서 라인 가운데를
+    직접 찾아 그 차이를 잰다. 가까이에 쓸 만한 조각이 모자라면 far_reach_px 까지 넓힌다.
+    계산 라인에서 ±search_px 안의 가는 흰 줄(폭 8px 이하)을 모두 후보로 두고, 여러 조각이 같은 차이를 가리키는 값(투표)을
+    고른다. 가장 가까운 줄만 쓰면 신발·그래픽 테두리 같은 엉뚱한 줄에 붙는다(실제 영상 383s: +2.8px 로 잘못 보정).
+    ±search_px 에서 못 찾으면 ±wide_px 로 한 번 더 찾는다(실제 영상: 화면 아래 라인이 20px 어긋남). 처음부터 넓게 찾으면 먼 코너에서
+    0.9m 옆 사이드라인까지 창에 들어와 애매해진다.
+    두 값이 비슷하게 많이 나오면(다른 선이 나란히 있음) 믿지 않는다. 그래픽 자리(ignore)에 걸친 조각은 쓰지 않는다.
+    반환: (차이 px, 쓴 조각 수, 발에서 가장 가까운 라인 점의 바깥 방향 단위 벡터) 또는 None(가려짐·애매함).
     """
     m = (line_mask(frame) > 0) if mask is None else mask
+    r = _snap_three(m, H, u, v, spec, side, exclude_px, reach_px, search_px, min_samples, ignore, far_reach_px)
+    if r is None and wide_px > search_px:
+        r = _snap_three(m, H, u, v, spec, side, exclude_px, reach_px, wide_px, min_samples, ignore, far_reach_px)
+    return r
+
+
+def _snap_three(m, H, u, v, spec, side, exclude_px, reach_px, search_px, min_samples, ignore, far_reach_px):
     h, w = m.shape
     a, n = _three_center_samples(H, spec, side)
     d = np.hypot(a[:, 0] - u, a[:, 1] - v)
     if not len(d):
         return None
     n_near = n[int(np.argmin(d))]
-    idx = np.flatnonzero((d >= exclude_px) & (d <= reach_px))
-    if len(idx) > 60:
-        idx = idx[np.linspace(0, len(idx) - 1, 60).astype(int)]
-    offs = []
     ts = np.arange(-search_px, search_px + 1)
-    for i in idx:
+    bad = None
+    if ignore is not None:
+        bad = cv2.dilate(ignore.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+
+    def runs_at(i):
         q = a[i][None, :] + ts[:, None] * n[i][None, :]
         qi = np.round(q).astype(int)
         inside = (qi[:, 0] >= 0) & (qi[:, 0] < w) & (qi[:, 1] >= 0) & (qi[:, 1] < h)
         if not inside.all():
-            continue
+            return None
+        if bad is not None and bad[qi[:, 1], qi[:, 0]].any():
+            return None
         on = m[qi[:, 1], qi[:, 0]]
-        if not on.any():
-            continue
-        # 흰 픽셀 덩어리(run)들 중 계산 위치(0)에 가장 가까운 것. 너무 두꺼우면(신발·유니폼·다른 큰 흰 면) 버린다.
-        runs, k = [], 0
+        out, k = [], 0
         while k < len(on):
             if on[k]:
                 j = k
                 while j + 1 < len(on) and on[j + 1]:
                     j += 1
-                runs.append((ts[k], ts[j]))
+                # 너무 두꺼운 덩어리(신발·유니폼·큰 흰 면)나 창 끝에 걸린 줄은 버린다
+                if j - k + 1 <= 8 and k > 0 and j < len(on) - 1:
+                    out.append((ts[k] + ts[j]) / 2.0)
                 k = j + 1
             else:
                 k += 1
-        c0, c1 = min(runs, key=lambda r: abs((r[0] + r[1]) / 2))
-        if c1 - c0 + 1 > 8 or c0 == ts[0] or c1 == ts[-1]:
-            continue
-        offs.append((c0 + c1) / 2)
-    if len(offs) < min_samples:
+        return out
+
+    # 다른 코트 라인(사이드라인·베이스라인 등)이 각 조각의 바깥 방향 직선과 만나는 자리(계산 라인 기준 px).
+    # 먼 코너에서는 0.9m 옆 사이드라인이 10~20px 안에 들어와 두 줄이 같이 보인다. H 가 어긋나면 두 줄이 같이 밀리므로
+    # '3점 라인이 s 에 있다'는 가정이 맞으면 다른 줄도 s + (그 줄 자리) 에 보여야 한다 → 그 가정에 점수를 더 준다.
+    from .court import court_polylines as _cp
+
+    other_pts = np.concatenate([densify(pl, 0.05) for k, pl in _cp(spec).items() if not k.endswith("_three")])
+    other_uv = project(H, other_pts)
+
+    def others_at(i):
+        rel = other_uv - a[i]
+        along = rel @ n[i]
+        perp = np.abs(rel @ np.array([-n[i][1], n[i][0]]))
+        o = np.sort(along[(perp <= 1.0) & (np.abs(along) <= search_px + 30)])
+        out = []
+        for x in o:
+            if not out or x - out[-1] > 2.0:
+                out.append(float(x))
+        return out
+
+    def collect(lo, hi):
+        idx = np.flatnonzero((d >= lo) & (d <= hi))
+        if len(idx) > 60:
+            idx = idx[np.linspace(0, len(idx) - 1, 60).astype(int)]
+        res = []
+        for i in idx:
+            r = runs_at(i)
+            if r:
+                res.append((r, n[i], others_at(i)))
+        return res
+
+    samples = collect(exclude_px, reach_px)
+    if len(samples) < min_samples and far_reach_px > reach_px:
+        samples += collect(reach_px + 1e-6, far_reach_px)
+    if len(samples) < min_samples:
         return None
-    offs = np.array(offs, float)
-    med = float(np.median(offs))
-    if float(np.median(np.abs(offs - med))) > 1.5 or abs(med) > search_px - 2:
+
+    def near(r, x):
+        return any(abs(q - x) <= 2.0 for q in r)
+
+    # 투표: '3점 라인이 c 에 있다' → 조각마다 c 에 줄이 보이면 1점, 창 안에 들어오는 다른 코트 라인도 제자리(c + o)에 보이면
+    # 그 비율만큼 더한다.
+    cands = sorted({round(x * 2) / 2 for r, _, _ in samples for x in r})
+    seen, score = [], []
+    for c in cands:
+        n3 = sc = 0.0
+        for r, _, os_ in samples:
+            if near(r, c):
+                n3 += 1
+                sc += 1
+                inw = [o for o in os_ if abs(c + o) <= search_px - 1]
+                if inw:
+                    sc += sum(near(r, c + o) for o in inw) / len(inw)
+        seen.append(n3)
+        score.append(sc)
+    seen, score = np.array(seen), np.array(score)
+    best = int(np.argmax(score - 0.01 * np.abs(np.array(cands))))  # 같으면 계산 위치에 가까운 쪽
+    c0, v0 = cands[best], int(seen[best])
+    if v0 < max(min_samples, 0.6 * len(samples)):
         return None
-    return med, len(offs), n_near
+    # 4px 넘게 떨어진 다른 값이 비슷하게 그럴듯하면 애매하다 (설명 안 되는 나란한 선)
+    other = [sv for c, sv in zip(cands, score) if abs(c - c0) > 4.0]
+    if other and max(other) >= 0.6 * score[best]:
+        return None
+    samples = [(r, ni) for r, ni, _ in samples]
+    # 라인이 화면에서 (du, dv) 만큼 통째로 밀렸다고 보고 맞춘다: 조각마다 차이 = 그 자리 바깥 방향 · (du, dv).
+    # 아크를 따라 바깥 방향이 돌아가므로, 발에서 먼 조각까지 쓸 때 차이를 그냥 평균하면 발 자리 값과 달라진다.
+    pred = np.full(len(samples), c0)
+    t = np.zeros(2)
+    for it in range(3):
+        tol = 3.0 if it == 0 else 2.0
+        rows, offs = [], []
+        for (r, ni), p in zip(samples, pred):
+            x = min(r, key=lambda q: abs(q - p))
+            if abs(x - p) <= tol:
+                rows.append(ni)
+                offs.append(x)
+        if len(offs) < min_samples:
+            return None
+        A, b = np.array(rows), np.array(offs)
+        lam = 1e-3 * len(b)
+        t = np.linalg.solve(A.T @ A + lam * np.eye(2), A.T @ b)
+        pred = np.array([float(ni @ t) for _, ni in samples])
+    res = b - A @ t
+    if float(np.median(np.abs(res))) > 1.5:
+        return None
+    off = float(n_near @ t)
+    if abs(off) > search_px - 2:
+        return None
+    return off, len(b), n_near
 
 
 def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, side: str | None = None,
                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3, frame: np.ndarray | None = None,
-                   foot: str = "mid", line_mask_img: np.ndarray | None = None):
+                   foot: str = "mid", line_mask_img: np.ndarray | None = None, ignore: np.ndarray | None = None,
+                   hidden_near_m: float = 1.2):
     """화면에서 찍은 발 위치(u, v)로 2점/3점을 판정하고, 찍기 오차를 반영해 '라인 근처'를 정한다.
 
     같은 1px 이라도 카메라에서 먼 쪽(특히 먼 코너)은 코트에서 수 cm~10cm 가 된다. 그래서 고정 30cm 대신
     click_px 만큼 잘못 찍었을 때 3점 라인까지 거리가 흔들리는 정도(margin_sigma)의 k 배와 30cm 중 큰 값 안쪽이면 near_line.
     frame 을 주면 발 근처에 실제로 보이는 3점 라인에 맞춰 위치를 보정한다(snap_three_line). 라인이 가려져 못 찾으면
     H 로 계산한 라인을 그대로 쓰고 line_snap_px=None.
+    그때 발 근처 라인이 방송 그래픽(ignore)이나 화면 가장자리에 걸려 있고 라인까지 hidden_near_m 안이면, 계산만으로는
+    믿을 수 없으므로 line_hidden=True, near_line=True (사람 판정). 실제 영상: 스코어버그 바로 위 윙 3점 2개를 계산 라인이
+    20px 어긋나 2점으로 냈다.
     foot: "mid" = 두 발 가운데를 찍음 / "toe" = 림 쪽 발끝을 찍음 (court.classify_shot 참고).
     """
     from .court import classify_shot, three_point_margin
@@ -142,7 +242,7 @@ def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, si
     call = classify_shot(x, y, spec, side=side, foot=foot)
     snap = None
     if frame is not None:
-        snap = snap_three_line(frame, H, u, v, spec, call.side, mask=line_mask_img)
+        snap = snap_three_line(frame, H, u, v, spec, call.side, mask=line_mask_img, ignore=ignore)
         if snap is not None:
             off, _, n_near = snap
             # 칠해진 라인이 off px 바깥에 있으면, 라인에 대한 발 위치는 그만큼 안쪽 → 찍은 점을 반대로 옮긴 것과 같다
@@ -157,11 +257,34 @@ def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, si
     sigma = click_px * float(np.hypot(mu, mv))
     call.margin_sigma = sigma
     call.near_line = abs(m0) < max(min_near_m, k * sigma)
+    if frame is not None and snap is None and abs(m0) < hidden_near_m:
+        call.line_hidden = _line_blocked(H, u, v, spec, call.side, frame.shape, ignore)
+        call.near_line = call.near_line or call.line_hidden
     return call
 
 
+def _line_blocked(H: np.ndarray, u: float, v: float, spec: CourtSpec, side: str, shape, ignore: np.ndarray | None,
+                  reach_px: float = 90.0, edge_px: int = 12) -> bool:
+    """발 근처(reach_px 안) 3점 라인 조각의 절반 이상이 그래픽(ignore)이나 화면 가장자리(edge_px)에 걸려 있는가."""
+    a, _ = _three_center_samples(H, spec, side)
+    d = np.hypot(a[:, 0] - u, a[:, 1] - v)
+    near = a[d <= reach_px]
+    if not len(near):
+        return True  # 발 근처에 라인 자체가 화면 안에 없다
+    h, w = shape[:2]
+    ui = np.round(near).astype(int)
+    out = (ui[:, 0] < edge_px) | (ui[:, 0] >= w - edge_px) | (ui[:, 1] < edge_px) | (ui[:, 1] >= h - edge_px)
+    blk = out.copy()
+    if ignore is not None:
+        inside = ~out
+        g = cv2.dilate(ignore.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+        blk[inside] = g[ui[inside, 1], ui[inside, 0]]
+    return float(blk.mean()) >= 0.5
+
+
 def classify_clicks(clicks, spec: CourtSpec = FIBA, side: str | None = None,
-                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3, foot: str = "mid"):
+                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3, foot: str = "mid",
+                    ignore: np.ndarray | None = None):
     """같은 슛의 발 위치를 여러 프레임(또는 확대해서 여러 번) 찍은 것을 코트에서 평균해 판정한다.
 
     clicks: [(H, u, v), ...] 또는 [(H, u, v, frame), ...] — 프레임마다 카메라가 움직여도 각자의 H 로 코트 좌표를 구한 뒤
@@ -171,7 +294,7 @@ def classify_clicks(clicks, spec: CourtSpec = FIBA, side: str | None = None,
     from .court import classify_shot
 
     calls = [classify_click(c[0], c[1], c[2], spec, side=side, click_px=click_px, k=k, min_near_m=min_near_m,
-                            frame=c[3] if len(c) > 3 else None, foot=foot) for c in clicks]
+                            frame=c[3] if len(c) > 3 else None, foot=foot, ignore=ignore) for c in clicks]
     side = side or calls[0].side
     x = float(np.mean([c.court_xy[0] for c in calls]))
     y = float(np.mean([c.court_xy[1] for c in calls]))
@@ -180,7 +303,9 @@ def classify_clicks(clicks, spec: CourtSpec = FIBA, side: str | None = None,
     call.line_snap_px = float(np.mean(snaps)) if snaps else None
     sigma = float(np.sqrt(np.sum([c.margin_sigma ** 2 for c in calls]))) / len(calls)
     call.margin_sigma = sigma
-    call.near_line = abs(call.margin) < max(min_near_m, k * sigma)
+    # 라인을 직접 본(보정한) 화면이 하나도 없고 가려진 화면이 있으면 계산만으로 믿을 수 없다
+    call.line_hidden = not snaps and any(c.line_hidden for c in calls)
+    call.near_line = abs(call.margin) < max(min_near_m, k * sigma) or call.line_hidden
     return call
 
 
@@ -294,7 +419,8 @@ def view_aspect(H: np.ndarray, shape) -> float:
 
 
 def line_support(dist: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, tol: float = 4.0,
-                 min_pts: int = 10, good: float = 0.4, cross_deg: float = 20.0) -> tuple[int, int, int]:
+                 min_pts: int = 10, good: float = 0.4, cross_deg: float = 20.0,
+                 ignore: np.ndarray | None = None) -> tuple[int, int, int]:
     """(화면에 보이는 코트 라인 줄 수, 그중 실제 흰 선과 good 비율 이상 겹치는 줄 수, 맞은 줄의 방향이 엇갈리는가 0/1).
 
     전체 일치율 하나로는 틀린 정합(예: 키를 하프코트 근처 선에 겹침)도 0.5~0.65 가 나온다. 맞는 H 라면 보이는 줄
@@ -308,7 +434,7 @@ def line_support(dist: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, tol: f
     curved = False
     for _, pts in _line_elements(spec):
         uv = project(H, pts)
-        ok = (uv[:, 0] >= 5) & (uv[:, 0] < w - 6) & (uv[:, 1] >= 5) & (uv[:, 1] < h - 6)
+        ok = _visible(uv, w, h, ignore, border=5)
         if ok.sum() < min_pts:
             continue
         n_vis += 1
@@ -339,6 +465,7 @@ def refine_homography(
     iterations: int = 10,
     min_matches: int = 30,
     return_support: bool = False,
+    ignore: np.ndarray | None = None,
 ):
     """현재 H 로 투영한 코트 라인을 실제 흰 라인 픽셀에 맞춰 다듬는다.
 
@@ -352,12 +479,15 @@ def refine_homography(
     벗어나는 결과는 받지 않는다 (줌은 화면 이동이 따라가므로 라인 정합이 크기를 크게 바꿀 일이 없다. 0.6 까지 허용했더니
     실제 영상에서 샘플마다 조금씩 줄어 결국 찌그러졌다 — 절대 기준은 CourtTracker.sane).
     """
-    mask = (line_mask(frame) > 0).astype(np.float32)
+    mask = line_mask(frame) > 0
+    if ignore is not None:
+        mask &= ~ignore  # 그래픽의 흰 글자·테두리는 코트 라인이 아니다
+    mask = mask.astype(np.float32)
     h, w = mask.shape
     dist = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
 
     def out(Hx, sc):
-        return (Hx, sc, line_support(dist, Hx, spec)) if return_support else (Hx, sc)
+        return (Hx, sc, line_support(dist, Hx, spec, ignore=ignore)) if return_support else (Hx, sc)
 
     court_pts = np.concatenate([densify(p, 0.2) for p in court_polylines(spec).values()])
     if mask.sum() < min_matches:
@@ -365,7 +495,7 @@ def refine_homography(
     xs = np.tile(np.arange(w, dtype=np.float32), (h, 1))
     ys = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
     A0 = key_area(H, spec)
-    best_H, best_score = H, _line_score(dist, project(H, court_pts), w, h)
+    best_H, best_score = H, _line_score(dist, project(H, court_pts), w, h, ignore=ignore)
     cur = H
     # 넓은 창으로 크게 당긴 뒤 창을 줄여 가며 정밀하게 맞춘다 (coarse-to-fine)
     radii = [r for r in (search_px, max(3, search_px // 2), 3) if r <= search_px]
@@ -376,7 +506,7 @@ def refine_homography(
         sy = cv2.boxFilter(mask * ys, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
         for _ in range(iterations):
             uv = project(cur, court_pts)
-            ok = (uv[:, 0] >= 0) & (uv[:, 0] < w - 1) & (uv[:, 1] >= 0) & (uv[:, 1] < h - 1)
+            ok = _visible(uv, w, h, ignore)
             if ok.sum() < min_matches:
                 break
             ui = np.round(uv[ok]).astype(int)
@@ -404,18 +534,105 @@ def refine_homography(
             cur = newH
             if move < 0.2:
                 break
-    score = _line_score(dist, project(cur, court_pts), w, h)
+    score = _line_score(dist, project(cur, court_pts), w, h, ignore=ignore)
     if score >= best_score - 0.02 and _area_ok(cur, A0, spec, 0.8, 1.25):  # 일치율이 눈에 띄게 나빠지지 않았으면 채택
         best_H, best_score = cur, score
     return out(best_H, best_score)
 
 
-def _line_score(dist: np.ndarray, uv: np.ndarray, w: int, h: int, tol: float = 4.0) -> float:
-    ok = (uv[:, 0] >= 0) & (uv[:, 0] < w - 1) & (uv[:, 1] >= 0) & (uv[:, 1] < h - 1)
+def _visible(uv: np.ndarray, w: int, h: int, ignore: np.ndarray | None = None, border: int = 0) -> np.ndarray:
+    """화면 안(가장자리 border px 제외)에 있고 ignore(방송 그래픽·편 화면의 검정 여백)에 안 걸린 점."""
+    ok = (uv[:, 0] >= border) & (uv[:, 0] < w - 1 - border) & (uv[:, 1] >= border) & (uv[:, 1] < h - 1 - border)
+    if ignore is not None and ok.any():
+        ui = np.round(uv[ok]).astype(int)
+        sub = ~ignore[ui[:, 1], ui[:, 0]]
+        ok[np.flatnonzero(ok)] = sub
+    return ok
+
+
+def _line_score(dist: np.ndarray, uv: np.ndarray, w: int, h: int, tol: float = 4.0,
+                ignore: np.ndarray | None = None) -> float:
+    """투영한 코트 라인 점 중 실제 라인 위(±tol px)에 있는 비율. 그래픽에 가려 볼 수 없는 점(ignore)은 세지 않는다."""
+    ok = _visible(uv, w, h, ignore)
     if ok.sum() == 0:
         return 0.0
     ui = np.round(uv[ok]).astype(int)
     return float(np.mean(dist[ui[:, 1], ui[:, 0]] <= tol))
+
+
+def line_residual(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, cap: float = 6.0,
+                  ignore: np.ndarray | None = None, mask: np.ndarray | None = None) -> tuple[float, int]:
+    """투영한 코트 라인 점에서 주변(±cap px) 흰 라인 픽셀의 무게중심(=라인 가운데)까지 평균 거리(px, cap 에서 자름)와
+    쓴 점 수. 일치율(±4px 안 비율)보다 세밀해서, 렌즈 휨처럼 몇 px 차이를 가를 때 쓴다. 주변에 라인이 없으면 cap."""
+    m = (line_mask(frame) > 0) if mask is None else mask.astype(bool)
+    if ignore is not None:
+        m = m & ~ignore
+    h, w = m.shape
+    mf = m.astype(np.float32)
+    r = int(math.ceil(cap))
+    k = (2 * r + 1, 2 * r + 1)
+    xs = np.tile(np.arange(w, dtype=np.float32), (h, 1))
+    ys = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
+    cnt = cv2.boxFilter(mf, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    sx = cv2.boxFilter(mf * xs, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    sy = cv2.boxFilter(mf * ys, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
+    pts = np.concatenate([densify(p, 0.1) for p in court_polylines(spec).values()])
+    uv = project(H, pts)
+    ok = _visible(uv, w, h, ignore, border=r + 1)
+    if ok.sum() == 0:
+        return cap, 0
+    ui = np.round(uv[ok]).astype(int)
+    c = cnt[ui[:, 1], ui[:, 0]]
+    has = c >= 2
+    d = np.full(len(ui), cap)
+    cx = sx[ui[has, 1], ui[has, 0]] / c[has]
+    cy = sy[ui[has, 1], ui[has, 0]] / c[has]
+    d[has] = np.minimum(np.hypot(cx - uv[ok][has, 0], cy - uv[ok][has, 1]), cap)
+    return float(np.mean(d)), int(ok.sum())
+
+
+def graphics_mask(frames, still: int = 14, close_px: int = 31, grow_px: int = 6, max_frac: float = 0.35) -> np.ndarray | None:
+    """방송 그래픽(스코어버그·로고·자막) 자리 = True. 라인 정합·라인 보정에서 이 자리의 흰 픽셀(숫자·테두리)을 코트 라인으로
+    잘못 쓰지 않고, 그래픽에 가려 안 보이는 코트 라인 점을 '틀림'으로 세지 않게 한다.
+
+    frames: 구간 전체에서 띄엄띄엄 뽑은 화면들 (카메라가 움직여야 코트와 그래픽이 갈린다).
+    모든 화면에서 밝기가 거의 같고(still 안) 그 자리에 글자·테두리 같은 경계가 있는 곳을 씨앗으로, 상자 모양으로 메운다.
+    거의 전부가 그대로면(카메라가 안 움직임) 판단할 수 없어 None."""
+    gs = [f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames if f is not None]
+    if len(gs) < 4:
+        return None
+    # 압축·센서 잡음은 살짝 흐려서 줄이고, 리플레이·화면 전환으로 그래픽이 한두 장 빠져도 되게 위아래 15% 는 빼고 범위를 본다
+    g = np.stack([cv2.GaussianBlur(x, (5, 5), 0) for x in gs]).astype(np.int16)
+    srt = np.sort(g, axis=0)
+    lo_i = int(0.15 * (len(gs) - 1))
+    hi_i = len(gs) - 1 - lo_i
+    rng = (srt[hi_i] - srt[lo_i]) < still
+    med = np.median(np.stack(gs), axis=0).astype(np.uint8)
+    edges = cv2.Canny(med, 60, 150) > 0
+    # 무늬가 있는 곳(경계)이 대부분 그대로면 카메라가 안 움직인 것 → 그래픽과 코트를 가를 수 없다.
+    # (무늬 없는 검정 여백·단색 벽은 원래 안 변하므로 세지 않는다)
+    tex = np.zeros_like(edges)
+    for x in gs[:: max(1, len(gs) // 4)]:
+        tex |= cv2.Canny(x, 60, 150) > 0
+    if tex.sum() == 0 or (rng & tex).sum() / tex.sum() > max_frac:
+        return None
+    seed = (rng & edges).astype(np.uint8)
+    m = cv2.morphologyEx(seed, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (close_px, close_px)))
+    # 테두리로 둘러싸인 그래픽 상자는 안쪽(단색이라 경계가 없음)까지 채운다. 화면 대부분을 감싸는 테두리는 채우지 않는다
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_max = 0.08 * m.shape[0] * m.shape[1]
+    for c in cnts:
+        if cv2.contourArea(c) <= area_max:
+            cv2.drawContours(m, [c], -1, 1, thickness=cv2.FILLED)
+    # 작은 점(우연히 같은 밝기였던 곳)은 버린다
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(m, 8)
+    keep = np.zeros_like(m)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] >= 300:
+            keep[lab == i] = 1
+    if grow_px > 0:
+        keep = cv2.dilate(keep, np.ones((2 * grow_px + 1, 2 * grow_px + 1), np.uint8))
+    return keep.astype(bool) if keep.any() else None
 
 
 # ---------------------------------------------------------------- 카메라 추적
@@ -496,7 +713,7 @@ class CourtTracker:
                  min_score: float = 0.65, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None,
                  keyframe_score: float = 0.7, max_jump_px: float = 15.0, weak_inliers: int = 100,
                  min_good_lines: int = 2, min_line_frac: float = 0.6, min_area_frac: float = 0.1,
-                 min_aspect_frac: float = 0.35):
+                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None):
         """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
         0.36~0.47, 키가 옆으로 밀린 틀린 화면이 0.55~0.60, 맞은 화면은 0.71 이상이었으므로 0.65.
         keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
@@ -508,8 +725,10 @@ class CourtTracker:
         몇 줄만 우연히 겹친다. 맞은 줄 중 방향이 엇갈리는 줄도 있어야 한다(line_support 참고).
         min_area_frac, min_aspect_frac: 사람이 맞춘 캘리브레이션 화면들과 비교한 절대 기준 (sane). 키 투영 넓이가 그중 가장
         작은 것의 min_area_frac 배보다 작거나, 화면 가운데의 코트 납작한 정도(view_aspect)가 min_aspect_frac 배보다 작으면
-        코트가 찌그러진 H 로 보고 쓰지 않는다. (실제 영상에서 좌표 1322개 중 1091개가 키 넓이 0~60px² 인 찌그러진 H 였다)"""
+        코트가 찌그러진 H 로 보고 쓰지 않는다. (실제 영상에서 좌표 1322개 중 1091개가 키 넓이 0~60px² 인 찌그러진 H 였다)
+        ignore: 라인 정합에서 뺄 자리(방송 그래픽, 렌즈 휨을 편 화면의 검정 여백) = True (graphics_mask)."""
         self.spec = spec
+        self.ignore = ignore
         self.H = H0.copy()
         self.prev = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
         self.orb = make_orb()
@@ -616,7 +835,7 @@ class CourtTracker:
         self.n += 1
         score = float("nan")
         if self.refine_every and self.n % self.refine_every == 0:
-            Hr, score, sup = refine_homography(frame, Hp, self.spec, return_support=True)
+            Hr, score, sup = refine_homography(frame, Hp, self.spec, return_support=True, ignore=self.ignore)
             self.last_support = sup
             if not self.sane(Hr, frame.shape) or not self.supported(sup):
                 # 라인 정합이 찌그러졌거나 보이는 라인과 안 맞는다 → 화면 이동으로 예측한 H 를 그대로 들고 간다
@@ -638,23 +857,28 @@ class CourtTracker:
         self.coast_n = 0
         return TrackResult(self.H.copy(), score, "ok")
 
-    def relocalize(self, frame: np.ndarray, min_inliers: int = 40) -> tuple[np.ndarray | None, float]:
-        """놓친 뒤 현재 화면을 키프레임들과 맞춰 H 를 다시 찾는다. (H, 라인 일치율) 또는 (None, 0).
+    def relocalize(self, frame: np.ndarray, min_inliers: int = 40, top_k: int = 3,
+                   good_enough: float = 0.8) -> tuple[np.ndarray | None, float]:
+        """놓친 뒤 현재 화면을 기준 화면(앵커)·키프레임들과 맞춰 H 를 다시 찾는다. (H, 라인 일치율) 또는 (None, 0).
 
-        키프레임과 특징점이 아주 많이 맞으면(strong_inliers 이상) 라인이 흐려 일치율이 낮아도 믿을 만하므로
-        self.last_inliers 에 맞은 수를 남긴다.
+        특징점이 가장 많이 맞은 후보 하나만 라인에 맞추면, 관중·선수에 많이 맞은 엉뚱한 키프레임이 뽑혀 놓친 상태가 길게
+        이어졌다 (실제 영상 195~206s: 왼쪽 기준 화면에서 옮겨 와 맞추면 0.81~0.83 인데 계속 lost). 그래서 앵커마다 하나씩과
+        키프레임 중 많이 맞은 top_k 개를 (서로 다른 자리만) 라인에 맞춰 보고, 라인이 가장 잘 맞고 support·sane 을 통과한 것을
+        고른다. good_enough 이상이 나오면 더 보지 않는다.
+        self.last_inliers 에 고른 후보의 특징점 수를 남긴다.
         """
         self.last_inliers = 0
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         kp2, d2 = self.orb.detectAndCompute(gray, self._mask(gray))
         if d2 is None or len(kp2) < min_inliers:
             return None, 0.0
-        best = (None, 0)
         # 앵커 전부 + 최근 키프레임 10개 + 그 이전은 띄엄띄엄 (놓친 동안 매 샘플 호출되므로 비용을 묶어 둔다)
         recent = list(reversed(self.keyframes))
         older = recent[10:]
-        cands = list(self.anchors) + recent[:10] + older[:: max(1, len(older) // 14 + 1)]
-        for kp1, d1, Hk in cands:
+        kfs = recent[:10] + older[:: max(1, len(older) // 14 + 1)]
+        tagged = [(True, c) for c in self.anchors] + [(False, c) for c in kfs]
+        found = []  # (inliers, H, 앵커인가)
+        for is_anchor, (kp1, d1, Hk) in tagged:
             m = self.matcher.match(d1, d2)
             if len(m) < min_inliers:
                 continue
@@ -665,23 +889,40 @@ class CourtTracker:
                 continue
             n = int(inl.sum())
             Hc = F @ Hk
-            if n > best[1] and self.sane(Hc / Hc[2, 2], frame.shape):
-                best = (Hc, n)
-        if best[0] is None or best[1] < min_inliers:
+            Hc = Hc / Hc[2, 2]
+            if n >= min_inliers and self.sane(Hc, frame.shape):
+                found.append((n, Hc, is_anchor))
+        if not found:
             return None, 0.0
-        self.last_inliers = best[1]
-        H, score, sup = refine_homography(frame, best[0] / best[0][2, 2], self.spec, return_support=True)
-        # 기준 화면에서 옮겨 온 H 는 멀리서 시작하는 경우가 많다. 한 번에 크기를 0.8~1.25배까지만 바꾸므로
-        # 일치율이 오르는 동안 몇 번 더 맞춘다 (실제 영상: 4번 반복해 0.86~0.88 로 잡힌 슛 장면들)
-        for _ in range(3):
-            H2, s2, sup2 = refine_homography(frame, H, self.spec, return_support=True)
-            if s2 <= score + 0.005:
+        found.sort(key=lambda r: -r[0])
+        # 라인에 맞춰 볼 후보: 특징점이 많은 순으로 top_k 개 + 각 앵커에서 온 것 (화면에서 거의 같은 자리면 하나만)
+        picks: list[tuple] = []
+        for n, Hc, is_anchor in found:
+            if len(picks) >= top_k and not is_anchor:
+                continue
+            if any(h_distance(Hc, P[1], frame.shape, self.spec) < 15.0 for P in picks):
+                continue
+            picks.append((n, Hc))
+        best = None  # (받을 수 있는가, 일치율, H, sup, inliers)
+        for n, Hc in picks:
+            H, score, sup = refine_homography(frame, Hc, self.spec, return_support=True, ignore=self.ignore)
+            # 기준 화면에서 옮겨 온 H 는 멀리서 시작하는 경우가 많다. 한 번에 크기를 0.8~1.25배까지만 바꾸므로
+            # 일치율이 오르는 동안 몇 번 더 맞춘다 (실제 영상: 4번 반복해 0.86~0.88 로 잡힌 슛 장면들)
+            for _ in range(3):
+                H2, s2, sup2 = refine_homography(frame, H, self.spec, return_support=True, ignore=self.ignore)
+                if s2 <= score + 0.005:
+                    break
+                H, score, sup = H2, s2, sup2
+            okay = self.supported(sup) and self.sane(H, frame.shape)
+            cand = (okay, score if okay else min(score, 0.0), H, sup, n)
+            if best is None or cand[:2] > best[:2]:
+                best = cand
+            if okay and score >= good_enough:
                 break
-            H, score, sup = H2, s2, sup2
+        okay, score, H, sup, n = best
+        self.last_inliers = n
         self.last_support = sup
-        if not self.supported(sup) or not self.sane(H, frame.shape):
-            # 다시 찾은 자리의 라인이 대부분 안 겹치거나 찌그러졌다 → 믿지 않는다 (일치율을 0 으로 낮춰 받는 쪽이 버리게)
-            score = min(score, 0.0)
+        # 다시 찾은 자리의 라인이 대부분 안 겹치거나 찌그러졌으면 일치율 0 이하 → 받는 쪽이 버린다
         return H, score
 
     def supported(self, sup: tuple) -> bool:

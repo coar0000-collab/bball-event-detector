@@ -97,7 +97,16 @@ def segment_digits(crop: np.ndarray, min_height_ratio: float = 0.4, templates: "
             continue
         boxes.append((x, y, w, h, i))
     boxes.sort()
-    blobs = [(lab[y:y + h, x:x + w] == i).astype(np.uint8) * 255 for x, y, w, h, i in boxes]
+    groups = [([i], x, y, x + w, y + h) for x, y, w, h, i in boxes]
+    if n_expected is not None and len(groups) > n_expected:
+        # 한 숫자가 두 조각으로 끊겨 잡힘 (실제 중계 글꼴의 '4': 사선과 세로획이 떨어져 '11' 처럼 읽힘)
+        # → 가로 간격이 가장 좁은 이웃끼리 합쳐 개수를 맞춘다
+        while len(groups) > n_expected:
+            gaps = [groups[j + 1][1] - groups[j][3] for j in range(len(groups) - 1)]
+            j = int(np.argmin(gaps))
+            a_, b_ = groups[j], groups[j + 1]
+            groups[j:j + 2] = [(a_[0] + b_[0], min(a_[1], b_[1]), min(a_[2], b_[2]), max(a_[3], b_[3]), max(a_[4], b_[4]))]
+    blobs = [np.isin(lab[y0:y1, x0:x1], ids).astype(np.uint8) * 255 for ids, x0, y0, x1, y1 in groups]
     ks = [1] * len(blobs)
     if n_expected is not None and 0 < len(blobs) < n_expected:
         # 등록할 때: 모자란 만큼 가장 넓은 덩어리를 나눈다
@@ -224,6 +233,42 @@ def read_number(crop: np.ndarray, templates: DigitTemplates, max_digits: int = 3
     if conf < min_conf:
         return Reading(None, text, conf)
     return Reading(int(text), text, conf)
+
+
+def _cost(templates: DigitTemplates, glyph: np.ndarray, digit: str) -> float:
+    """글리프와 그 숫자 템플릿들 중 가장 가까운 것의 평균 차이 (0 = 똑같음)."""
+    lst = templates.samples.get(digit)
+    if not lst:
+        return 1.0
+    g = glyph.astype(np.float32) / 255.0
+    return min(float(np.mean(np.abs(g - s.astype(np.float32) / 255.0))) for s in lst)
+
+
+def read_number_near(crop: np.ndarray, templates: DigitTemplates, prev: int | None, max_digits: int = 3,
+                     min_conf: float = 0.15, max_step: int = 3, max_cost: float = 0.12) -> Reading:
+    """직전에 확정된 점수(prev)를 알 때 읽기. 점수는 한 번에 3점(정정이면 -3점)보다 많이 바뀌지 않는다.
+
+    그냥 읽은 값이 prev±max_step 밖이면(실제 중계: 22→24 의 '4' 가 두 조각으로 끊겨 '114' 로 읽혀 +92), prev±max_step 의
+    값마다 그 자릿수로 글리프를 나눠(끊긴 조각은 합침) 그 숫자 템플릿과 얼마나 닮았는지 보고, 모든 자리가 max_cost 안으로
+    닮은 값 중 가장 닮은 것을 고른다. 닮은 값이 없으면 그냥 읽은 값을 그대로 돌려준다 — 다음 경기로 넘어가 0:0 이 되는
+    것처럼 정말 크게 바뀐 경우는 ScoreChangeDetector 가 여러 번 읽힌 뒤에 check/correction 으로 받는다."""
+    r = read_number(crop, templates, max_digits, min_conf)
+    if prev is None or (r.value is not None and abs(r.value - prev) <= max_step):
+        return r
+    if not r.text:
+        return r  # 글자가 안 보임 (스코어버그가 사라진 화면)
+    best: tuple[float, int] | None = None
+    for c in range(max(0, prev - max_step), prev + max_step + 1):
+        txt = str(c)
+        glyphs = segment_digits(crop, n_expected=len(txt))
+        if len(glyphs) != len(txt):
+            continue
+        cost = max(_cost(templates, g, ch) for g, ch in zip(glyphs, txt))
+        if best is None or cost < best[0]:
+            best = (cost, c)
+    if best is not None and best[0] <= max_cost:
+        return Reading(best[1], str(best[1]), float(np.clip(1 - best[0] / max_cost, 0, 1)) * 0.5)
+    return r
 
 
 # ---------------------------------------------------------------- 점수 변화 이벤트

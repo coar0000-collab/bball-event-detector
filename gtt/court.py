@@ -85,6 +85,8 @@ class ShotCall:
     foot: str = "mid"
     # 발 근처에 실제로 보이는 3점 라인에 맞춰 보정한 양(화면 px, 라인 바깥쪽 +). None = 보정 안 함/라인이 가려짐
     line_snap_px: float | None = None
+    # 발 근처 3점 라인이 방송 그래픽(스코어버그 등)이나 화면 가장자리에 걸려 직접 볼 수 없었다 → 계산만 믿을 수 없어 사람 판정
+    line_hidden: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -103,6 +105,7 @@ class ShotCall:
             "on_line": self.on_line,
             "foot_point": self.foot,
             "line_snap_px": "" if self.line_snap_px is None else round(self.line_snap_px, 1),
+            "line_hidden": self.line_hidden,
         }
 
 
@@ -186,13 +189,16 @@ def classify_shot(
 
 
 def is_ft_spot(x: float, y: float, spec: CourtSpec = FIBA, side: str | None = None,
-               behind_m: float = 1.0, front_m: float = 0.3, half_width_m: float = 1.2) -> bool:
-    """자유투 쏘는 자리인지 (자유투 라인에서 뒤로 behind_m, 앞으로 front_m, 레인 가운데에서 좌우 half_width_m 안)."""
+               behind_m: float = 1.8, front_m: float = 0.3, half_width_m: float = 1.2, radius_m: float = 2.0) -> bool:
+    """자유투 쏘는 자리인지. 자유투는 자유투 라인 뒤 반원(반지름 1.8m) 안 어디서나 쏠 수 있다 → 라인에서 뒤로 behind_m,
+    앞으로 front_m(발 찍기 오차), 레인 가운데에서 좌우 half_width_m 안, 자유투 라인 가운데에서 radius_m 안.
+    (예전에는 뒤로 1.0m 까지만 봐서, 실제 영상에서 라인 1.1m 뒤에서 쏜 자유투를 자유투 자리가 아니라고 했다)"""
     if side is None:
         side = "left" if x <= spec.length / 2 else "right"
     d_baseline = x if side == "left" else spec.length - x
     behind = d_baseline - spec.key_length  # 자유투 라인 뒤쪽이 +
-    return -front_m <= behind <= behind_m and abs(y - spec.width / 2) <= half_width_m
+    lat = abs(y - spec.width / 2)
+    return -front_m <= behind <= behind_m and lat <= half_width_m and math.hypot(max(behind, 0.0), lat) <= radius_m
 
 
 def landmarks(spec: CourtSpec = FIBA) -> dict[str, tuple[float, float]]:

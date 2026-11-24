@@ -15,13 +15,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-def resolve_corrections(rows: list[dict], window: float = 30.0) -> list[dict]:
+def resolve_corrections(rows: list[dict], window: float = 30.0, lookback: float = 300.0) -> list[dict]:
     """기록원이 점수를 고친 흔적(감소)을 앞뒤 변화와 묶어 정리한다. 원본은 두고 새 목록을 돌려준다.
 
     - 감소 뒤 window 초 안에 같은 팀이 같은 만큼 다시 오르면(잠깐 잘못 내렸다가 되돌림) 그 증가는 득점이 아니다
       → flag "revert". (실제 영상 73.5s·87.5s 에서 '+1 ok' 로 나와 자유투 하나가 있는 것처럼 보였다)
     - 아니면, 감소 바로 앞의 같은 팀 정상 변화(window 초 안)를 고친 것으로 본다. 합이 0 이면 그 변화는 취소
       (flag "reverted"), 1~3 이면 고친 값으로 바꾼다(+3 → -1 이면 +2). 감소 자체는 flag "merged".
+    - 그것도 아니면 늦게 몰아서 고친 것으로 본다: 감소 앞 lookback 초 안의 같은 팀 정상 변화를 최근 것부터 더해 가다
+      감소량과 딱 맞으면 그 변화들을 모두 취소(flag "reverted", note "늦은 정정"). 실제 영상: 147s·173s 에 슛 없이 +1 이
+      두 번 올랐다가 341s 에 -2 로 한꺼번에 지워졌다.
     정상(ok)만 득점으로 세므로 score-check 는 고친 뒤의 점수로 비교한다."""
     out = [dict(r) for r in rows]
     order = sorted(range(len(out)), key=lambda i: float(out[i]["t_sec"]))
@@ -38,17 +41,34 @@ def resolve_corrections(rows: list[dict], window: float = 30.0) -> list[dict]:
                 out[nxt]["flag"] = "revert"
                 continue
             prv = idx[p - 1] if p > 0 else None
-            if prv is None or out[prv].get("flag", "ok") != "ok" or t - float(out[prv]["t_sec"]) > window:
-                continue
-            net = int(out[prv]["delta"]) + d
-            if net == 0:
-                out[prv]["flag"] = "reverted"
-            elif net in (1, 2, 3):
-                out[prv]["note"] = f"{out[prv]['delta']}→{net} 정정"
-                out[prv]["delta"] = net
-            else:
-                continue
-            e["flag"] = "merged"
+            if prv is not None and out[prv].get("flag", "ok") == "ok" and t - float(out[prv]["t_sec"]) <= window:
+                net = int(out[prv]["delta"]) + d
+                if net == 0:
+                    out[prv]["flag"] = "reverted"
+                    e["flag"] = "merged"
+                    continue
+                if net in (1, 2, 3):
+                    out[prv]["note"] = f"{out[prv]['delta']}→{net} 정정"
+                    out[prv]["delta"] = net
+                    e["flag"] = "merged"
+                    continue
+            # 늦게 몰아서 고침: 최근 정상 변화부터 더해 감소량과 딱 맞는 묶음
+            acc, chosen = 0, []
+            for q in reversed(idx[:p]):
+                r = out[q]
+                if t - float(r["t_sec"]) > lookback:
+                    break
+                if r.get("flag", "ok") != "ok" or int(r["delta"]) <= 0:
+                    continue
+                acc += int(r["delta"])
+                chosen.append(q)
+                if acc >= -d:
+                    break
+            if acc == -d and chosen:
+                for q in chosen:
+                    out[q]["flag"] = "reverted"
+                    out[q]["note"] = f"늦은 정정({e.get('time', round(t, 1))} {d:+d})으로 취소"
+                e["flag"] = "merged"
     return out
 
 
