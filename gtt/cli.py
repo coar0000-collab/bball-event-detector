@@ -268,12 +268,19 @@ def cmd_track_court(a):
     # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
     trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score)
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
+    # 사람이 맞춘 화면은 그 시각의 정답이기도 하다: (시각, H, 회색 화면). 추적 결과에 그 시각으로 그대로 넣고,
+    # 그 직후 샘플에서 추적이 놓쳐 있으면 이 화면에서 이어 붙여 다시 잡는다.
+    cal_list = [(t_calib, H0, cv2.cvtColor(frame_c, cv2.COLOR_BGR2GRAY))]
     for c in calibs[1:]:
         Hc, dc = _load_calib(c)
+        tc = float(dc.get("t_sec") or 0.0)
         try:
-            trk.add_anchor(v.frame_at(float(dc.get("t_sec") or 0.0)), Hc)
+            fc = v.frame_at(tc)
         except ValueError:
             print(f"경고: {c} 의 시각 프레임을 못 읽어 기준에서 뺌", file=sys.stderr)
+            continue
+        trk.add_anchor(fc, Hc)
+        cal_list.append((tc, Hc, cv2.cvtColor(fc, cv2.COLOR_BGR2GRAY)))
     print(f"기준 화면(캘리브레이션) {len(trk.anchors)}개", file=sys.stderr)
 
     def strong(Hr, sc):
@@ -327,6 +334,19 @@ def cmd_track_court(a):
             if strong(Hr, sc) or (Hr is not None and sc >= a.recover_score):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
+        if r.status not in ("ok", "recovered"):
+            # 바로 앞에 사람이 맞춘 화면이 있으면 그 화면에서 화면 이동으로 이어 붙여 다시 잡는다
+            for tc, Hc, gc in cal_list:
+                if 0 < t - tc <= a.step + 1e-6:
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    F, n = HG.frame_to_frame(gc, gray, trk.orb, trk.matcher, mask=overlay, return_inliers=True)
+                    if F is None or n < 80:
+                        continue
+                    Hr, sc, sup = HG.refine_homography(frame, F @ Hc, spec, return_support=True)
+                    if sc >= a.min_score and trk.supported(sup) and trk.sane(Hr, frame.shape):
+                        trk.reset(Hr, frame)
+                        r = HG.TrackResult(Hr, sc, "recovered")
+                        break
         if r.status in ("ok", "recovered"):
             last_good, last_good_gray = r.H, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         times.append(t)
@@ -356,6 +376,23 @@ def cmd_track_court(a):
                 gap = None  # 화면 전환·놓침: 이동이 끊겼으니 메우지 않는다
         if len(times) % int(max(1, 60 / a.step)) == 0:
             print(f"{fmt_time(t)} 상태={r.status} 라인일치={r.line_score:.2f}", file=sys.stderr)
+    # 사람이 맞춘 화면을 그 시각 그대로 넣는다 (같은 프레임 샘플이 있으면 바꾸고, 없으면 끼워 넣는다)
+    half = 0.5 / (v.fps or 30.0)
+    for tc, Hc, _ in cal_list:
+        if not (times[0] - half <= tc <= times[-1] + half):
+            continue
+        i = int(np.argmin(np.abs(np.array(times) - tc)))
+        if abs(times[i] - tc) <= half:
+            Hs[i], status[i], scores[i] = Hc, "calib", 1.0
+        else:
+            times.append(tc)
+            Hs.append(Hc)
+            scores.append(1.0)
+            status.append("calib")
+            support.append((0, 0, 0))
+    order = np.argsort(np.array(times), kind="stable")
+    times, Hs, scores = [times[i] for i in order], [Hs[i] for i in order], [scores[i] for i in order]
+    status, support = [status[i] for i in order], [support[i] for i in order]
     # support: 샘플마다 (보이는 라인 줄, 맞은 줄, 방향 엇갈림) — 틀린 정합을 찾을 때 본다
     np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status),
                         support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name)
@@ -476,14 +513,21 @@ def cmd_click_shots(a):
             state["click"] = None
             playing = False
             if H is not None:
-                clicks.append((H.copy(), u, vv))
+                # 이 프레임에 보이는 3점 라인에 맞춰 보정하도록 화면도 같이 넘긴다
+                clicks.append((H.copy(), u, vv, frame.copy()))
                 call = (HG.classify_clicks(clicks, spec, side=a.side) if len(clicks) > 1
-                        else HG.classify_click(H, u, vv, spec, side=a.side))
+                        else HG.classify_click(H, u, vv, spec, side=a.side, frame=frame))
             else:
                 call = None
         view = frame.copy()
         if H is not None:
             HG.draw_court(view, H, spec, (0, 255, 255), 2)
+            if point is not None:
+                # 3점 라인 띠(바깥·안쪽 가장자리): 발끝이 이 띠에 조금이라도 닿으면 2점
+                edges = C.three_line_edges(spec)
+                for k in ("L_outer", "L_inner", "R_outer", "R_inner"):
+                    q = HG.project(H, HG.densify(edges[k], 0.05)).astype(np.int32)
+                    cv2.polylines(view, [q], False, (255, 0, 255), 1, cv2.LINE_AA)
         zoom = None
         if point is not None:
             col = (0, 255, 0) if (call and call.points == 3) else (255, 160, 0)
@@ -505,7 +549,9 @@ def cmd_click_shots(a):
             info += "  [NO COURT - recalibrate]"
         _put(view, info, (10, 28), 0.65, (0, 255, 255))
         if call:
-            txt = f"{call.points}PT {call.zone}  dist {call.dist_to_rim:.2f}m  line {call.margin:+.2f}m" + ("  NEAR LINE!" if call.near_line else "")
+            txt = (f"{call.points}PT {call.zone}  dist {call.dist_to_rim:.2f}m  toe-to-line {call.margin:+.2f}m"
+                   + ("  ON LINE" if call.on_line else "") + ("  NEAR LINE!" if call.near_line else "")
+                   + (f"  [line snap {call.line_snap_px:+.1f}px]" if call.line_snap_px is not None else "  [line hidden: H only]"))
             _put(view, txt, (10, 58), 0.65, (0, 255, 0) if call.points == 3 else (255, 200, 0))
             if call.ft_spot and not ft:
                 _put(view, "FT spot: press f if this is a free throw", (10, 88), 0.6, (0, 200, 255))
@@ -567,7 +613,9 @@ def cmd_click_shots(a):
 __SHOTS_HELP = """
 슛 위치 기록 (슛 라벨링 + 3점 라인 판정 확인)
   space 재생/멈춤   a/d ±1초   j/l ±5초   ,/. 한 프레임
-  릴리스 순간 슈터의 두 발 가운데를 클릭 → 화면에 2점/3점과 라인까지 거리가 뜹니다
+  릴리스 순간 슈터의 두 발 가운데를 클릭 → 화면에 2점/3점과 '림 쪽 발끝 ~ 3점 라인 바깥 가장자리' 거리가 뜹니다
+    (발끝은 두 발 가운데에서 0.14m 앞으로 계산. 분홍 두 줄 = 3점 라인 띠, 발끝이 조금이라도 닿으면 2점)
+    발 근처에 보이는 칠해진 3점 라인에 맞춰 자동 보정합니다 (line snap). 수비수에 가려 안 보이면 'line hidden' 으로 표시
   숫자키로 슈터 등번호 입력 (Backspace 지우기, 모르면 비워 둠)
   m 성공으로 저장   x 실패로 저장   t 홈/원정(스코어버그 왼쪽/오른쪽 팀) 전환   z 마지막 기록 삭제   q 종료
   f 자유투 모드 켜기/끄기 (켜 있으면 1점·자유투로 저장, 자유투가 끝나면 다시 f 로 끄기)

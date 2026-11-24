@@ -56,10 +56,39 @@ def test_three_line_points_have_zero_margin():
 
 
 def test_near_line_flag():
-    c = classify_shot(R + FIBA.three_radius + 0.1, M, side="left")
+    c = classify_shot(R + FIBA.three_radius + 0.1, M, side="left", foot="toe")
     assert c.points == 3 and c.near_line
-    c = classify_shot(R + FIBA.three_radius - 0.1, M, side="left")
+    c = classify_shot(R + FIBA.three_radius - 0.1, M, side="left", foot="toe")
     assert c.points == 2 and c.near_line
+
+
+def test_toe_touching_line_band_is_two():
+    """3점 라인 띠(바깥 가장자리 6.75m, 폭 5cm)에 발끝이 조금이라도 닿으면 2점 (FIBA: 라인은 2점 구역)."""
+    top = R + FIBA.three_radius
+    assert classify_shot(top + 0.01, M, side="left", foot="toe").points == 3      # 발끝이 라인 바로 뒤
+    c = classify_shot(top - 0.02, M, side="left", foot="toe")                    # 발끝이 라인 띠 위
+    assert c.points == 2 and c.on_line
+    assert classify_shot(top, M, side="left", foot="toe").points == 2            # 바깥 가장자리에 딱 닿음
+    c = classify_shot(top - 0.2, M, side="left", foot="toe")
+    assert c.points == 2 and not c.on_line                                       # 라인 안쪽
+    # 두 발 가운데를 찍으면 림 쪽 발끝은 foot_reach(0.14m) 앞: 가운데가 라인 뒤 0.1m 여도 발끝은 라인 위 → 2점
+    c = classify_shot(top + 0.1, M, side="left")
+    assert c.points == 2 and c.on_line and c.margin == pytest.approx(0.1 - FIBA.foot_reach)
+    assert classify_shot(top + FIBA.foot_reach + 0.01, M, side="left").points == 3
+    # 코너도 같은 규칙: 사이드라인에서 0.9m(라인 바깥 가장자리)
+    corner = FIBA.width - FIBA.three_corner_from_sideline
+    assert classify_shot(1.0, corner + 0.01, side="left", foot="toe").points == 3
+    assert classify_shot(1.0, corner - 0.03, side="left", foot="toe").on_line
+
+
+def test_three_line_edges():
+    from gtt.court import three_line_edges
+
+    e = three_line_edges(FIBA)
+    for (x, y) in e["L_outer"][3:-3]:
+        assert abs(three_point_margin(x, y, FIBA, "left")) < 1e-6
+    for (x, y) in e["L_inner"][3:-3]:
+        assert three_point_margin(x, y, FIBA, "left") == pytest.approx(-FIBA.line_width)
 
 
 def test_nba_line_is_deeper():

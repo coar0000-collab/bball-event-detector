@@ -224,3 +224,26 @@ def test_bridge_gap_fills_only_when_both_ways_agree():
         assert HG.h_distance(H, Ht, grays[0].shape) < 2
     wrong_end = np.array([[1, 0, 12.0], [0, 1, -8.0], [0, 0, 1]]) @ Hs[-1]
     assert all(H is None for H in HG.bridge_gap(grays, Hs[0], wrong_end, FIBA))
+
+
+def test_click_snaps_to_painted_three_line():
+    """코트 전체 H 가 3점 라인 근처에서 몇 px 어긋나 있어도, 발 근처에 보이는 칠해진 라인에 맞춰 판정한다.
+    발끝이 라인 띠 바로 뒤(3점)인데 H 가 라인을 바깥으로 6px 밀어 계산하면 2점으로 나오던 경우."""
+    frame, Htrue = make_scene()
+    R0 = 1.575
+    # 탑에서 림 쪽 발끝이 라인 바깥 가장자리 뒤 0.06m → 두 발 가운데는 그보다 foot_reach 뒤
+    x = R0 + FIBA.three_radius + 0.06 + FIBA.foot_reach
+    u, v = HG.court_to_image(Htrue, x, 7.5)
+    good = HG.classify_click(Htrue, u, v, FIBA, side="left")
+    assert good.points == 3
+    shift = np.array([[1, 0, 6.0], [0, 1, 0], [0, 0, 1]]) @ Htrue  # 화면에서 오른쪽(탑에서는 라인 바깥쪽)으로 6px 어긋난 H
+    assert HG.classify_click(shift, u, v, FIBA, side="left").points == 2     # 보정 없이: 틀림
+    snapped = HG.classify_click(shift, u, v, FIBA, side="left", frame=frame)
+    assert snapped.points == 3 and snapped.line_snap_px is not None and abs(snapped.line_snap_px + 6) < 1.5
+    # 라인이 다 가려지면(수비수) 보정하지 않고 표시만
+    import cv2
+
+    hidden = frame.copy()
+    cv2.circle(hidden, (int(u), int(v)), 110, (30, 30, 30), -1)
+    c = HG.classify_click(shift, u, v, FIBA, side="left", frame=hidden)
+    assert c.line_snap_px is None

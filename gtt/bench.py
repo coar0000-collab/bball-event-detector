@@ -22,8 +22,8 @@ import numpy as np
 
 from . import homography as HG
 from . import scorebug as SB
-from .court import FIBA, classify_shot, landmarks
-from .demo import BUG_ROIS, FPS, H_IMG, W, _court_texture, _draw_bug
+from .court import FIBA, classify_shot, court_polylines, landmarks
+from .demo import BUG_ROIS, FPS, H_IMG, W, _draw_bug
 
 # 리플레이 구간. REPLAY_DELAY 가 있으면 '몇 초 전 장면'을 그 득점 자리를 중심으로 다시 보여 준다(놓친 득점 리플레이).
 # 없으면 앞서 지나간 장면의 다른 각도 클로즈업. 리플레이 동안 스코어버그는 숨는다.
@@ -42,7 +42,8 @@ def _wing(margin, sign=1):  # 45도
     return (RIM + d * math.cos(math.pi / 4), sign * d * math.sin(math.pi / 4))
 
 
-# (릴리스 시각, 종류, 공격 림 기준 위치 (베이스라인에서 거리, 림 중심선에서 옆으로), 성공 여부)
+# (릴리스 시각, 종류, 공격 림 기준 림 쪽 발끝 위치 (베이스라인에서 거리, 림 중심선에서 옆으로), 성공 여부)
+# 발끝이 3점 라인 바깥 가장자리 뒤면 3점, 라인 띠에 닿거나 안쪽이면 2점. 아래 _feet 로 '두 발 가운데'로 바꾼다.
 # 라인 바로 안팎(±0.1~0.3m) 슛을 일부러 많이 넣었다. 공격 방향은 그 순간 화면 가운데에 더 가까운 림.
 SHOTS = [
     (4.5, "FG", (0.5, -6.85), True),     # 코너 3점 (사이드라인 쪽 0.25m 바깥)
@@ -55,11 +56,23 @@ SHOTS = [
     (45.5, "FT", (6.2, 0.0), True),      # 자유투 2개
     (50.5, "FT", (6.2, 0.0), True),
     (55.5, "FG", (6.4, 0.4), True),      # 자유투 자리 점프슛 (2점)
-    (60.5, "FG", (1.2, 6.6), True),      # 코너 라인 바로 안쪽 (2점, 사이드라인 쪽 0.0~0.3m)
+    (60.5, "FG", (1.2, 6.6), True),      # 코너 라인 바깥 가장자리에 발끝이 딱 닿음 (2점) — 위치만으로는 못 가르는 경우
     (65.0, "FG", _top(1.2), False),      # 먼 3점 실패
     (78.5, "FG", _wing(0.08, -1), True), # 45도 라인 위 바로 바깥 (3점)
     (84.0, "FG", (5.0, 3.0), True),      # 미드레인지
 ]
+
+
+def _feet(p):
+    """위 위치는 '림 쪽 발끝' 기준. 사람이 찍는 '두 발 가운데'는 발끝에서 foot_reach 만큼 라인 바깥쪽(림 반대쪽)."""
+    d, lat = p
+    if d <= FIBA.corner_straight_end:
+        return (d, lat + math.copysign(FIBA.foot_reach, lat))
+    r = math.hypot(d - RIM, lat)
+    return (d + FIBA.foot_reach * (d - RIM) / r, lat + FIBA.foot_reach * lat / r)
+
+
+SHOTS = [(t, k, _feet(p) if k == "FG" else p, made) for t, k, p, made in SHOTS]
 GLITCHES = [(9.0, 9.3), (29.0, 29.3), (51.0, 51.3)]  # 이 동안 홈 점수가 +10 으로 잘못 보임
 SCORE_LAG = 1.5  # 슛 → 스코어버그 반영
 FAST_PANS = [(0.0, 3.0), (52.0, 54.0), (60.0, 61.5)]  # 속공 따라가는 빠른 팬 (블러 심함)
@@ -217,6 +230,27 @@ def _score_metrics(got, want, tol=1.5):
     return tp, fp
 
 
+def _court_texture(seed: int = 0):
+    """합성 코트 바닥 그림. 3점 라인은 실제 규격처럼 바깥 가장자리 6.75m 에서 안쪽으로 5cm 폭 띠로 칠한다
+    (다른 라인은 데모와 같이 그린다)."""
+    from .court import three_line_edges
+
+    top, T = HG.render_topdown(FIBA, px_per_m=40)
+    rng = np.random.default_rng(seed)
+    tex = cv2.GaussianBlur(rng.integers(0, 60, top.shape[:2], dtype=np.uint8), (5, 5), 0)
+    top = cv2.add(top, cv2.merge([tex, tex, tex]))
+    for name, poly in court_polylines(FIBA).items():
+        if name.endswith("_three"):
+            continue
+        uv = HG.project(T, HG.densify(poly, 0.25))
+        cv2.polylines(top, [np.round(uv).astype(np.int32)], False, (255, 255, 255), 3, cv2.LINE_AA)
+    w_px = max(1, int(round(FIBA.line_width * 40)))
+    for k in ("L_center", "R_center"):
+        uv = HG.project(T, HG.densify(three_line_edges(FIBA)[k], 0.05))
+        cv2.polylines(top, [np.round(uv).astype(np.int32)], False, (255, 255, 255), w_px, cv2.LINE_AA)
+    return top, T
+
+
 _texture = lru_cache(maxsize=4)(_court_texture)
 
 
@@ -257,13 +291,15 @@ def _calibrate_at(video: Path, t: float, seed: int, path: Path, names=None) -> b
     return True
 
 
-def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, review: bool = True) -> list[dict]:
+def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, review: bool = True,
+                 frame_at=None) -> list[dict]:
     """사람(나중에는 검출 모델)이 슛마다 발 위치를 화면에서 찍었다고 보고 코트로 판정한다.
 
     noise_px: 발 위치를 찍을 때의 화면 오차(표준편차, px).
     ft_rule: "label" = 자유투인지는 사람이 f 로 표시 / "spot" = 자유투 자리에서 쏘면 무조건 자유투로 본다(위치만).
     review: 라인 근처로 뜬 슛은 click-shots 에서처럼 앞뒤 프레임에서 발을 더 찍어(Shift+클릭) 평균한다.
     리플레이 중에 난 슛은 리플레이 화면에서 찍는다(replay=True). 화면 밖이면 못 찍는다.
+    frame_at: 시각 → 화면. 주면 click-shots 처럼 발 근처에 보이는 3점 라인에 맞춰 보정한다.
     """
     from .cli import _CourtLookup
     from .video import fmt_time
@@ -304,8 +340,9 @@ def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, 
         if H is None:
             row.update({"points": "", "zone": "", "zone_kr": "", "near_line": "", "clicks": 0})
         else:
-            clicks = [(H, u, v)]
-            call = HG.classify_click(H, u, v, FIBA, side=s["side"])
+            fr = frame_at(td) if frame_at else None
+            clicks = [(H, u, v, fr)] if fr is not None else [(H, u, v)]
+            call = HG.classify_click(H, u, v, FIBA, side=s["side"], frame=fr)
             if review and call.near_line:
                 # 슈터는 릴리스 1초 전부터 0.5초 뒤까지 그 자리에 있다 → 같은 화면 종류(본/리플레이)의 앞뒤 추적 프레임에서 더 찍기
                 for dt in (-1.0, -0.5, 0.5):
@@ -313,7 +350,8 @@ def _label_shots(shots, truth, track, noise_px: float, ft_rule: str, seed: int, 
                     H2 = look.at(t2, tol=0.05)
                     c2 = click(t2, s)
                     if H2 is not None and c2 is not None and c2[2] == rep:
-                        clicks.append((H2, c2[0], c2[1]))
+                        f2 = frame_at(t2) if frame_at else None
+                        clicks.append((H2, c2[0], c2[1], f2) if f2 is not None else (H2, c2[0], c2[1]))
                 call = HG.classify_clicks(clicks, FIBA, side=s["side"])
             row.update(call.as_dict())
             row["clicks"] = len(clicks)
@@ -365,7 +403,12 @@ def run(out_dir: str | Path, seconds: float = 90.0, seed: int = 0, step: float =
         for td in _display_times(s)[:1]:
             rep = _camera_truth(td, seed)[1]
             same = [dt for dt in (0.0, -0.5, 0.5, -1.0) if _camera_truth(td + dt, seed)[1] == rep]  # 같은 화면(본/리플레이)만
-            if all(look.at(td + dt, tol=0.05) is None for dt in same):
+            def on_screen(t, s=s):  # 그 화면에 슈터 발이 보이는가
+                u, v = HG.court_to_image(_camera_truth(t, seed)[0], s["x"], s["y"])
+                return 0 <= u < W and 0 <= v < H_IMG
+
+            # 발이 보이면서 코트 좌표도 있는 화면이 하나도 없으면 (사람이) 그 시각으로 캘리브레이션
+            if all(look.at(td + dt, tol=0.05) is None or not on_screen(td + dt) for dt in same):
                 c = out / f"calib_extra{extra + 1}.json"
                 if _calibrate_at(video, td, seed, c):
                     extra += 1
@@ -423,9 +466,23 @@ def run(out_dir: str | Path, seconds: float = 90.0, seed: int = 0, step: float =
     from . import scorecheck as SC
     events = SC.read_csv(ev_csv)
     court = {}
+    from .video import Video
+
+    vid = Video(str(video))
+    fcache: dict = {}
+
+    def frame_at(t):  # click-shots 처럼 찍은 화면에 보이는 3점 라인으로 보정
+        k = round(t, 3)
+        if k not in fcache:
+            try:
+                fcache[k] = vid.frame_at(t)
+            except ValueError:
+                fcache[k] = None
+        return fcache[k]
+
     for noise in (0.0, 3.0, 6.0):
         for rule, review in (("label", False), ("label", True), ("spot", True)):
-            rows = _label_shots(shots, truth, track, noise, rule, seed, review=review)
+            rows = _label_shots(shots, truth, track, noise, rule, seed, review=review, frame_at=frame_at)
             sm = SC.check(events, rows).summary()
             key = (f"발 위치 오차 {noise:g}px, 자유투 {'라벨' if rule == 'label' else '위치만'}, "
                    f"라인 근처 {'다시 찍어 평균' if review else '한 번만'}")
