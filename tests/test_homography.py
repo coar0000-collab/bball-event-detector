@@ -338,3 +338,40 @@ def test_wide_snap_that_flips_call_goes_to_human():
     assert c.points == 3 and not c.near_line
     c = call(8, 0.5)  # 작은 보정
     assert c.points == 3 and abs(c.line_snap_px) <= 12 and not c.near_line
+
+
+def _plain_scene(shift, seed=0):
+    """make_scene 과 같은 바닥 무늬·카메라인데 코트 라인이 하나도 안 보이는 화면 (라인 정합으로는 확인 불가)."""
+    import cv2
+
+    top, T = HG.render_topdown(FIBA, px_per_m=40)
+    rng = np.random.default_rng(seed)
+    tex = cv2.GaussianBlur(rng.integers(0, 60, top.shape[:2], dtype=np.uint8), (5, 5), 0)
+    top = cv2.add(np.full_like(top, top[3, 3]), cv2.merge([tex, tex, tex]))
+    h, w = top.shape[:2]
+    src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
+    dst = np.float32([[150, 120], [1130, 120], [1400, 700], [-120, 700]]) + np.float32(shift)
+    Hcam = cv2.getPerspectiveTransform(src, dst)
+    return cv2.warpPerspective(top, Hcam, (1280, 720), borderValue=(40, 40, 40)), Hcam @ T
+
+
+def test_consensus_when_lines_not_visible():
+    """라인이 안 보여 라인 정합으로 확인 못 하는 화면도, 서로 다른 시각의 기준 화면 둘이 특징점만으로 같은 자리를 가리키면 받는다.
+    하나뿐이거나 둘이 다른 자리를 가리키면(한쪽 H 가 틀림) 받지 않는다."""
+    f0, H0 = make_scene()
+    f1, H1 = make_scene(shift=(-60, 10))
+    f2, H2 = _plain_scene((-30, 5))
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    _, sc = trk.relocalize(f2)
+    assert sc < 0.65 and trk.consensus(f2.shape) is None  # 기준 화면 하나뿐
+    trk.n = 20
+    trk._add_keyframe(cv2_gray(f1), H1)
+    trk.relocalize(f2)
+    Hc = trk.consensus(f2.shape)
+    assert Hc is not None and HG.h_distance(Hc, H2, f2.shape) < 1.0
+    # 같은 화면을 틀린 H(옆으로 45px)로 저장한 키프레임: 둘이 엇갈리면 받지 않는다
+    trk2 = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    trk2.n = 20
+    trk2._add_keyframe(cv2_gray(f1), np.array([[1, 0, 45.0], [0, 1, 0], [0, 0, 1]]) @ H1)
+    trk2.relocalize(f2)
+    assert trk2.consensus(f2.shape) is None

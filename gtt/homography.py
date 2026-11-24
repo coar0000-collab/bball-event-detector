@@ -761,8 +761,9 @@ class CourtTracker:
         self.static = StaticMask() if (use_static_mask and overlay_mask is None) else None
         if self.static is not None:
             self.static.update(self.prev)
-        self.keyframes: list[tuple] = []  # (keypoints, descriptors, H)
-        self.anchors: list[tuple] = []  # 사람이 맞춘 캘리브레이션 화면들 — 지워지지 않는 키프레임
+        self.keyframes: list[tuple] = []  # (keypoints, descriptors, H, 저장한 샘플 번호)
+        self.anchors: list[tuple] = []  # 사람이 맞춘 캘리브레이션 화면들 — 지워지지 않는 키프레임 (번호는 음수)
+        self.last_found: list[tuple] = []  # 마지막 relocalize 에서 특징점으로 옮겨 온 후보들 (맞은 점, H, 앵커인가, 번호)
         self._court_pts = np.concatenate([densify(p, 0.5) for p in court_polylines(spec).values()])
         self.add_anchor(frame0, H0)
 
@@ -772,7 +773,7 @@ class CourtTracker:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         kp, des = self.orb.detectAndCompute(gray, self._mask(gray))
         if des is not None and len(kp) >= 50:
-            self.anchors.append((kp, des, H.copy()))
+            self.anchors.append((kp, des, H.copy(), -1000 * (len(self.anchors) + 1)))
 
     def _mask(self, gray):
         if self.overlay_mask is not None:
@@ -782,7 +783,7 @@ class CourtTracker:
     def _add_keyframe(self, gray, H, max_keep: int = 80) -> None:
         kp, des = self.orb.detectAndCompute(gray, self._mask(gray))
         if des is not None and len(kp) >= 50:
-            self.keyframes.append((kp, des, H.copy()))
+            self.keyframes.append((kp, des, H.copy(), self.n))
             self.keyframes = self.keyframes[-max_keep:]
 
     def _jump(self, Ha: np.ndarray, Hb: np.ndarray, shape) -> float:
@@ -883,7 +884,8 @@ class CourtTracker:
         kfs = recent[:10] + older[:: max(1, len(older) // 14 + 1)]
         tagged = [(True, c) for c in self.anchors] + [(False, c) for c in kfs]
         found = []  # (inliers, H, 앵커인가)
-        for is_anchor, (kp1, d1, Hk) in tagged:
+        self.last_found = []
+        for is_anchor, (kp1, d1, Hk, nk) in tagged:
             m = self.matcher.match(d1, d2)
             if len(m) < min_inliers:
                 continue
@@ -897,6 +899,7 @@ class CourtTracker:
             Hc = Hc / Hc[2, 2]
             if n >= min_inliers and self.sane(Hc, frame.shape):
                 found.append((n, Hc, is_anchor))
+                self.last_found.append((n, Hc, is_anchor, nk))
         if not found:
             return None, 0.0
         found.sort(key=lambda r: -r[0])
@@ -929,6 +932,33 @@ class CourtTracker:
         self.last_support = sup
         # 다시 찾은 자리의 라인이 대부분 안 겹치거나 찌그러졌으면 일치율 0 이하 → 받는 쪽이 버린다
         return H, score
+
+    def consensus(self, shape, min_inliers: int = 80, agree_px: float = 4.0, min_sep: int = 10,
+                  min_votes: int = 2) -> np.ndarray | None:
+        """마지막 relocalize 의 후보 중, 서로 다른 시각(min_sep 샘플 이상 떨어진)의 기준 화면 min_votes 개 이상이 특징점만으로
+        옮겨 온 H 가 화면에서 agree_px 안으로 같으면 그 평균 H. 아니면 None.
+
+        라인이 적게 보이는 화면(스코어버그 근처 윙·코너, 반코트 확대)은 라인 정합이 support 기준을 못 넘어 몇십 초씩 좌표를
+        못 냈다 (실제 B-LAB: 놓침 31%, coast 28%). 중계 카메라는 한 자리에서 돌고 당기기만 하므로 기준 화면과 지금 화면 사이는
+        관중석까지 통째로 화면 변환 하나다. 따로 맞춘 둘 이상이 같은 답을 내면 라인을 못 봐도 믿을 수 있다."""
+        c = [f for f in self.last_found if f[0] >= min_inliers]
+        if len(c) < min_votes:
+            return None
+        best = None
+        for f in c:
+            grp = [g for g in c if h_distance(g[1], f[1], shape, self.spec) <= agree_px]
+            ns = sorted(g[3] for g in grp)
+            votes = sum(1 for k, x in enumerate(ns) if k == 0 or x - ns[k - 1] >= min_sep)
+            key = (votes, sum(g[0] for g in grp))
+            if best is None or key > best[0]:
+                best = (key, grp)
+        (votes, _), grp = best
+        if votes < min_votes:
+            return None
+        w = np.array([g[0] for g in grp], float)
+        H = sum(wi * g[1] for wi, g in zip(w, grp)) / w.sum()
+        H = H / H[2, 2]
+        return H if self.sane(H, shape) else None
 
     def supported(self, sup: tuple) -> bool:
         """보이는 코트 라인 줄 대부분이 실제 선과 겹치고, 맞은 줄의 방향이 엇갈리는가 (line_support 결과)."""
