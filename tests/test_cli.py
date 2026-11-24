@@ -10,6 +10,7 @@ from gtt import cli
 from gtt import homography as HG
 from gtt import scorebug as SB
 from gtt.court import FIBA, landmarks
+from gtt.video import Video
 
 from test_homography import make_scene
 
@@ -148,3 +149,67 @@ def test_demo_runs_end_to_end(tmp_path):
     assert res["점수 변화"].startswith("정답 2개 중 2개 맞음")  # 6초 +2, 14초 +3
     assert all(s["맞음"] for s in res["슛 판정 상세"])
     assert (tmp_path / "demo" / "overlay_grid.png").exists()
+
+
+def test_lens_fit_and_track_with_lens(tmp_path, capsys):
+    """렌즈가 휜 영상: lens-fit 으로 k1 을 찾고, track-court --lens 로 편 화면에서 추적하고, 원본 화면에서 찍은 발 위치를
+    shot 이 편 화면으로 옮겨 판정한다. 화면 왼쪽 아래 가장자리, 라인 바로 바깥(+0.06m) 슛: 휜 화면에 맞춘 H 만으로는
+    (라인 보정을 못 하면) -0.02m 로 2점이 나오지만, 휨을 펴면 맞는다."""
+    from test_lens import distorted_scene
+
+    from gtt import homography as HG
+    from gtt.court import FIBA
+    from gtt.lens import Lens
+
+    k1 = -0.12
+    video = tmp_path / "bent.avi"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (1280, 720))
+    truth = []
+    for i in range(30):  # 3초, 천천히 오른쪽으로 팬
+        raw, Hideal, lens, Hc = distorted_scene(k1, shift=(-3.0 * i, 0.0))
+        cv2.rectangle(raw, (500, 660), (780, 712), (30, 20, 20), -1)  # 스코어버그 (움직이지 않음)
+        cv2.putText(raw, "47 52", (540, 700), cv2.FONT_HERSHEY_DUPLEX, 1.2, (255, 255, 255), 2)
+        w.write(raw)
+        truth.append((Hideal, Hc))
+    w.release()
+    # 사람이 원본(휜) 화면에서 맞춘 캘리브레이션 = 휨을 무시한 H 를 라인에 맞춘 것
+    raw0 = Video(str(video)).frame_at(0.0)
+    H = truth[0][0]
+    for _ in range(4):
+        H, _ = HG.refine_homography(raw0, H, FIBA)
+    (tmp_path / "calib.json").write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "H_court_to_image": H.tolist()}))
+    lens_json = tmp_path / "lens.json"
+    cli.main(["lens-fit", "--video", str(video), "--calib", str(tmp_path / "calib.json"), "--out", str(lens_json)])
+    got = Lens.load(lens_json)
+    assert abs(got.k1 - k1) <= 0.021, got
+    track = tmp_path / "t.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(tmp_path / "calib.json"), "--lens", str(lens_json),
+              "--step", "0.5", "--out", str(track)])
+    z = np.load(track)
+    look = cli._CourtLookup(None, str(track))
+    assert look.lens is not None and abs(look.lens.k1 - got.k1) < 1e-9
+    good = [i for i, H in enumerate(z["H"]) if np.all(np.isfinite(H))]
+    assert len(good) >= 5
+    # 편 화면 정답 H 와 비교 (정답은 k1 로 편 화면, 찾은 k1 과 조금 다를 수 있어 원본 화면 점으로 비교)
+    for i in good:
+        t = float(z["times"][i])
+        Hideal = truth[int(round(t * 10))][0]
+        for x, y in [(1.575 + 6.0, 7.5), (3.0, 2.0), (8.0, 13.0)]:
+            u_true, v_true = Lens(k1, 1280, 720).distort_pts([HG.court_to_image(Hideal, x, y) + np.array([Lens(k1, 1280, 720).pad] * 2)])[0]
+            uc, vc = HG.court_to_image(z["H"][i], x, y)
+            ur, vr = look.to_raw(uc, vc)
+            assert np.hypot(ur - u_true, vr - v_true) < 3.0, (t, x, y)
+    # 화면 아래쪽 45도 3점 라인 바로 바깥(림 쪽 발끝 +0.12m)에서 쏜 슛: 원본 화면에서 찍은 두 발 가운데
+    lens_true = Lens(k1, 1280, 720)
+    th = np.radians(75)
+    d = FIBA.three_radius + 0.06 + FIBA.foot_reach
+    x, y = 1.575 + d * np.cos(th), 7.5 + d * np.sin(th)
+    u, v = lens_true.distort_pts([np.array(HG.court_to_image(truth[0][0], x, y)) + lens_true.pad])[0]
+    assert HG.classify_click(H, u, v, FIBA, side="left").points == 2  # 휨 무시: 틀림
+    capsys.readouterr()
+    cli.main(["shot", "--track", str(track), "--t", "0", "--u", str(u), "--v", str(v), "--side", "left"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["points"] == 3 and abs(out["margin_m"] - 0.06) < 0.04
+    cli.main(["shot", "--track", str(track), "--t", "0", "--u", str(u), "--v", str(v), "--video", str(video), "--side", "left"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["points"] == 3 and abs(out["margin_m"] - 0.06) < 0.04

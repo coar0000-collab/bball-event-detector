@@ -112,7 +112,8 @@ def cmd_scorebug_read(a):
     if a.templates and Path(a.templates).exists():
         tmpl = SB.DigitTemplates.load(a.templates)
         if tmpl.missing():
-            print(f"경고: 템플릿에 없는 숫자 {tmpl.missing()} → 글꼴 대체 템플릿으로 보충")
+            print(f"경고: 실제 화면에서 등록하지 않은 숫자 {tmpl.missing()} → 글꼴 대체 템플릿으로 보충합니다. "
+                  f"중계 글꼴과 달라 잘못 읽을 수 있으니, 그 숫자가 나오는 화면에서 scorebug-learn 으로 등록하세요.")
             fb = SB.DigitTemplates.from_fonts()
             for d in tmpl.missing():
                 for g in fb.samples.get(d, []):
@@ -124,8 +125,10 @@ def cmd_scorebug_read(a):
     events, raw = [], []
     last_print = 0.0
     for t, frame in v.iterate(step=a.step, start=a.start, end=a.end):
-        rh = SB.read_number(cfg.crop(frame, "home"), tmpl, cfg.max_digits)
-        ra = SB.read_number(cfg.crop(frame, "away"), tmpl, cfg.max_digits)
+        # 확정된 점수를 알면 그 근처 값으로만 읽는다 (한 번에 +4 이상 바뀌는 판독은 잘못 읽은 것)
+        ph, pa = det.state if det.state is not None else (None, None)
+        rh = SB.read_number_near(cfg.crop(frame, "home"), tmpl, ph, cfg.max_digits)
+        ra = SB.read_number_near(cfg.crop(frame, "away"), tmpl, pa, cfg.max_digits)
         raw.append({"t_sec": round(t, 2), "home": rh.value, "away": ra.value, "home_conf": round(rh.confidence, 3), "away_conf": round(ra.confidence, 3)})
         for e in det.push(t, rh.value, ra.value):
             row = e.as_row()
@@ -244,29 +247,136 @@ def _load_calib(path: str) -> tuple[np.ndarray, dict]:
     return np.array(d["H_court_to_image"], dtype=np.float64), d
 
 
+def _sample_frames(v, start: float, end: float, n: int = 12) -> list:
+    """구간 전체에서 띄엄띄엄 n 장 (방송 그래픽 찾기용). 못 읽는 프레임은 건너뛴다."""
+    out = []
+    for k in range(n):
+        try:
+            out.append(v.frame_at(start + (end - start) * k / n))
+        except ValueError:
+            pass
+    return out
+
+
+def _calib_on_canvas(H: np.ndarray, d: dict, frame_raw: np.ndarray, lens, spec, ignore) -> tuple[np.ndarray, float]:
+    """원본 화면에서 맞춘 캘리브레이션 H 를 렌즈 휨을 편 화면(canvas) 용으로 바꾼다. (H, 일치율)
+
+    사람이 찍은 점(image_points)이 있으면 그 점을 펴서 다시 맞추고, 없으면 H 를 옮긴 뒤 흰 라인에 다시 맞춘다."""
+    from .lens import convert_h
+
+    if lens is None or lens.is_identity:
+        return H, float("nan")
+    if d.get("lens") and abs(float(d["lens"].get("k1", 0.0)) - lens.k1) < 1e-9:
+        return H, float("nan")  # 이미 편 화면에서 맞춘 캘리브레이션
+    Hc = None
+    pts = d.get("image_points") or {}
+    if len(pts) >= 4:
+        und = {k: tuple(lens.undistort_pts([v])[0]) for k, v in pts.items()}
+        try:
+            Hc, _ = HG.fit_homography(und, spec)
+        except Exception:  # noqa: BLE001 — 점이 이상하면 H 를 옮기는 쪽으로
+            Hc = None
+    if Hc is None:
+        Hc = convert_h(H, lens, spec)
+    canvas = lens.undistort(frame_raw)
+    Hc, sc = HG.refine_homography(canvas, Hc, spec, ignore=ignore)
+    for _ in range(4):
+        H2, s2 = HG.refine_homography(canvas, Hc, spec, ignore=ignore)
+        if s2 <= sc + 0.002:
+            break
+        Hc, sc = H2, s2
+    return Hc, sc
+
+
+def cmd_lens_fit(a):
+    from . import lens as LN
+
+    spec = _spec(a.spec)
+    v = Video(a.video)
+    samples = []
+    for c in a.calib:
+        H, d = _load_calib(c)
+        if d.get("t_sec") is None:
+            print(f"경고: {c} 에 t_sec 가 없어 뺌", file=sys.stderr)
+            continue
+        samples.append((v.frame_at(float(d["t_sec"])), H, f"{Path(c).name} ({float(d['t_sec']):.1f}s)"))
+    if a.track:
+        z = np.load(a.track, allow_pickle=False)
+        ok = [i for i, (st, sc) in enumerate(zip(z["status"], z["line_score"]))
+              if str(st) in ("ok", "recovered") and float(sc) >= a.min_score]
+        if ok:
+            pick = [ok[int(j)] for j in np.linspace(0, len(ok) - 1, min(a.n_extra, len(ok)))]
+            for i in dict.fromkeys(pick):
+                t = float(z["times"][i])
+                samples.append((v.frame_at(t), z["H"][i], f"추적 {t:.1f}s ({float(z['line_score'][i]):.2f})"))
+    if not samples:
+        sys.exit("렌즈 휨을 잴 화면이 없습니다 (--calib 에 t_sec 가 있는 캘리브레이션, 또는 --track).")
+    end = v.duration or 600.0
+    graphics = HG.graphics_mask(_sample_frames(v, 0.0, end))
+    print(f"화면 {len(samples)}장: " + ", ".join(n for _, _, n in samples))
+    print("방송 그래픽 자리: " + (f"{int(graphics.sum())}px 제외" if graphics is not None else "못 찾음(전부 사용)"))
+    best, table = LN.fit_k1([(f, H) for f, H, _ in samples], spec, graphics_raw=graphics, log=print)
+    r0 = dict((k, r) for k, r, _ in table).get(0.0)
+    rb = dict((k, r) for k, r, _ in table)[best]
+    lens = LN.Lens(best, v.width, v.height)
+    print(f"\n가장 잘 맞는 k1 = {best:+.3f}  (라인까지 평균 {rb:.3f}px"
+          + (f", 휨 보정 없음 {r0:.3f}px" if r0 is not None else "") + f")  편 화면 여백 {lens.pad}px")
+    if r0 is not None and r0 - rb < 0.05:
+        print("휨 보정으로 거의 나아지지 않습니다 → k1=0 (보정 안 함) 으로 저장")
+        lens = LN.Lens(0.0, v.width, v.height, 0)
+    for f, H, name in samples:
+        _, _, sc, res, _ = LN.fit_on_canvas(f, H, lens, spec, graphics)
+        print(f"  {name}: 일치율 {sc:.3f}, 라인까지 {res:.3f}px")
+    lens.save(a.out)
+    print(f"저장: {a.out}")
+
+
 def cmd_track_court(a):
     spec = _spec(a.spec)
     calibs = a.calib if isinstance(a.calib, list) else [a.calib or "configs/calib.json"]
     H0, d = _load_calib(calibs[0])
-    v = Video(a.video)
+    raw_v = Video(a.video)
+    lens = None
+    if a.lens:
+        from .lens import Lens, LensVideo
+
+        lens = Lens.load(a.lens)
+        if (lens.width, lens.height) != (raw_v.width, raw_v.height):
+            sys.exit(f"렌즈 파일 해상도 {lens.width}x{lens.height} 가 영상 {raw_v.width}x{raw_v.height} 와 다릅니다.")
+        print(f"렌즈 휨 보정 k1={lens.k1:+.3f} (편 화면 {lens.canvas_size[0]}x{lens.canvas_size[1]})", file=sys.stderr)
+    v = LensVideo(raw_v, lens) if lens is not None else raw_v
     t_calib = float(d.get("t_sec") or 0.0)
     start = a.start if a.start is not None else t_calib
-    frame_c = v.frame_at(t_calib)  # 캘리브레이션 H 는 이 화면에서 맞춘 것
-    frame0 = frame_c if abs(start - t_calib) < 1e-3 else v.frame_at(start)
-    # 방송 그래픽(스코어버그·로고) 찾기: 구간 전체에서 띄엄띄엄 12장을 뽑아 안 변하는 곳을 특징점에서 뺀다
     end = a.end if a.end is not None else v.duration
     if end <= start:  # 길이를 모르는 영상
         end = start + 600
-    samples = []
-    for k in range(12):
-        try:
-            samples.append(v.frame_at(start + (end - start) * k / 12))
-        except ValueError:  # 못 읽는 프레임은 건너뛴다
-            pass
+    # 방송 그래픽(스코어버그·로고) 찾기: 구간 전체에서 띄엄띄엄 12장을 뽑아 안 변하는 곳을 특징점에서 빼고(overlay),
+    # 라인 정합·라인 보정에서도 뺀다(ignore: 그래픽의 흰 글자를 라인으로 쓰지 않고, 가려진 라인을 '틀림'으로 세지 않음)
+    raw_samples = _sample_frames(raw_v, start, end)
+    graphics_raw = HG.graphics_mask(raw_samples) if not a.no_graphics_mask else None
+    if lens is not None:
+        from .lens import canvas_ignore
+
+        ignore = canvas_ignore(lens, graphics_raw)
+        samples = [lens.undistort(f) for f in raw_samples]
+    else:
+        ignore = graphics_raw
+        samples = raw_samples
+    print("방송 그래픽 자리: " + (f"{int(graphics_raw.sum())}px 라인 정합에서 제외" if graphics_raw is not None else "못 찾음"),
+          file=sys.stderr)
+    frame_c = v.frame_at(t_calib)  # 캘리브레이션 H 는 이 화면에서 맞춘 것
+    frame0 = frame_c if abs(start - t_calib) < 1e-3 else v.frame_at(start)
+    if lens is not None:
+        H0, sc0 = _calib_on_canvas(H0, d, raw_v.frame_at(t_calib), lens, spec, ignore)
+        print(f"캘리브레이션 {calibs[0]} → 편 화면에서 다시 맞춤 (일치율 {sc0:.2f})", file=sys.stderr)
     sm = HG.StaticMask.from_frames(samples)
     overlay = sm.mask(frame0.shape[:2])
+    if overlay is not None and lens is not None and lens.invalid_mask() is not None:
+        overlay = overlay.copy()
+        overlay[cv2.dilate(lens.invalid_mask().astype(np.uint8), np.ones((9, 9), np.uint8)) > 0] = 0  # 검정 여백 경계는 특징점 아님
     # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
-    trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score)
+    trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score,
+                          ignore=ignore)
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
     # 사람이 맞춘 화면은 그 시각의 정답이기도 하다: (시각, H, 회색 화면). 추적 결과에 그 시각으로 그대로 넣고,
     # 그 직후 샘플에서 추적이 놓쳐 있으면 이 화면에서 이어 붙여 다시 잡는다.
@@ -283,6 +393,9 @@ def cmd_track_court(a):
         except ValueError:
             print(f"경고: {c} 의 시각 프레임을 못 읽어 기준에서 뺌", file=sys.stderr)
             continue
+        if lens is not None:
+            Hc, scc = _calib_on_canvas(Hc, dc, raw_v.frame_at(tc), lens, spec, ignore)
+            print(f"캘리브레이션 {c} → 편 화면에서 다시 맞춤 (일치율 {scc:.2f})", file=sys.stderr)
         trk.add_anchor(fc, Hc)
         cal_list.append((tc, Hc, cv2.cvtColor(fc, cv2.COLOR_BGR2GRAY)))
     for tc, _, _ in cal_list:
@@ -335,7 +448,7 @@ def cmd_track_court(a):
                 F, n = HG.frame_to_frame(last_good_gray, gray, trk.orb, trk.matcher, mask=overlay, return_inliers=True)
                 Hr, sc = None, 0.0
                 if F is not None and n >= 80:
-                    Hr, sc, sup = HG.refine_homography(frame, F @ last_good, spec, return_support=True)
+                    Hr, sc, sup = HG.refine_homography(frame, F @ last_good, spec, return_support=True, ignore=ignore)
                     if not trk.supported(sup) or not trk.sane(Hr, frame.shape):
                         Hr, sc = None, 0.0
             if strong(Hr, sc) or (Hr is not None and sc >= a.recover_score):
@@ -349,7 +462,7 @@ def cmd_track_court(a):
                     F, n = HG.frame_to_frame(gc, gray, trk.orb, trk.matcher, mask=overlay, return_inliers=True)
                     if F is None or n < 80:
                         continue
-                    Hr, sc, sup = HG.refine_homography(frame, F @ Hc, spec, return_support=True)
+                    Hr, sc, sup = HG.refine_homography(frame, F @ Hc, spec, return_support=True, ignore=ignore)
                     if sc >= a.min_score and trk.supported(sup) and trk.sane(Hr, frame.shape):
                         trk.reset(Hr, frame)
                         r = HG.TrackResult(Hr, sc, "recovered")
@@ -401,17 +514,53 @@ def cmd_track_court(a):
     times, Hs, scores = [times[i] for i in order], [Hs[i] for i in order], [scores[i] for i in order]
     status, support = [status[i] for i in order], [support[i] for i in order]
     # support: 샘플마다 (보이는 라인 줄, 맞은 줄, 방향 엇갈림) — 틀린 정합을 찾을 때 본다
+    extra = {}
+    if lens is not None:
+        extra["lens"] = json.dumps(lens.as_dict())  # H 는 렌즈 휨을 편 화면(canvas) 좌표 → 원본 화면 점은 lens 로 옮겨 쓴다
+    if ignore is not None:
+        extra["ignore"] = np.packbits(ignore.astype(bool))
+        extra["ignore_shape"] = np.array(ignore.shape)
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status),
-                        support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name)
+                        support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name, **extra)
     ok = sum(s in ("ok", "recovered", "calib", "bridged") for s in status)
     print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
           f"앞뒤 정상 화면 사이 메움 {n_bridged}개)")
 
 
 class _CourtLookup:
+    """시각 → 코트 변환. 추적 결과(npz)에 렌즈 휨 보정(lens)이 있으면 H 는 편 화면(canvas) 좌표이므로
+    화면은 undistort(), 원본 화면에서 찍은 점은 to_canvas() 로 옮겨 쓴다. ignore: 라인 정합에서 뺀 자리(방송 그래픽 등)."""
+
     def __init__(self, calib: str | None, track: str | None):
         self.fixed = _load_calib(calib)[0] if calib else None
         self.track = np.load(track, allow_pickle=False) if track else None
+        self.lens = None
+        self.ignore = None
+        if self.track is not None:
+            if "lens" in self.track.files:
+                from .lens import Lens
+
+                d = json.loads(str(self.track["lens"]))
+                self.lens = Lens(float(d["k1"]), int(d["width"]), int(d["height"]), int(d["pad"]))
+            if "ignore" in self.track.files:
+                shp = tuple(int(x) for x in self.track["ignore_shape"])
+                self.ignore = np.unpackbits(self.track["ignore"])[: shp[0] * shp[1]].reshape(shp).astype(bool)
+
+    def undistort(self, frame: np.ndarray) -> np.ndarray:
+        return self.lens.undistort(frame) if self.lens is not None else frame
+
+    def to_canvas(self, u: float, v: float) -> tuple[float, float]:
+        if self.lens is None:
+            return u, v
+        p = self.lens.undistort_pts([[u, v]])[0]
+        return float(p[0]), float(p[1])
+
+    def to_raw(self, u: float, v: float) -> tuple[float, float]:
+        if self.lens is None:
+            return u, v
+        p = self.lens.distort_pts([[u, v]])[0]
+        return float(p[0]), float(p[1])
 
     def nearest(self, t: float, tol: float = 0.6) -> tuple[np.ndarray | None, float]:
         """(H, 그 H 가 계산된 시각과의 차이 초). 고정 캘리브레이션이면 차이 0.
@@ -436,12 +585,13 @@ class _CourtLookup:
 def cmd_overlay(a):
     spec = _spec(a.spec)
     v = Video(a.video)
-    frame = v.frame_at(a.t)
-    H = _CourtLookup(a.calib, a.track).at(a.t)
+    look = _CourtLookup(a.calib, a.track)
+    frame = look.undistort(v.frame_at(a.t))  # 렌즈 휨 보정한 추적이면 편 화면에 그린다
+    H = look.at(a.t)
     if H is None:
         sys.exit("이 시각의 코트 변환이 없습니다 (화면 전환 구간일 수 있음).")
     if a.refine:
-        H, sc = HG.refine_homography(frame, H, spec)
+        H, sc = HG.refine_homography(frame, H, spec, ignore=look.ignore)
         print(f"라인 정합 일치율 {sc:.2f}")
     HG.draw_court(frame, H, spec, (0, 255, 255), 2)
     cv2.imwrite(a.out, frame)
@@ -449,12 +599,21 @@ def cmd_overlay(a):
 
 
 def cmd_shot(a):
+    """원본 화면에서 찍은 발 위치(--u --v) 하나를 판정. --video 를 주면 그 화면에 보이는 3점 라인으로 보정하고(click-shots 와 같음),
+    추적 결과에 렌즈 휨 보정이 있으면 점과 화면을 편 화면으로 옮겨 판정한다."""
     spec = _spec(a.spec)
-    H = _CourtLookup(a.calib, a.track).at(a.t or 0.0)
+    look = _CourtLookup(a.calib, a.track)
+    t = a.t or 0.0
+    H = look.at(t)
     if H is None:
         sys.exit("코트 변환이 없습니다.")
-    call = HG.classify_click(H, a.u, a.v, spec, side=a.side)
-    print(json.dumps(call.as_dict(), ensure_ascii=False, indent=2))
+    frame = look.undistort(Video(a.video).frame_at(t)) if a.video else None
+    u, v = look.to_canvas(a.u, a.v)
+    call = HG.classify_click(H, u, v, spec, side=a.side, frame=frame, ignore=look.ignore)
+    out = call.as_dict()
+    if look.lens is not None:
+        out["canvas_uv"] = [round(u, 1), round(v, 1)]
+    print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
 def cmd_click_shots(a):
@@ -493,7 +652,7 @@ def cmd_click_shots(a):
         if key not in h_cache:
             H, dt = look.nearest(t)
             if H is not None and abs(dt) > 0.5 / v.fps:
-                Hr, sc = HG.refine_homography(frame, H, spec)
+                Hr, sc = HG.refine_homography(frame, H, spec, ignore=look.ignore)
                 if sc >= 0.3:
                     H = Hr
             h_cache.clear()
@@ -502,7 +661,10 @@ def cmd_click_shots(a):
 
     cv2.setMouseCallback(win, on_mouse)
     print(__SHOTS_HELP)
-    frame = v.frame_at(t)
+    if look.lens is not None:
+        print(f"렌즈 휨을 편 화면으로 보여 줍니다 (k1={look.lens.k1:+.3f}). CSV 의 u, v 는 원본 화면 좌표로 저장합니다.")
+    frame_at = lambda tt: look.undistort(v.frame_at(tt))  # noqa: E731
+    frame = frame_at(t)
     while True:
         if playing:
             t += 1.0 / v.fps * 2
@@ -510,6 +672,8 @@ def cmd_click_shots(a):
             ok2 = v.cap.grab()
             if not (ok and ok2):
                 playing = False
+            else:
+                frame = look.undistort(frame)
         H = court_at(t, frame)
         if state["click"] is not None:
             u, vv = state["click"][0] / s, state["click"][1] / s
@@ -522,8 +686,8 @@ def cmd_click_shots(a):
             if H is not None:
                 # 이 프레임에 보이는 3점 라인에 맞춰 보정하도록 화면도 같이 넘긴다
                 clicks.append((H.copy(), u, vv, frame.copy()))
-                call = (HG.classify_clicks(clicks, spec, side=a.side) if len(clicks) > 1
-                        else HG.classify_click(H, u, vv, spec, side=a.side, frame=frame))
+                call = (HG.classify_clicks(clicks, spec, side=a.side, ignore=look.ignore) if len(clicks) > 1
+                        else HG.classify_click(H, u, vv, spec, side=a.side, frame=frame, ignore=look.ignore))
             else:
                 call = None
         view = frame.copy()
@@ -558,7 +722,8 @@ def cmd_click_shots(a):
         if call:
             txt = (f"{call.points}PT {call.zone}  dist {call.dist_to_rim:.2f}m  toe-to-line {call.margin:+.2f}m"
                    + ("  ON LINE" if call.on_line else "") + ("  NEAR LINE!" if call.near_line else "")
-                   + (f"  [line snap {call.line_snap_px:+.1f}px]" if call.line_snap_px is not None else "  [line hidden: H only]"))
+                   + (f"  [line snap {call.line_snap_px:+.1f}px]" if call.line_snap_px is not None
+                      else ("  [LINE BLOCKED by graphics/edge]" if call.line_hidden else "  [line hidden: H only]")))
             _put(view, txt, (10, 58), 0.65, (0, 255, 0) if call.points == 3 else (255, 200, 0))
             if call.ft_spot and not ft:
                 _put(view, "FT spot: press f if this is a free throw", (10, 88), 0.6, (0, 200, 255))
@@ -573,14 +738,14 @@ def cmd_click_shots(a):
                 v.cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * v.fps))
         elif key in (ord("a"), ord("d"), ord("j"), ord("l")):
             t = max(0.0, t + {ord("a"): -1, ord("d"): 1, ord("j"): -5, ord("l"): 5}[key])
-            frame = v.frame_at(t)
+            frame = frame_at(t)
             point, call, clicks = None, None, []
         elif key == ord(","):
             t = max(0.0, t - 1 / v.fps)
-            frame = v.frame_at(t)
+            frame = frame_at(t)
         elif key == ord("."):
             t += 1 / v.fps
-            frame = v.frame_at(t)
+            frame = frame_at(t)
         elif key == ord("t"):
             team = "away" if team == "home" else "home"
         elif key == ord("f"):
@@ -595,8 +760,9 @@ def cmd_click_shots(a):
         elif key in (8, 127):  # Backspace
             jersey = ""
         elif key in (ord("m"), ord("x")) and point is not None:
+            ur, vr = look.to_raw(point[0], point[1])  # 원본 화면 좌표로 저장 (렌즈 보정 여부와 상관없이 같은 기준)
             row = {"t_sec": round(t, 2), "time": fmt_time(t), "team": team, "no": jersey, "result": "MADE" if key == ord("m") else "MISSED",
-                   "u": round(point[0], 1), "v": round(point[1], 1)}
+                   "u": round(ur, 1), "v": round(vr, 1)}
             row.update(call.as_dict() if call else {"points": "", "zone": "", "zone_kr": "", "near_line": ""})
             row.update({"replay": replay, "clicks": len(clicks), "line_call": line_call})
             if line_call and call is not None:
@@ -774,7 +940,18 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--reloc-every", type=int, default=5, help="좌표를 못 내는(coast) 샘플이 이만큼 이어질 때마다 기준 화면과 다시 맞춰 봄")
     q.add_argument("--bridge", type=float, default=4.0,
                    help="좌표를 못 낸 구간이 이 초 이하이고 앞뒤가 정상이면, 양쪽에서 화면 이동으로 따라와 서로 맞을 때만 메움 (0 = 끔)")
+    q.add_argument("--lens", default=None, help="lens-fit 결과 JSON. 주면 렌즈 휨을 편 화면에서 추적·판정 (화면 가장자리 정확도)")
+    q.add_argument("--no-graphics-mask", action="store_true", help="방송 그래픽 자리를 라인 정합에서 빼지 않음 (비교용)")
     q.add_argument("--out", default="out/court_track.npz")
+
+    q = add("lens-fit", cmd_lens_fit, "캘리브레이션 화면들로 렌즈 휨(k1)을 재서 저장 → track-court --lens")
+    q.add_argument("--video", required=True)
+    q.add_argument("--calib", action="append", required=True, help="t_sec 가 있는 캘리브레이션 JSON (여러 번, 양쪽 골대 화면 권장)")
+    q.add_argument("--track", default=None, help="(선택) 추적 결과에서 라인이 잘 맞은 화면을 더 씀")
+    q.add_argument("--n-extra", type=int, default=8)
+    q.add_argument("--min-score", type=float, default=0.8)
+    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--out", default="configs/lens.json")
 
     q = add("overlay", cmd_overlay, "코트 라인을 영상 프레임에 겹쳐 그려 확인")
     q.add_argument("--video", required=True)
@@ -786,6 +963,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--out", default="out/overlay.png")
 
     q = add("shot", cmd_shot, "화면 좌표(슈터 발) 하나로 2점/3점 판정")
+    q.add_argument("--video", default=None, help="주면 그 시각 화면의 3점 라인으로 보정 (click-shots 와 같은 판정)")
     q.add_argument("--u", type=float, required=True)
     q.add_argument("--v", type=float, required=True)
     q.add_argument("--t", type=float, default=None)
