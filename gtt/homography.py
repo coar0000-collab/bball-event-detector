@@ -50,20 +50,110 @@ def court_to_image(H: np.ndarray, x: float, y: float) -> tuple[float, float]:
     return float(u), float(v)
 
 
+def _three_center_samples(H: np.ndarray, spec: CourtSpec, side: str, step_m: float = 0.05):
+    """3점 라인 띠 가운데 선의 점들을 화면에 투영한 것과, 각 점에서 라인 바깥쪽(3점 쪽)을 가리키는 화면 단위 벡터."""
+    from .court import three_line_edges
+
+    pts = densify(three_line_edges(spec)[("L" if side == "left" else "R") + "_center"], step_m)
+    rx, ry = spec.rim(side)
+    d_base = pts[:, 0] if side == "left" else spec.length - pts[:, 0]
+    dirs = np.zeros_like(pts)
+    corner = d_base <= spec.corner_straight_end + 1e-6
+    dirs[corner, 1] = np.sign(pts[corner, 1] - ry)
+    r = np.hypot(pts[~corner, 0] - rx, pts[~corner, 1] - ry)
+    dirs[~corner, 0] = (pts[~corner, 0] - rx) / r
+    dirs[~corner, 1] = (pts[~corner, 1] - ry) / r
+    a = project(H, pts)
+    b = project(H, pts + 0.1 * dirs)
+    n = b - a
+    n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-9)
+    return a, n
+
+
+def snap_three_line(frame: np.ndarray, H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, side: str = "left",
+                    exclude_px: float = 22.0, reach_px: float = 90.0, search_px: int = 12, min_samples: int = 6,
+                    mask: np.ndarray | None = None):
+    """찍은 발 근처에서 실제로 보이는 3점 라인이 H 로 계산한 라인보다 화면에서 몇 px 바깥(+)/안쪽(-)에 있는지.
+
+    코트 전체로 맞춘 H 는 군데군데 몇 px 어긋날 수 있다. 2점/3점은 발끝과 '칠해진 라인' 사이 거리로 정해지므로,
+    발 주변(신발이 가리는 exclude_px 안쪽은 빼고 reach_px 까지)에서 라인 가운데를 직접 찾아 그 차이를 잰다.
+    수비수·슈터 몸에 가려 보이는 라인 조각이 min_samples 보다 적거나 서로 안 맞으면(다른 종목 선 등) None → 보정하지 않는다.
+    반환: (차이 px, 쓴 조각 수, 발에서 가장 가까운 라인 점의 바깥 방향 단위 벡터) 또는 None.
+    """
+    m = (line_mask(frame) > 0) if mask is None else mask
+    h, w = m.shape
+    a, n = _three_center_samples(H, spec, side)
+    d = np.hypot(a[:, 0] - u, a[:, 1] - v)
+    if not len(d):
+        return None
+    n_near = n[int(np.argmin(d))]
+    idx = np.flatnonzero((d >= exclude_px) & (d <= reach_px))
+    if len(idx) > 60:
+        idx = idx[np.linspace(0, len(idx) - 1, 60).astype(int)]
+    offs = []
+    ts = np.arange(-search_px, search_px + 1)
+    for i in idx:
+        q = a[i][None, :] + ts[:, None] * n[i][None, :]
+        qi = np.round(q).astype(int)
+        inside = (qi[:, 0] >= 0) & (qi[:, 0] < w) & (qi[:, 1] >= 0) & (qi[:, 1] < h)
+        if not inside.all():
+            continue
+        on = m[qi[:, 1], qi[:, 0]]
+        if not on.any():
+            continue
+        # 흰 픽셀 덩어리(run)들 중 계산 위치(0)에 가장 가까운 것. 너무 두꺼우면(신발·유니폼·다른 큰 흰 면) 버린다.
+        runs, k = [], 0
+        while k < len(on):
+            if on[k]:
+                j = k
+                while j + 1 < len(on) and on[j + 1]:
+                    j += 1
+                runs.append((ts[k], ts[j]))
+                k = j + 1
+            else:
+                k += 1
+        c0, c1 = min(runs, key=lambda r: abs((r[0] + r[1]) / 2))
+        if c1 - c0 + 1 > 8 or c0 == ts[0] or c1 == ts[-1]:
+            continue
+        offs.append((c0 + c1) / 2)
+    if len(offs) < min_samples:
+        return None
+    offs = np.array(offs, float)
+    med = float(np.median(offs))
+    if float(np.median(np.abs(offs - med))) > 1.5 or abs(med) > search_px - 2:
+        return None
+    return med, len(offs), n_near
+
+
 def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, side: str | None = None,
-                   click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3):
+                   click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3, frame: np.ndarray | None = None,
+                   foot: str = "mid", line_mask_img: np.ndarray | None = None):
     """화면에서 찍은 발 위치(u, v)로 2점/3점을 판정하고, 찍기 오차를 반영해 '라인 근처'를 정한다.
 
     같은 1px 이라도 카메라에서 먼 쪽(특히 먼 코너)은 코트에서 수 cm~10cm 가 된다. 그래서 고정 30cm 대신
     click_px 만큼 잘못 찍었을 때 3점 라인까지 거리가 흔들리는 정도(margin_sigma)의 k 배와 30cm 중 큰 값 안쪽이면 near_line.
+    frame 을 주면 발 근처에 실제로 보이는 3점 라인에 맞춰 위치를 보정한다(snap_three_line). 라인이 가려져 못 찾으면
+    H 로 계산한 라인을 그대로 쓰고 line_snap_px=None.
+    foot: "mid" = 두 발 가운데를 찍음 / "toe" = 림 쪽 발끝을 찍음 (court.classify_shot 참고).
     """
     from .court import classify_shot, three_point_margin
 
     x, y = image_to_court(H, u, v)
-    call = classify_shot(x, y, spec, side=side)
+    call = classify_shot(x, y, spec, side=side, foot=foot)
+    snap = None
+    if frame is not None:
+        snap = snap_three_line(frame, H, u, v, spec, call.side, mask=line_mask_img)
+        if snap is not None:
+            off, _, n_near = snap
+            # 칠해진 라인이 off px 바깥에 있으면, 라인에 대한 발 위치는 그만큼 안쪽 → 찍은 점을 반대로 옮긴 것과 같다
+            u, v = u - off * float(n_near[0]), v - off * float(n_near[1])
+            x, y = image_to_court(H, u, v)
+            call = classify_shot(x, y, spec, side=call.side, foot=foot)
+            call.line_snap_px = off
     m0 = call.margin
-    mu = three_point_margin(*image_to_court(H, u + 1, v), spec, call.side) - m0
-    mv = three_point_margin(*image_to_court(H, u, v + 1), spec, call.side) - m0
+    reach = spec.foot_reach if foot == "mid" else 0.0
+    mu = three_point_margin(*image_to_court(H, u + 1, v), spec, call.side) - reach - m0
+    mv = three_point_margin(*image_to_court(H, u, v + 1), spec, call.side) - reach - m0
     sigma = click_px * float(np.hypot(mu, mv))
     call.margin_sigma = sigma
     call.near_line = abs(m0) < max(min_near_m, k * sigma)
@@ -71,19 +161,23 @@ def classify_click(H: np.ndarray, u: float, v: float, spec: CourtSpec = FIBA, si
 
 
 def classify_clicks(clicks, spec: CourtSpec = FIBA, side: str | None = None,
-                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3):
+                    click_px: float = 3.0, k: float = 2.0, min_near_m: float = 0.3, foot: str = "mid"):
     """같은 슛의 발 위치를 여러 프레임(또는 확대해서 여러 번) 찍은 것을 코트에서 평균해 판정한다.
 
-    clicks: [(H, u, v), ...] — 프레임마다 카메라가 움직여도 각자의 H 로 코트 좌표를 구한 뒤 평균한다.
+    clicks: [(H, u, v), ...] 또는 [(H, u, v, frame), ...] — 프레임마다 카메라가 움직여도 각자의 H 로 코트 좌표를 구한 뒤
+    평균한다. frame 이 있으면 프레임마다 보이는 3점 라인에 맞춰 보정한 뒤 평균한다.
     찍기 오차는 서로 독립이라 n 번 찍으면 흔들림이 1/√n 로 준다. 라인 근처 슛을 확실히 가를 때 쓴다.
     """
     from .court import classify_shot
 
-    calls = [classify_click(H, u, v, spec, side=side, click_px=click_px, k=k, min_near_m=min_near_m) for H, u, v in clicks]
+    calls = [classify_click(c[0], c[1], c[2], spec, side=side, click_px=click_px, k=k, min_near_m=min_near_m,
+                            frame=c[3] if len(c) > 3 else None, foot=foot) for c in clicks]
     side = side or calls[0].side
     x = float(np.mean([c.court_xy[0] for c in calls]))
     y = float(np.mean([c.court_xy[1] for c in calls]))
-    call = classify_shot(x, y, spec, side=side)
+    call = classify_shot(x, y, spec, side=side, foot=foot)
+    snaps = [c.line_snap_px for c in calls if c.line_snap_px is not None]
+    call.line_snap_px = float(np.mean(snaps)) if snaps else None
     sigma = float(np.sqrt(np.sum([c.margin_sigma ** 2 for c in calls]))) / len(calls)
     call.margin_sigma = sigma
     call.near_line = abs(call.margin) < max(min_near_m, k * sigma)
