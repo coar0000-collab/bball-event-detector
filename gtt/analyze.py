@@ -30,6 +30,7 @@ import numpy as np
 
 from . import boxscore as BX
 from . import metrics as MT
+from . import zones as ZN
 from .scorecheck import check as score_check, read_csv
 
 AUTO_NOTE = "영상에서 자동"
@@ -347,11 +348,41 @@ def write_xlsx(path: Path, game, box: BX.Box, met, events, shots, summary, metri
     if shots:
         s = wb.create_sheet("슛 기록")
         cols = ["time", "team", "no", "result", "points", "zone_kr", "margin_m", "near_line", "court_x", "court_y"]
-        s.append(["시각", "팀", "등번호", "결과", "점수", "구역", "3점 라인까지(m)", "라인 근처", "코트 x(m)", "코트 y(m)"])
+        s.append(["시각", "팀", "등번호", "결과", "점수", "구역", "3점 라인까지(m)", "라인 근처", "코트 x(m)", "코트 y(m)",
+                  "세부 구역", "거리대", "림까지(m)", "각도(°)"])
         for r_ in shots:
-            s.append([r_.get(k) if k != "team" else box.team_names.get(r_.get("team"), r_.get("team")) for k in cols])
+            row = [r_.get(k) if k != "team" else box.team_names.get(r_.get("team"), r_.get("team")) for k in cols]
+            z = _zone_row(r_)
+            row += [z["zone"], z["band"], z["dist_m"], z["angle_deg"]] if z else ["", "", "", ""]
+            s.append(row)
         for cell in s[1]:
             cell.font, cell.fill = bold, head
+
+        zs = wb.create_sheet("구역별 슛")
+        tal = ZN.tally(shots)
+        r0 = 1
+        for kind, title, order in (("zone", "세부 구역 (코트 좌표 기준)", ZN.ZONES_2 + ZN.ZONES_3), ("band", "거리대 (림 중심에서)", ZN.BANDS)):
+            zs.cell(r0, 1, title).font = bold
+            hdr = ["구역", "점수"]
+            for t in ("home", "away"):
+                hdr += [f"{box.team_names[t]} 시도", "성공", "성공률"]
+            for j, h in enumerate(hdr, 1):
+                c_ = zs.cell(r0 + 1, j, h)
+                c_.font, c_.fill = bold, head
+            r = r0 + 2
+            for zname in order:
+                pts = 3 if (zname in ZN.ZONES_3 or zname in ZN.BANDS[4:]) else 2
+                row = [zname, pts]
+                for t in ("home", "away"):
+                    a, m_ = tal[kind].get((t, zname), [0, 0])
+                    row += [a, m_, (m_ / a) if a else None]
+                for j, v in enumerate(row, 1):
+                    c_ = zs.cell(r, j, v)
+                    if j in (5, 8) and v is not None:
+                        c_.number_format = "0%"
+                r += 1
+            r0 = r + 1
+        zs.column_dimensions["A"].width = 20
 
     # 설명
     d = wb.create_sheet("설명")
@@ -478,6 +509,39 @@ def _court_svg(shots, names) -> str:
     return "".join(out)
 
 
+def _zone_row(r: dict) -> dict | None:
+    if str(r.get("zone", "")).upper() == "FT":
+        return None
+    try:
+        x, y = float(r["court_x"]), float(r["court_y"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    side = r.get("side") if r.get("side") in ("left", "right") else None
+    return ZN.zone_of(x, y, side=side)
+
+
+def _zone_tables(shots, names) -> str:
+    tal = ZN.tally(shots)
+    P = ["<h2>구역별 슛 (코트 좌표 기준)</h2><p class=sub>카메라 화면이 아니라 코트 규격 좌표(m)로 나눈 구역입니다. "
+         "좌/우는 베이스라인에서 코트를 바라본 방향, 칸은 성공/시도.</p><div class=two>"]
+    for kind, title, order in (("zone", "세부 구역", ZN.ZONES_2 + ZN.ZONES_3), ("band", "거리대", ZN.BANDS)):
+        h = [f"<div class=panel><table><thead><tr><th class=l>{title}</th><th>점수</th>"
+             f"<th class=home>{_e(names['home'])}</th><th class=away>{_e(names['away'])}</th></tr></thead><tbody>"]
+        for z in order:
+            pts = 3 if (z in ZN.ZONES_3 or z in ZN.BANDS[4:]) else 2
+            cells = []
+            for t in ("home", "away"):
+                a, m = tal[kind].get((t, z), [0, 0])
+                cells.append(f"<td>{m}/{a} <small>{m / a:.0%}</small></td>" if a else "<td style='color:var(--mute)'>0/0</td>")
+            h.append(f"<tr><td class=l>{_e(z)}</td><td>{pts}</td>{''.join(cells)}</tr>")
+        h.append("</tbody></table></div>")
+        P.append("".join(h))
+    P.append("</div>")
+    if tal["skipped"]:
+        P.append(f"<p class=sub>코트 좌표가 없는 슛 {tal['skipped']}개는 구역에서 뺐습니다.</p>")
+    return "".join(P)
+
+
 def _cell(v, k=None, avail=True):
     f = _fmt(v, k)
     if f is None:
@@ -597,6 +661,8 @@ def write_html(path: Path, game, box: BX.Box, met, events, shots, summary, metri
         P.append("<h2>슛 위치</h2><div class=panel>" + _court_svg(shots, names)
                  + f"<div class=legend><span>● 성공</span><span>✕ 실패</span><span><i class=sw style='background:var(--home)'></i>{_e(names['home'])}</span>"
                    f"<span><i class=sw style='background:var(--away)'></i>{_e(names['away'])}</span></div></div>")
+    if shots:
+        P.append(_zone_tables(shots, names))
     if ag and ag.get("짝지은 변화"):
         P.append("<h2>코트로 정한 점수 vs 점수판</h2><div class=panel><table><tbody>")
         for k in ("점수판 변화", "짝지은 변화", "일치", "슛 없이 바뀐 점수", "점수 변화 없는 성공 슛", "라인 근처 슛이 낀 변화", "라인 근처에서 틀림"):

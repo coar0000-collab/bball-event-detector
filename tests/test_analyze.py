@@ -83,3 +83,21 @@ def test_demo_end_to_end(tmp_path):
     assert ws.cell(4, 1).value == "경기ID" and ws.cell(4, 27).value == "득점"
     names = [ws.cell(r, 4).value for r in range(5, ws.max_row + 1)]
     assert "레드 7번" in names
+
+
+def test_zones_from_court_coordinates():
+    from gtt import zones as ZN
+
+    rim = 1.575
+    assert ZN.zone_of(rim + 0.5, 7.5)["zone"] == "림 근처"
+    assert ZN.zone_of(rim + 2.5, 7.5)["zone"] == "페인트"
+    assert ZN.zone_of(rim + 7.3, 7.5)["zone"] == "탑"
+    assert ZN.zone_of(0.8, 0.5)["zone"].startswith("코너")
+    assert ZN.zone_of(rim + 7.3, 7.5)["band"] == "3점 라인~8m"
+    # 오른쪽 골대도 같은 규칙 (좌우 대칭)
+    a, b = ZN.zone_of(0.8, 0.5), ZN.zone_of(28 - 0.8, 15 - 0.5)
+    assert a["zone"] == b["zone"] and a["band"] == b["band"]
+    t = ZN.tally([{"team": "home", "result": "MADE", "court_x": rim + 7.3, "court_y": 7.5},
+                  {"team": "home", "result": "MISSED", "court_x": rim + 7.2, "court_y": 7.4},
+                  {"team": "home", "result": "MADE", "zone": "FT", "court_x": 6, "court_y": 7.5}])
+    assert t["zone"][("home", "탑")] == [2, 1]
