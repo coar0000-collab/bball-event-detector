@@ -467,6 +467,9 @@ def cmd_track_court(a):
     # 좌표를 못 낸 짧은 구간(coast)을 앞뒤 정상 화면 사이에서 메우기 위해, 마지막 정상 화면 뒤의 샘플 화면을 모아 둔다
     gap: list | None = [] if prev_good_gray is not None else None  # [(샘플 번호, 회색 화면)], None = 메우기 포기
     n_bridged = 0
+    n_consensus = 0
+    # 진단용: 샘플마다 추적기가 들고 있던 위치(좌표를 못 낸 coast 도 화면 이동으로 예측한 H). 확인 안 된 값이라 판정에는 안 쓴다
+    preds = [Hs[0].copy()]
     for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
         if t <= start:
             continue
@@ -478,10 +481,20 @@ def cmd_track_court(a):
             if strong(Hr, sc) or (Hr is not None and sc >= max(a.recover_score, 0.75)):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
+            elif a.consensus and (Hc := trk.consensus(frame.shape)) is not None:
+                # 라인으로는 확인 못 해도 서로 다른 시각의 기준 화면 둘 이상이 같은 자리를 가리킨다
+                trk.reset(Hc, frame)
+                r = HG.TrackResult(Hc, sc, "consensus")
+                n_consensus += 1
         elif r.status in ("cut", "lost"):
             # 화면 전환(리플레이·광고) 뒤: 기준 화면·키프레임과 맞춰 다시 찾는다
             Hr, sc = trk.relocalize(frame)
-            if not strong(Hr, sc) and (Hr is None or sc < a.recover_score):
+            Hc = trk.consensus(frame.shape) if a.consensus else None
+            if not strong(Hr, sc) and (Hr is None or sc < a.recover_score) and Hc is not None:
+                trk.reset(Hc, frame)
+                r = HG.TrackResult(Hc, sc, "consensus")
+                n_consensus += 1
+            elif not strong(Hr, sc) and (Hr is None or sc < a.recover_score):
                 # 마지막으로 잘 맞던 화면과 거의 같은 화면으로 돌아왔을 때만 그 H 에서 라인 정합 (멀리 이동한 화면에 억지로 맞추지 않음)
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 F, n = HG.frame_to_frame(last_good_gray, gray, trk.orb, trk.matcher, mask=overlay, return_inliers=True)
@@ -510,6 +523,7 @@ def cmd_track_court(a):
             last_good, last_good_gray = r.H, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         times.append(t)
         Hs.append(r.H if r.H is not None else np.full((3, 3), np.nan))
+        preds.append(trk.H.copy() if not trk.lost else np.full((3, 3), np.nan))
         scores.append(r.line_score)
         status.append(r.status)
         support.append(tuple(trk.last_support) + (0,) * (3 - len(trk.last_support)))
@@ -546,11 +560,13 @@ def cmd_track_court(a):
         else:
             times.append(tc)
             Hs.append(Hc)
+            preds.append(Hc)
             scores.append(1.0)
             status.append("calib")
             support.append((0, 0, 0))
     order = np.argsort(np.array(times), kind="stable")
     times, Hs, scores = [times[i] for i in order], [Hs[i] for i in order], [scores[i] for i in order]
+    preds = [preds[i] for i in order]
     status, support = [status[i] for i in order], [support[i] for i in order]
     # support: 샘플마다 (보이는 라인 줄, 맞은 줄, 방향 엇갈림) — 틀린 정합을 찾을 때 본다
     extra = {}
@@ -560,11 +576,12 @@ def cmd_track_court(a):
         extra["ignore"] = np.packbits(ignore.astype(bool))
         extra["ignore_shape"] = np.array(ignore.shape)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), line_score=np.array(scores), status=np.array(status),
+    np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), H_pred=np.stack(preds), line_score=np.array(scores),
+                        status=np.array(status),
                         support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name, **extra)
-    ok = sum(s in ("ok", "recovered", "calib", "bridged") for s in status)
+    ok = sum(s in _GOOD for s in status)
     print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
-          f"앞뒤 정상 화면 사이 메움 {n_bridged}개)")
+          f"앞뒤 정상 화면 사이 메움 {n_bridged}개, 기준 화면 여러 개 일치로 찾음 {n_consensus}개)")
 
 
 class _CourtLookup:
@@ -635,7 +652,10 @@ class _CourtLookup:
         return self.nearest(t, tol)[0]
 
 
-_GOOD = ("ok", "recovered", "calib", "bridged")
+_GOOD = ("ok", "recovered", "calib", "bridged", "consensus")
+_CALL_KEYS = ("points", "zone", "zone_kr", "side", "hand_side", "dist_to_rim_m", "margin_m", "near_line", "court_x", "court_y",
+              "ft_spot", "margin_sigma_m", "on_line", "foot_point", "line_snap_px", "line_hidden")
+_VERIFIED = ("ok", "recovered", "calib")  # 그 화면 흰 라인으로 확인된 것 (multi-view 의 기준 화면으로 씀)
 
 
 def _read_motions(v, look, i0: int, i1: int, keep: set, every: int, mask=None, orb=None, matcher=None):
@@ -763,12 +783,12 @@ def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, match
                 n_src: int = 30, min_inliers: int = 60, agree_m: float = 0.2, min_votes: int = 2, min_sep: float = 2.0):
     """슛 프레임을 추적이 잘 된 다른 화면들(앞뒤 span 초 안, 서로 min_sep 초 이상 떨어진 n_src 장 + 사람 캘리브레이션 화면)과
     직접 특징점으로 맞춘다. 중계 카메라는 한 자리에서 돌고 당기기만 하므로 두 화면 사이는 관중석까지 통째로 하나의 화면 변환이다.
-    서로 다른 시각의 화면 min_votes 장 이상에서 옮겨 온 H 가 발 자리에서 agree_m 안으로 같은 곳을 가리킬 때만 쓴다
-    ("multi-view"). 따로따로 맞춘 것이 같은 답을 내야 하므로 한 화면과 잘못 맞은 경우는 걸러진다.
+    서로 다른 시각의 화면 min_votes 장 이상에서 옮겨 온 H 가 발 자리에서 한 후보의 agree_m 안에 모일 때만 쓴다
+    ("multi-view"). 모인 것끼리 가장 먼 거리(h_agree_m, 최대 2×agree_m)만큼 라인 근처 기준을 넓힌다(_judge). 따로따로 맞춘 것이 같은 답을 내야 하므로 한 화면과 잘못 맞은 경우는 걸러진다.
     (실제 B-LAB: 스코어버그 근처 장면에서 20~80초씩 정상 샘플이 없어 앞뒤 8초 이어 오기로는 6건을 못 살렸다)"""
     times, Hs, st = look.track["times"], look.track["H"], look.track["status"].astype(str)
     fin = np.all(np.isfinite(Hs.reshape(len(Hs), -1)), axis=1)
-    good = fin & np.isin(st, _GOOD)
+    good = fin & np.isin(st, _VERIFIED)
     near_idx = [int(i) for i in np.flatnonzero(good & (np.abs(times - t) <= span))]
     near_idx.sort(key=lambda i: abs(times[i] - t))
     picks: list[int] = []
@@ -816,9 +836,10 @@ def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, match
     w = np.array([d[1] for d in grp], float)
     Hm = sum(wi * d[2] for wi, d in zip(w, grp)) / w.sum()
     Hm = Hm / Hm[2, 2]
-    cen = np.average(np.stack([d[3] for d in grp]), axis=0, weights=w)
+    P = np.stack([d[3] for d in grp])
+    spread = float(np.max(np.linalg.norm(P[:, None] - P[None], axis=2)))  # 같은 답을 낸 화면끼리 가장 먼 거리 (최대 2×agree_m)
     info["h_source"] = "multi-view"
-    info["h_agree_m"] = round(float(max(np.linalg.norm(d[3] - cen) for d in grp)) * 2, 3)
+    info["h_agree_m"] = round(spread, 3)
     info["h_gap_s"] = round(float(min(abs(d[0] - t) for d in grp)), 2)
     return Hm, info
 
@@ -848,6 +869,18 @@ def cmd_overlay(a):
     look = _lookup(a, v)
     frame = look.undistort(v.frame_at(a.t))  # 렌즈 휨 보정한 추적이면 편 화면에 그린다
     H = look.at(a.t)
+    if a.pred and look.track is not None and "H_pred" in look.track.files:
+        # 진단: 좌표를 못 낸 샘플(coast)에서 추적기가 화면 이동으로 예측하던 위치를 빨간 선으로 그린다
+        i = int(np.argmin(np.abs(look.track["times"] - a.t)))
+        Hp = look.track["H_pred"][i]
+        if np.all(np.isfinite(Hp)):
+            HG.draw_court(frame, Hp, spec, (0, 0, 255), 1)
+            print(f"예측 위치(빨강): {look.track['times'][i]:.2f}s 상태 {look.track['status'][i]} 라인 일치율 "
+                  f"{float(look.track['line_score'][i]):.2f} 줄 {tuple(int(x) for x in look.track['support'][i])}")
+        if H is None:
+            cv2.imwrite(a.out, frame)
+            print(f"저장: {a.out} (확인된 좌표 없음, 예측 위치만)")
+            return
     if H is None:
         sys.exit("이 시각의 코트 변환이 없습니다 (화면 전환 구간일 수 있음).")
     if a.refine:
@@ -905,11 +938,13 @@ def cmd_rejudge(a):
         side = r.get("side") if r.get("side") in ("left", "right") else a.side
         call, info, _ = _judge(look, v, t, u, vv, spec, side=side, window=a.window)
         is_ft = str(r.get("zone", "")).upper() == "FT"
-        for k in ("points", "zone", "zone_kr", "near_line", "margin_m", "line_snap_px", "line_hidden", "ft_spot", "court_points"):
-            r2.pop(k, None)
+        for k in _CALL_KEYS + ("court_points", "h_source", "h_gap_s", "h_agree_m", "h_votes"):
+            r2.pop(k, None)  # 예전 판정 값이 남지 않게 (좌표 없음이면 빈칸)
         if call is None:
             n_none += 1
-            r2.update({"points": "", "zone": "", "zone_kr": "", "near_line": "", "court_points": ""})
+            r2.update({k: "" for k in _CALL_KEYS + ("court_points",)})
+            if side:
+                r2["side"] = side
         else:
             r2.update(call.as_dict())
             r2["court_points"] = call.points
@@ -1316,6 +1351,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="좌표를 못 낸 구간이 이 초 이하이고 앞뒤가 정상이면, 양쪽에서 화면 이동으로 따라와 서로 맞을 때만 메움 (0 = 끔)")
     q.add_argument("--lens", default=None, help="lens-fit 결과 JSON. 주면 렌즈 휨을 편 화면에서 추적·판정 (화면 가장자리 정확도)")
     q.add_argument("--no-graphics-mask", action="store_true", help="방송 그래픽 자리를 라인 정합에서 빼지 않음 (비교용)")
+    q.add_argument("--no-consensus", dest="consensus", action="store_false",
+                   help="라인으로 확인 못 한 화면을 '서로 다른 시각의 기준 화면 둘 이상이 같은 자리' 로 받지 않음 (비교용)")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--out", default="out/court_track.npz")
@@ -1338,6 +1375,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track")
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
     q.add_argument("--refine", action="store_true")
+    q.add_argument("--pred", action="store_true", help="진단: 추적기가 예측하던 위치(좌표 못 낸 구간 포함)를 빨간 선으로 같이 그림")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--no-graphics-mask", action="store_true")

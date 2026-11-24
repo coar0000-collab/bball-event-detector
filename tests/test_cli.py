@@ -289,7 +289,7 @@ def test_rejudge_cli(synthetic, tmp_path, capsys):
                                      (6.5, 5.8 + 0.3, 7.5, "FT", ""), (10.0, 1.575 + 7.4, 7.5, "", "on")):
         u, v = HG.court_to_image(Hs[int(round(t * FPS))], x, y)
         rows.append({"t_sec": t, "team": "home", "result": "MADE", "u": round(u, 1), "v": round(v, 1), "zone": zone,
-                     "points": "", "line_call": line_call})
+                     "points": "", "line_call": line_call, "court_x": "99", "h_source": "old"})  # 예전 판정 값
     src = tmp_path / "shots.csv"
     cli._write_csv(str(src), rows)
     out = tmp_path / "re.csv"
@@ -298,6 +298,9 @@ def test_rejudge_cli(synthetic, tmp_path, capsys):
     assert [g["points"] for g in got] == ["3", "2", "1", "2"]
     assert [g["court_points"] for g in got] == ["3", "2", "2", "3"]  # 사람 판정·자유투 전 코트만의 점수
     assert got[1]["h_source"] == "two-way" and got[0]["h_source"] in ("two-way", "track")
+    assert all(g["court_x"] != "99" for g in got)  # 예전 좌표가 남지 않는다
+    tr = np.load(track)
+    assert tr["H_pred"].shape == tr["H"].shape  # 진단용 예측 위치도 샘플마다 저장
 
 
 def test_graphics_box_with_calib_flags_hidden_line(tmp_path, capsys):
