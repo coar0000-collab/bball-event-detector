@@ -1181,6 +1181,12 @@ def cmd_body_point(a):
     print(json.dumps(d, ensure_ascii=False, indent=2))
 
 
+def cmd_dashboard(a):
+    from .dashboard import serve
+
+    serve(a.port, a.lan, a.profile, not a.no_browser)
+
+
 # ---------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gtt", description="GARBAGE TIME tracker: 스코어버그 인식 + 코트 라인 기반 2점/3점 판정")
@@ -1373,6 +1379,12 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track")
     q.add_argument("--side", choices=["left", "right"], default=None)
     q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+
+    q = add("dashboard", cmd_dashboard, "브라우저 대시보드: 영상 올리기 → 자동 분석 → 보고서·기록지 보기")
+    q.add_argument("--port", type=int, default=8765)
+    q.add_argument("--lan", action="store_true", help="같은 와이파이의 폰·노트북에서도 접속 (비밀 키 주소)")
+    q.add_argument("--profile", default="configs", help="방송 프로필 폴더")
+    q.add_argument("--no-browser", action="store_true")
 
     q = add("bench", cmd_bench, "어려운 합성 중계(빠른 팬·리플레이·로고·자유투)로 정확도 측정")
     q.add_argument("--out", default="out/bench")

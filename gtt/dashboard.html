@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>경기 분석 대시보드</title>
+<style>
+:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1b;--mute:#6b6a66;--line:#e3e1dc;--accent:#d4572a;--away:#2c6fbb;--ok:#2f8f4e;--bad:#c0392b;--soft:#eeece8;--sel:#fbefe9}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#171715;--card:#22221f;--ink:#ecebe7;--mute:#a19f99;--line:#3a3935;--accent:#f08a5d;--away:#6aa8f0;--ok:#5cc07c;--bad:#f07a6d;--soft:#2c2b28;--sel:#3a2a22}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,"Segoe UI","Malgun Gothic","Apple SD Gothic Neo",sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card)}
+header h1{font-size:18px;margin:0}header .sub{color:var(--mute);font-size:13px}
+.wrap{display:grid;grid-template-columns:340px 1fr;gap:16px;padding:16px 20px;max-width:1500px;margin:0 auto}
+@media (max-width:900px){.wrap{grid-template-columns:minmax(0,1fr);padding:12px 16px}header .sub{display:none}iframe{height:80vh;min-height:480px}}
+.wrap>*{min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px}
+.card h2{font-size:15px;margin:0 0 10px}
+.drop{border:2px dashed var(--line);border-radius:10px;padding:18px;text-align:center;color:var(--mute);cursor:pointer}
+.drop.over{border-color:var(--accent);background:var(--sel)}
+.row{display:flex;gap:8px;margin-top:10px}.row input{flex:1;min-width:0}
+input{background:var(--bg);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:7px 9px;font:inherit}
+button{font:inherit;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);padding:8px 12px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button:disabled{opacity:.5;cursor:default}
+.warn{background:var(--soft);border-radius:8px;padding:8px 10px;font-size:13px;margin-top:10px}
+.bar{height:6px;background:var(--soft);border-radius:99px;overflow:hidden;margin-top:8px}.bar i{display:block;height:100%;background:var(--accent);width:0}
+.job{border-top:1px solid var(--line);padding:10px 0}.job:first-child{border-top:0}
+.steps{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}.pill{font-size:12px;border-radius:99px;padding:2px 8px;background:var(--soft)}
+.pill.ok{color:var(--ok)}.pill.bad{color:var(--bad)}
+pre{font-size:11.5px;color:var(--mute);white-space:pre-wrap;max-height:90px;overflow:auto;margin:6px 0 0}
+.list .a{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
+.list .a.sel{border-color:var(--accent);background:var(--sel)}
+.a .sc{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}.a .meta{color:var(--mute);font-size:12.5px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 12px}.tile b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+.tile>span{color:var(--mute);font-size:12.5px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.actions a{text-decoration:none}
+iframe{width:100%;height:calc(100vh - 260px);min-height:600px;border:1px solid var(--line);border-radius:12px;background:var(--card)}
+.empty{color:var(--mute);text-align:center;padding:60px 10px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<header><h1>🏀 경기 분석 대시보드</h1><span class="sub">영상을 올리면 점수판·코트를 읽어 기록지와 평가지표를 만듭니다</span></header>
+<div class="wrap">
+  <aside>
+    <div class="card">
+      <h2>새 분석</h2>
+      <div class="drop" id="drop">경기 영상을 여기에 끌어다 놓거나 눌러서 고르세요<br><small>mp4 · mkv · mov · avi</small></div>
+      <input type="file" id="file" accept="video/*" hidden>
+      <div class="row"><input id="home" placeholder="왼쪽(홈) 팀 이름"><input id="away" placeholder="오른쪽(원정) 팀"></div>
+      <div class="row"><input id="shots" placeholder="(선택) 슛 기록 CSV 경로 예: out/game1_shots.csv"></div>
+      <div class="row"><button class="primary" id="go" disabled>분석 시작</button><button id="demo">영상 없이 데모</button></div>
+      <div class="bar" id="upbar" hidden><i></i></div>
+      <div class="warn" id="profwarn" hidden></div>
+    </div>
+    <div class="card" id="jobsCard" hidden><h2>진행 중</h2><div id="jobs"></div></div>
+    <div class="card"><h2>분석 결과</h2><div class="list" id="list"><div class="empty">아직 없습니다</div></div></div>
+  </aside>
+  <main id="main"><div class="empty">왼쪽에서 분석을 고르거나 새로 시작하세요.</div></main>
+</div>
+<script>
+const K = new URLSearchParams(location.search).get('k') || '';
+const H = K ? {'X-Key': K} : {};
+const q = o => Object.entries(o).filter(([,v]) => v).map(([k,v]) => k + '=' + encodeURIComponent(v)).join('&');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let picked = null, selected = null, lastDirs = '';
+const $ = id => document.getElementById(id);
+
+const drop = $('drop'), file = $('file');
+drop.onclick = () => file.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); pick(e.dataTransfer.files[0]); };
+file.onchange = () => pick(file.files[0]);
+function pick(f){ if(!f) return; picked = f; drop.innerHTML = '<b>' + esc(f.name) + '</b><br><small>' + (f.size/1048576).toFixed(0) + ' MB</small>'; $('go').disabled = false; }
+
+$('go').onclick = () => {
+  if (!picked) return;
+  $('go').disabled = true;
+  const bar = $('upbar'); bar.hidden = false;
+  const x = new XMLHttpRequest();
+  x.open('POST', '/api/upload?' + q({name: picked.name, home: $('home').value, away: $('away').value, shots: $('shots').value, k: K}));
+  x.upload.onprogress = e => { if (e.lengthComputable) bar.firstChild.style.width = (100*e.loaded/e.total) + '%'; };
+  x.onload = () => { bar.hidden = true; const r = JSON.parse(x.responseText || '{}'); if (r.error) alert(r.error); picked = null;
+    drop.innerHTML = '경기 영상을 여기에 끌어다 놓거나 눌러서 고르세요<br><small>mp4 · mkv · mov · avi</small>'; refresh(); };
+  x.onerror = () => { bar.hidden = true; $('go').disabled = false; alert('올리기에 실패했습니다'); };
+  x.send(picked);
+};
+$('demo').onclick = async () => { $('demo').disabled = true; await fetch('/api/demo?' + q({k: K}), {method: 'POST', headers: H}); refresh(); setTimeout(() => $('demo').disabled = false, 3000); };
+
+function jobHTML(j){
+  const st = j.status === 'running' ? '<span class="pill">진행 중</span>' : j.status === 'done' ? '<span class="pill ok">완료</span>' : '<span class="pill bad">실패</span>';
+  const secs = Math.round(((j.ended || Date.now()/1000) - j.started));
+  return `<div class="job"><b>${esc(j.label)}</b> ${st} <small class="sub">${secs}초</small>
+    <div class="steps">${j.steps.map((s,i) => `<span class="pill ${i < j.steps.length-1 || j.status==='done' ? 'ok' : ''}">${i+1}. ${esc(s)}</span>`).join('')}</div>
+    ${j.status !== 'done' ? `<pre>${esc(j.log.slice(-6).join('\n'))}</pre>` : ''}</div>`;
+}
+function cardHTML(a){
+  const g = a.game || {};
+  const agree = a.agree_of ? `<span class="${a.agree === a.agree_of ? 'ok' : 'bad'}">코트 점수 ${a.agree}/${a.agree_of}</span>` : '슛 기록 없음';
+  return `<div class="a ${a.dir === selected ? 'sel' : ''}" data-dir="${esc(a.dir)}">
+    <div class="sc">${esc(g['홈팀'])} ${g['홈 득점'] ?? ''} : ${g['원정 득점'] ?? ''} ${esc(g['원정팀'])}</div>
+    <div class="meta">${a.demo ? '데모 · ' : ''}${esc(g['영상'])} · ${new Date(a.mtime*1000).toLocaleString()}<br>${agree} · 점수판 ${a.events ?? 0}건</div></div>`;
+}
+function show(a){
+  selected = a.dir;
+  document.querySelectorAll('.list .a').forEach(e => e.classList.toggle('sel', e.dataset.dir === a.dir));
+  const g = a.game || {}, s = a.sources || {};
+  const base = '/r/' + encodeURIComponent(a.dir) + '/';
+  const kq = K ? '?k=' + encodeURIComponent(K) : '';
+  const tiles = [
+    [`${g['홈 득점']} : ${g['원정 득점']}`, `${g['홈팀']} vs ${g['원정팀']}`],
+    [a.agree_of ? `<span class="${a.agree === a.agree_of ? 'ok' : 'bad'}">${a.agree}/${a.agree_of}</span>` : '–', '코트로 정한 점수 = 점수판 (목표 100%)' + (a.no_coord ? ` · 발 위치 없음 ${a.no_coord}개는 점수판으로 보정` : '')],
+    [a.track != null ? Math.round(a.track*100) + '%' : '–', '코트 추적 성공 프레임'],
+    [s['코트'] != null ? `${s['코트']} / ${s['점수판 보정'] || 0} / ${s['판정 불가'] || 0}` : '–', '2·3점 출처: 코트 / 점수판 보정 / 판정 불가'],
+    [Math.round(a.seconds) + '초', '분석 시간'],
+  ];
+  $('main').innerHTML = `<div class="tiles">${tiles.map(([v,l]) => `<div class="tile"><b>${v}</b><span>${esc(l)}</span></div>`).join('')}</div>
+    <div class="actions"><a href="${base}report.html${kq}" target="_blank"><button>보고서 새 창</button></a>
+    ${a.xlsx ? `<a href="${base}${encodeURIComponent('기록지_자동.xlsx')}${kq}"><button class="primary">기록지 엑셀 받기</button></a>` : ''}</div>
+    ${a.notes.length ? `<div class="warn">${a.notes.map(esc).join('<br>')}</div><br>` : ''}
+    <iframe src="${base}report.html${kq}" title="분석 보고서"></iframe>`;
+}
+async function refresh(){
+  let st;
+  try { st = await (await fetch('/api/state?' + q({k: K}), {headers: H})).json(); } catch { return; }
+  const pw = $('profwarn');
+  pw.hidden = st.profile_ok;
+  pw.innerHTML = `실제 영상을 분석하려면 이 중계용 준비 파일이 먼저 있어야 해요: <code>${esc(st.profile)}/scorebug.json</code> (한 번만, README의 '방송 프로필'). 지금은 데모만 됩니다.`;
+  const running = st.jobs.filter(j => j.status === 'running' || (j.ended && Date.now()/1000 - j.ended < 30));
+  $('jobsCard').hidden = !running.length;
+  $('jobs').innerHTML = running.map(jobHTML).join('');
+  const dirs = st.analyses.map(a => a.dir).join('|');
+  if (dirs !== lastDirs) {
+    const isNew = lastDirs && st.analyses.length && !lastDirs.split('|').includes(st.analyses[0].dir);
+    lastDirs = dirs;
+    $('list').innerHTML = st.analyses.length ? st.analyses.map(cardHTML).join('') : '<div class="empty">아직 없습니다</div>';
+    document.querySelectorAll('.list .a').forEach(e => e.onclick = () => show(st.analyses.find(a => a.dir === e.dataset.dir)));
+    if (st.analyses.length && (!selected || isNew)) show(st.analyses[0]);
+  }
+  setTimeout(refresh, running.some(j => j.status === 'running') ? 1500 : 5000);
+}
+refresh();
+</script>
+</body>
+</html>

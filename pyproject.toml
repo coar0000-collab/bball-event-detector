@@ -19,7 +19,7 @@ gtt = "gtt.cli:main"
 packages = ["gtt"]
 
 [tool.setuptools.package-data]
-gtt = ["*.json"]
+gtt = ["*.json", "*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -29,6 +29,8 @@ gtt analyze --demo --open                     # 영상 없이: 합성 중계로 
 gtt analyze --video videos/game1.mp4 --open   # 실제 영상
 ```
 
+**대시보드:** `gtt dashboard`를 켜면 브라우저에 대시보드가 열립니다. 영상을 끌어다 놓으면 분석이 돌고(단계별 진행 표시), 끝나면 점수·코트 점수 일치율·2/3점 출처 요약과 보고서, 기록지 엑셀 받기가 한 화면에 나옵니다. 지난 분석도 목록으로 남습니다. `gtt dashboard --lan`으로 켜면 같은 와이파이의 폰·노트북에서 비밀 키가 든 주소로 볼 수 있습니다. 영상은 `videos/uploads/`, 결과는 `out/`에 쌓이고 깃에는 올라가지 않습니다.
+
 Windows에서는 `analyze_video.bat` 위에 영상 파일을 끌어다 놓으면 됩니다(더블클릭하면 데모).
 
 결과 폴더(`out/analysis_<영상 이름>/`)
@@ -260,6 +262,7 @@ gtt compare --records "data/D3 기록지_1R-11R.xlsx" --game D101,D102,D103 \
 | `gtt/resolve.py` | 코트로 못 정한 성공 슛만 점수판으로 2점/3점 보정 (하이브리드) |
 | `gtt/linefit.py` | 점수판이 정답인 성공 슛으로 발끝 라인 기준 학습 → 실패 슛 판정 |
 | `gtt/camera3d.py` | 호모그래피 → 3D 카메라, 머리·골반 + 키로 가려진 발 위치 추정 (`body-point`) |
+| `gtt/dashboard.py`, `gtt/dashboard.html` | `gtt dashboard`: 영상 올리기 → 분석 → 결과 보기 웹 화면 (표준 라이브러리만) |
 | `gtt/zones.py` | 코트 좌표 → 세부 구역·거리대, 구역별 시도/성공 |
 | `gtt/boxscore.py` | 점수판 이벤트 + 슛 기록 → 팀·선수 기록 (잰 기록과 못 잰 기록 구분) |
 | `gtt/metrics.py`, `gtt/metrics_default.json` | 평가지표 수식(설정 파일) 해석·계산 |
