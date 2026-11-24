@@ -107,6 +107,22 @@ def test_track_start_differs_from_calib(synthetic):
     assert sum(np.all(np.isfinite(H)) for H in z["H"]) >= len(z["H"]) - 1
 
 
+def test_extra_calib_inserted_at_its_time(synthetic):
+    """샘플 간격(0.5초)에 없는 시각(6.3초)에 맞춘 캘리브레이션도 그 시각 그대로 결과에 들어간다 (실제 영상 204.5s·309.5s)."""
+    d, video, Hs = synthetic
+    (d / "calib63.json").write_text(json.dumps({"spec": "FIBA", "t_sec": 6.3, "H_court_to_image": Hs[63].tolist()}))
+    (d / "calib_no_t.json").write_text(json.dumps({"spec": "FIBA", "H_court_to_image": Hs[70].tolist()}))
+    track = d / "track63.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--calib", str(d / "calib63.json"),
+              "--calib", str(d / "calib_no_t.json"), "--end", "8", "--step", "0.5", "--out", str(track)])
+    z = np.load(track)
+    i = int(np.argmin(np.abs(z["times"] - 6.3)))
+    assert abs(z["times"][i] - 6.3) < 1e-6 and z["status"][i] == "calib"
+    assert np.allclose(z["H"][i], Hs[63])
+    assert list(z["times"]) == sorted(z["times"])
+    assert sum(s == "calib" for s in z["status"]) == 2  # 시각 없는 파일은 빠진다
+
+
 def test_court_lookup_skips_missing_sample(tmp_path):
     """가장 가까운 샘플이 좌표 없음(coast)이면 tol 안의 다음 가까운 샘플을 쓴다 (실제 영상 309.5s)."""
     nan = np.full((3, 3), np.nan)
