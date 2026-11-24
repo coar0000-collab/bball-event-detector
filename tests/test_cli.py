@@ -353,3 +353,42 @@ def test_shot_multi_view_when_no_good_sample_nearby(synthetic, capsys, tmp_path)
     res = json.loads(capsys.readouterr().out)
     assert res["h_source"] == "multi-view" and res["h_votes"] >= 2, res
     assert res["points"] == 3 and abs(res["court_x"] - (1.575 + 7.4)) < 0.15
+
+
+def test_track_around_shots_only(synthetic, tmp_path):
+    """--around: 경기 전체 대신 슛 앞뒤 창만 추적해 npz 하나로 합친다 (실제 KBA 92분 전체 추적이 하루 가까이 걸림)."""
+    d, video, Hs = synthetic
+    shots = tmp_path / "s.csv"
+    cli._write_csv(str(shots), [{"t_sec": 3.0, "u": 1, "v": 1}, {"t_sec": 9.5, "u": 1, "v": 1}, {"t_sec": 3.5, "u": "", "v": ""}])
+    assert cli._around_windows(str(shots), 1.5, 1.0) == [(1.5, 4.5), (8.0, 10.5)]  # 겹친 창은 합침
+    out = tmp_path / "around.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5",
+              "--around", str(shots), "--before", "1.5", "--after", "1.0", "--out", str(out)])
+    z = np.load(out)
+    t = z["times"]
+    assert np.all(((t >= 1.5) & (t <= 4.5)) | ((t >= 8.0) & (t <= 10.5)) | (t == 0.0))
+    assert np.all(np.diff(t) > 0) and z["H_pred"].shape == z["H"].shape
+    st = z["status"].astype(str)
+    good = np.isin(st, cli._GOOD) & (t >= 8.0)
+    assert good.sum() >= 3
+    i = int(np.flatnonzero(good)[0])
+    Htrue = Hs[int(round(t[i] * FPS))]
+    assert HG.h_distance(z["H"][i], Htrue, (720, 1280)) < 4.0
+
+
+def test_gym_spec_json(tmp_path):
+    """체육관별 규격 JSON: 칠한 3점 라인이 FIBA 와 다른 체육관(옛 6.25m, 두 줄 등)은 그 라인으로 판정한다."""
+    from gtt import court as C
+
+    p = tmp_path / "gym.json"
+    p.write_text(json.dumps({"base": "FIBA", "three_radius": 7.0}), encoding="utf-8")
+    sp = cli._spec(str(p))
+    assert sp.name == "gym" and sp.three_radius == 7.0 and sp.key_width == C.FIBA.key_width
+    x, y = sp.rim_from_baseline + 6.9, sp.width / 2  # 탑, 림에서 6.9m
+    assert C.classify_shot(x, y, C.FIBA, side="left").points == 3
+    assert C.classify_shot(x, y, sp, side="left").points == 2
+    assert cli._spec("fiba") is C.FIBA
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"three_radiu": 7.0}), encoding="utf-8")
+    with pytest.raises(SystemExit):
+        cli._spec(str(bad))
