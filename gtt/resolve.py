@@ -45,7 +45,7 @@ def resolve(events: list[dict], shots: list[dict], max_lag: float = 20.0) -> tup
         s["points_source"] = "판정 불가(실패 슛)" if uncertain(s) else "코트"
     res = check(events, out, max_lag=max_lag)
     idx = {id(s): s for s in out}
-    stats = {"코트": 0, "점수판 보정": 0, "판정 불가": 0, "코트≠점수판": 0}
+    stats = {"코트": 0, "점수판 보정": 0, "학습 기준": 0, "판정 불가": 0, "코트≠점수판": 0}
     for p in res.pairs:
         if len(p.shots) != 1:
             continue
@@ -62,6 +62,30 @@ def resolve(events: list[dict], shots: list[dict], max_lag: float = 20.0) -> tup
                 s["zone_kr"] = "3점(위치 모름)" if d == 3 else "2점"
         elif s["points_source"] == "코트" and shot_points(s) != d and d in (1, 2, 3):
             s["points_source"] = "코트≠점수판"
+    # 점수판이 정답인 성공 슛으로 '발끝 라인 기준'을 이 영상에서 학습해, 판정 불가인 실패 슛에 쓴다
+    from .linefit import fit, labeled_samples, margin_mid
+
+    model = fit(labeled_samples(events, shots))
+    stats["라인 기준"] = model.as_dict()
+    for s in out:
+        if s["points_source"] != "판정 불가(실패 슛)" or str(s.get("result", "")).upper() in ("MADE", "성공"):
+            continue
+        m = margin_mid(s)
+        if m is None or (model.n2 + model.n3) == 0:
+            continue
+        try:
+            sig = float(s.get("margin_sigma_m") or 0)
+        except ValueError:
+            sig = 0.0
+        d = model.decide(m, sig)
+        if d is not None:
+            s["court_points_guess"] = s.get("points", "")
+            s["points"] = d
+            s["points_source"] = "학습 기준"
+            if d == 3:
+                s["zone_kr"] = three_zone_by_direction(float(s["court_x"]), float(s["court_y"]), side=s.get("side"))
+            else:
+                s["zone_kr"] = "2점"
     for s in out:
         if s["points_source"] == "판정 불가(실패 슛)" and str(s.get("result", "")).upper() in ("MADE", "성공"):
             s["points_source"] = "판정 불가(점수판 짝 없음)"

@@ -121,4 +121,19 @@ def test_hybrid_resolves_only_uncertain_made_shots():
     assert out[1]["points_source"].startswith("판정 불가")
     assert out[2]["points_source"] == "코트"
     assert shots[0]["points"] == "2"  # 원본은 그대로
-    assert st == {"코트": 1, "점수판 보정": 1, "판정 불가": 1, "코트≠점수판": 0}
+    assert {k: st[k] for k in ("코트", "점수판 보정", "판정 불가", "코트≠점수판")} == {"코트": 1, "점수판 보정": 1, "판정 불가": 1, "코트≠점수판": 0}
+
+
+def test_line_model_learned_from_made_shots_decides_misses():
+    from gtt.linefit import fit
+
+    # 점수판 정답: 라인 바깥 0.10m 은 +2(발끝이 라인에 닿음), 0.25m 은 +3
+    m = fit([(0.10, 2), (-0.3, 2), (0.25, 3), (0.6, 3)])
+    assert m.lo == 0.10 and m.hi == 0.25 and m.offset == 0.14 and m.errors == 0
+    assert m.decide(0.40) == 3 and m.decide(0.05) == 2 and m.decide(0.18) is None
+    assert m.decide(0.30, sigma=0.1) is None  # 찍기 오차까지 넣으면 애매
+    # 영상이 쌓여 구간이 좁아지면 애매한 범위가 줄어든다
+    m2 = fit([(0.10, 2), (0.13, 2), (0.16, 3), (0.25, 3)])
+    assert m2.decide(0.18) == 3
+    # 엇갈린 기록(찍기 실수)은 오류 수로 드러난다
+    assert fit([(0.3, 2), (0.2, 3)]).errors == 1

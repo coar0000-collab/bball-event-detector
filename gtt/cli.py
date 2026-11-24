@@ -732,6 +732,25 @@ def cmd_analyze(a):
         webbrowser.open((out / "report.html").resolve().as_uri())
 
 
+def cmd_body_point(a):
+    from .camera3d import camera_from_homography, ground_from_body
+    from .court import classify_shot
+
+    v = Video(a.video)
+    size = (v.width, v.height)
+    v.close()
+    H = _CourtLookup(a.calib, a.track).at(a.t or 0.0)
+    if H is None:
+        sys.exit("이 시각의 코트 변환이 없습니다.")
+    cam = camera_from_homography(H, size)
+    g = ground_from_body(cam, a.u, a.v, a.part, a.height, a.height_sd)
+    call = classify_shot(g["x"], g["y"], _spec(a.spec), side=a.side)
+    d = call.as_dict() | {"camera_height_m": round(cam.height_m, 2), "focal_px": round(float(cam.K[0, 0]), 1),
+                          "ground_sd_m": round(g["sd_m"], 3)}
+    d["near_line"] = abs(call.margin) < max(0.3, 2 * g["sd_m"])
+    print(json.dumps(d, ensure_ascii=False, indent=2))
+
+
 # ---------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gtt", description="GARBAGE TIME tracker: 스코어버그 인식 + 코트 라인 기반 2점/3점 판정")
@@ -869,6 +888,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--out", help="결과 폴더 (기본 out/analysis_<영상 이름>)")
     q.add_argument("--open", action="store_true", help="끝나면 보고서를 브라우저로 열기")
     q.add_argument("--court-only", action="store_true", help="코트로 못 정한 성공 슛을 점수판으로 보정하지 않음")
+
+    q = add("body-point", cmd_body_point, "발이 가려졌을 때: 머리/골반을 찍고 선수 키로 바닥(발) 위치를 계산해 2점/3점 판정 (가상 3D 코트)")
+    q.add_argument("--video", required=True, help="화면 크기를 알기 위해")
+    q.add_argument("--t", type=float, required=True)
+    q.add_argument("--u", type=float, required=True)
+    q.add_argument("--v", type=float, required=True)
+    q.add_argument("--part", choices=["head", "hip"], default="head", help="찍은 부위 (점프 전 디딤 프레임에서)")
+    q.add_argument("--height", type=float, default=1.85, help="선수 키 (m)")
+    q.add_argument("--height-sd", type=float, default=0.08, help="키를 모를 때 편차 (m)")
+    q.add_argument("--calib")
+    q.add_argument("--track")
+    q.add_argument("--side", choices=["left", "right"], default=None)
+    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
 
     q = add("bench", cmd_bench, "어려운 합성 중계(빠른 팬·리플레이·로고·자유투)로 정확도 측정")
     q.add_argument("--out", default="out/bench")

@@ -670,10 +670,16 @@ def write_html(path: Path, game, box: BX.Box, met, events, shots, summary, metri
                  "코트로 못 정한 <b>성공</b> 슛만 그 순간 점수판(+2/+3)으로 정했습니다. 실패 슛은 점수판이 안 바뀌어 보정할 수 없습니다. "
                  "위의 '코트로 정한 점수 = 점수판' 일치율은 보정 전 코트 판정만으로 잰 값입니다.</p><div class=panel><table><tbody>")
         for k, lab in (("코트", "코트 좌표로 확실히 판정"), ("점수판 보정", "점수판으로 보정 (코트로 못 정한 성공 슛)"),
-                       ("판정 불가", "판정 불가 (실패 슛 등, 사람 확인)"), ("코트≠점수판", "코트 판정과 점수판이 다름 (사람 확인)")):
+                       ("학습 기준", "이 경기 성공 슛으로 학습한 발끝 기준으로 판정 (실패 슛)"),
+                       ("판정 불가", "판정 불가 (사람 확인)"), ("코트≠점수판", "코트 판정과 점수판이 다름 (사람 확인)")):
             v = rs.get(k, 0)
             cls = " class=bad" if k in ("판정 불가", "코트≠점수판") and v else ""
             P.append(f"<tr><td class=l>{_e(lab)}</td><td{cls}>{v}</td></tr>")
+        lm = rs.get("라인 기준")
+        if lm and lm["n2"] + lm["n3"]:
+            P.append(f"<tr><td class=l style='white-space:normal'>학습된 발끝 기준: 찍은 발 가운데가 3점 라인 바깥에서 "
+                     f"{lm['lo']:+.2f}~{lm['hi']:+.2f} m 사이면 판정 불가 (점수판 정답 성공 슛 2점 {lm['n2']}개·3점 {lm['n3']}개로 학습"
+                     f"{', 설명 안 되는 기록 ' + str(lm['errors']) + '개' if lm['errors'] else ''})</td><td></td></tr>")
         P.append("</tbody></table></div>")
     if shots:
         P.append(_zone_tables(shots, names))
