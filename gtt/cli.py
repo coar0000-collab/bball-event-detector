@@ -912,11 +912,15 @@ def cmd_body_point(a):
     v = Video(a.video)
     size = (v.width, v.height)
     v.close()
-    H = _CourtLookup(a.calib, a.track).at(a.t or 0.0)
+    look = _CourtLookup(a.calib, a.track)
+    H = look.at(a.t or 0.0)
     if H is None:
         sys.exit("이 시각의 코트 변환이 없습니다.")
+    if look.lens is not None:  # 추적이 렌즈 휨을 편 화면(canvas) 위에서 했으면 점과 화면 크기도 그쪽으로
+        size = look.lens.canvas_size
+    u, v_ = look.to_canvas(a.u, a.v)
     cam = camera_from_homography(H, size)
-    g = ground_from_body(cam, a.u, a.v, a.part, a.height, a.height_sd)
+    g = ground_from_body(cam, u, v_, a.part, a.height, a.height_sd)
     call = classify_shot(g["x"], g["y"], _spec(a.spec), side=a.side)
     d = call.as_dict() | {"camera_height_m": round(cam.height_m, 2), "focal_px": round(float(cam.K[0, 0]), 1),
                           "ground_sd_m": round(g["sd_m"], 3)}
