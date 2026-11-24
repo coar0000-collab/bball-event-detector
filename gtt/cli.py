@@ -714,7 +714,7 @@ def cmd_analyze(a):
         out = a.out or str(Path("out") / f"analysis_{Path(a.video).stem}")
         res = AN.run(a.video, out, a.profile, shots=a.shots, roster=a.roster, metrics_path=a.metrics, game_id=a.game_id,
                      game_date=a.date, home=a.home, away=a.away, step=a.step, track_step=a.track_step, start=a.start, end=a.end,
-                     hybrid=not a.court_only)
+                     hybrid=not a.court_only, line_samples=a.line_samples, learn_this_game=not a.no_learn_this_game)
     out = Path(a.out or ("out/analysis_demo" if a.demo else f"out/analysis_{Path(a.video).stem}"))
     g = res["경기"]
     print(f"[분석 완료] {g['홈팀']} {g['홈 득점']} : {g['원정 득점']} {g['원정팀']}  (점수판 변화 {res['점수판 변화']}건)")
@@ -888,6 +888,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--out", help="결과 폴더 (기본 out/analysis_<영상 이름>)")
     q.add_argument("--open", action="store_true", help="끝나면 보고서를 브라우저로 열기")
     q.add_argument("--court-only", action="store_true", help="코트로 못 정한 성공 슛을 점수판으로 보정하지 않음")
+    q.add_argument("--line-samples", action="append", help="다른 경기 결과 폴더의 line_samples.json (여러 번 가능): 발끝 기준 학습 표본")
+    q.add_argument("--no-learn-this-game", action="store_true", help="이 경기 점수판은 발끝 기준 학습에 쓰지 않음 (다른 경기 표본만)")
 
     q = add("body-point", cmd_body_point, "발이 가려졌을 때: 머리/골반을 찍고 선수 키로 바닥(발) 위치를 계산해 2점/3점 판정 (가상 3D 코트)")
     q.add_argument("--video", required=True, help="화면 크기를 알기 위해")

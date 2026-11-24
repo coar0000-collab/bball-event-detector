@@ -39,7 +39,10 @@ def three_zone_by_direction(x: float, y: float, spec: CourtSpec = FIBA, side: st
     return "탑" if math.degrees(math.atan2(abs(dy), max(dx, 1e-6))) < 22.5 else "45도"
 
 
-def resolve(events: list[dict], shots: list[dict], max_lag: float = 20.0) -> tuple[list[dict], dict]:
+def resolve(events: list[dict], shots: list[dict], max_lag: float = 20.0, prior_samples: list | None = None,
+            same_game: bool = True) -> tuple[list[dict], dict]:
+    """prior_samples: 다른 경기에서 모은 (m, 점수) 학습 표본. same_game=False 면 이 경기 점수판은 학습에 쓰지 않는다
+    (코트 단독 검증을 이 경기로 할 때)."""
     out = [dict(s) for s in shots]
     for s in out:
         s["points_source"] = "판정 불가(실패 슛)" if uncertain(s) else "코트"
@@ -65,8 +68,10 @@ def resolve(events: list[dict], shots: list[dict], max_lag: float = 20.0) -> tup
     # 점수판이 정답인 성공 슛으로 '발끝 라인 기준'을 이 영상에서 학습해, 판정 불가인 실패 슛에 쓴다
     from .linefit import fit, labeled_samples, margin_mid
 
-    model = fit(labeled_samples(events, shots))
-    stats["라인 기준"] = model.as_dict()
+    here = labeled_samples(events, shots)
+    model = fit(list(prior_samples or []) + (here if same_game else []))
+    stats["라인 기준"] = model.as_dict() | {"학습": ("이 경기 + " if same_game else "") + f"다른 경기 표본 {len(prior_samples or [])}개",
+                                         "이 경기 표본": [[round(m, 3), p] for m, p in here]}
     for s in out:
         if s["points_source"] != "판정 불가(실패 슛)" or str(s.get("result", "")).upper() in ("MADE", "성공"):
             continue

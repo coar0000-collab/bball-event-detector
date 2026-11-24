@@ -108,7 +108,8 @@ def _overlay_grid(video: Path, track: Path, out: Path, duration: float) -> Path 
 def run(video: str | Path, out_dir: str | Path, profile: str | Path = "configs", shots: str | None = None,
         roster: str | None = None, metrics_path: str | None = None, game_id: str = "G001", game_date: str | None = None,
         home: str | None = None, away: str | None = None, step: float = 0.5, track_step: float = 0.2,
-        start: float | None = None, end: float | None = None, demo_note: str | None = None, shots_fn=None, hybrid: bool = True) -> dict:
+        start: float | None = None, end: float | None = None, demo_note: str | None = None, shots_fn=None, hybrid: bool = True,
+        line_samples: list[str] | None = None, learn_this_game: bool = True) -> dict:
     from . import cli
     from . import scorebug as SB
     from .video import Video
@@ -167,7 +168,11 @@ def run(video: str | Path, out_dir: str | Path, profile: str | Path = "configs",
         agree = res.summary()
         if hybrid:
             from .resolve import resolve
-            shot_rows, resolve_stats = resolve(events, shot_rows)
+            prior = []
+            for f in line_samples or []:  # 다른 경기 analyze 결과 폴더의 line_samples.json
+                prior += [tuple(x) for x in json.loads(Path(f).read_text(encoding="utf-8"))]
+            shot_rows, resolve_stats = resolve(events, shot_rows, prior_samples=prior, same_game=learn_this_game)
+            (out / "line_samples.json").write_text(json.dumps(resolve_stats["라인 기준"]["이 경기 표본"]), encoding="utf-8")
         with open(out / "score_check.csv", "w", encoding="utf-8-sig", newline="") as f:
             rows = res.rows()
             if rows:
@@ -679,7 +684,8 @@ def write_html(path: Path, game, box: BX.Box, met, events, shots, summary, metri
         if lm and lm["n2"] + lm["n3"]:
             P.append(f"<tr><td class=l style='white-space:normal'>학습된 발끝 기준: 찍은 발 가운데가 3점 라인 바깥에서 "
                      f"{lm['lo']:+.2f}~{lm['hi']:+.2f} m 사이면 판정 불가 (점수판 정답 성공 슛 2점 {lm['n2']}개·3점 {lm['n3']}개로 학습"
-                     f"{', 설명 안 되는 기록 ' + str(lm['errors']) + '개' if lm['errors'] else ''})</td><td></td></tr>")
+                     f"{', 설명 안 되는 기록 ' + str(lm['errors']) + '개' if lm['errors'] else ''}; 학습: {lm.get('학습', '')}). "
+                     "이 기준은 실패 슛에만 쓰고 위의 코트 단독 일치율에는 쓰지 않습니다.</td><td></td></tr>")
         P.append("</tbody></table></div>")
     if shots:
         P.append(_zone_tables(shots, names))
