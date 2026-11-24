@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import sys
 from pathlib import Path
@@ -31,7 +32,21 @@ def _fit_window(img: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def _spec(name: str) -> C.CourtSpec:
-    return C.SPECS[name.upper()]
+    """FIBA·NBA 또는 체육관별 규격 JSON 경로 ({"base": "FIBA", "name": "...", "three_radius": 6.75, ...}).
+    아마추어 체육관은 3점 라인이 옛 규격(6.25m)으로 남아 있거나 두 줄로 칠해진 곳이 있어, 경기에 쓰는 실제 칠한 라인에 맞춘다."""
+    if name.upper() in C.SPECS:
+        return C.SPECS[name.upper()]
+    p = Path(name)
+    if not p.exists():
+        sys.exit(f"코트 규격 '{name}' 을 모릅니다 (FIBA, NBA 또는 규격 JSON 경로)")
+    d = json.loads(p.read_text(encoding="utf-8"))
+    base = C.SPECS[str(d.pop("base", "FIBA")).upper()]
+    fields = {f.name for f in dataclasses.fields(C.CourtSpec)}
+    bad = sorted(set(d) - fields)
+    if bad:
+        sys.exit(f"{name}: 모르는 항목 {bad} (쓸 수 있는 것: {sorted(fields)})")
+    d.setdefault("name", p.stem)
+    return dataclasses.replace(base, **{k: (v if k == "name" else float(v)) for k, v in d.items()})
 
 
 def _write_csv(path: str, rows: list[dict]) -> None:
@@ -365,7 +380,89 @@ def cmd_lens_fit(a):
     print(f"저장: {a.out}")
 
 
+def _around_windows(path: str, before: float, after: float, start=None, end=None) -> list[tuple[float, float]]:
+    """슛 CSV(t_sec)의 시각마다 [t-before, t+after] 창을 만들고 겹치는 창은 합친다."""
+    from .scorecheck import read_csv
+
+    ts = []
+    for r in read_csv(path):
+        try:
+            ts.append(float(r["t_sec"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    wins: list[list[float]] = []
+    for t in sorted(ts):
+        w0, w1 = max(0.0, t - before), t + after
+        if start is not None:
+            w0 = max(w0, start)
+        if end is not None:
+            w1 = min(w1, end)
+        if w1 <= w0:
+            continue
+        if wins and w0 <= wins[-1][1]:
+            wins[-1][1] = max(wins[-1][1], w1)
+        else:
+            wins.append([w0, w1])
+    return [(w0, w1) for w0, w1 in wins]
+
+
+def _track_around(a):
+    """경기 전체 대신 슛 시각 앞뒤 창만 추적해 npz 하나로 합친다. 창마다 기준 화면(캘리브레이션)과 맞춰 새로 시작한다.
+    (실제 KBA D201: 92분 전체를 0.2초 간격으로 돌리면 놓친 화면마다 다시 찾기를 해서 하루 가까이 걸렸다)"""
+    import copy
+    import tempfile
+
+    wins = _around_windows(a.around, a.before, a.after, a.start, a.end)
+    if not wins:
+        sys.exit(f"{a.around} 에서 t_sec 를 하나도 못 읽었습니다.")
+    print(f"슛 앞뒤 창 {len(wins)}개, 모두 {sum(w1 - w0 for w0, w1 in wins):.0f}초를 추적합니다", file=sys.stderr)
+    # 방송 그래픽·안 변하는 자리는 짧은 창 하나(자유투처럼 카메라가 멈춘 장면)로 찾으면 코트까지 잡히므로, 창 전체에 걸쳐 고른 화면으로 찾는다
+    raw_v = Video(a.video)
+    mids = [(w0 + w1) / 2 for w0, w1 in wins]
+    pick = [mids[int(i)] for i in np.unique(np.linspace(0, len(mids) - 1, min(24, len(mids))).round())]
+    if len(pick) < 12:
+        pick = list(np.linspace(wins[0][0], wins[-1][1], 12))
+    raw_samples = []
+    for t in pick:
+        try:
+            raw_samples.append(raw_v.frame_at(float(t)))
+        except ValueError:
+            pass
+    parts = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for k, (w0, w1) in enumerate(wins):
+            b = copy.copy(a)
+            b.around, b.start, b.end, b.out = None, w0, w1, str(Path(tmp) / f"w{k}.npz")
+            b.raw_samples = raw_samples
+            print(f"[창 {k + 1}/{len(wins)}] {fmt_time(w0)} ~ {fmt_time(w1)}", file=sys.stderr)
+            cmd_track_court(b)
+            z = np.load(b.out)
+            parts.append({f: z[f] for f in z.files})
+    keys = ("times", "H", "H_pred", "line_score", "status", "support")
+    merged = {f: np.concatenate([p[f] for p in parts]) for f in keys}
+    order = np.argsort(merged["times"], kind="stable")
+    merged = {f: x[order] for f, x in merged.items()}
+    # 창이 겹쳐 같은 시각(캘리브레이션 화면 등)이 두 번 들어간 것은 앞의 것만
+    keep = np.ones(len(order), bool)
+    keep[1:] = np.diff(merged["times"]) > 1e-6
+    merged = {f: x[keep] for f, x in merged.items()}
+    extra = {"spec": parts[0]["spec"]}
+    if "lens" in parts[0]:
+        extra["lens"] = parts[0]["lens"]
+    igs = [np.unpackbits(p["ignore"])[: int(np.prod(p["ignore_shape"]))].reshape(p["ignore_shape"]).astype(bool)
+           for p in parts if "ignore" in p]
+    if igs:
+        ig = np.logical_or.reduce(igs)  # 창마다 찾은 그래픽 자리를 모두 뺀다
+        extra["ignore"], extra["ignore_shape"] = np.packbits(ig), np.array(ig.shape)
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(a.out, **merged, **extra)
+    ok = int(np.isin(merged["status"].astype(str), _GOOD).sum())
+    print(f"저장: {a.out}  (창 {len(wins)}개, 프레임 {len(merged['times'])}개 중 코트 좌표 있음 {ok}개)")
+
+
 def cmd_track_court(a):
+    if getattr(a, "around", None):
+        return _track_around(a)
     spec = _spec(a.spec)
     calibs = a.calib if isinstance(a.calib, list) else [a.calib or "configs/calib.json"]
     H0, d = _load_calib(calibs[0])
@@ -386,7 +483,7 @@ def cmd_track_court(a):
         end = start + 600
     # 방송 그래픽(스코어버그·로고) 찾기: 구간 전체에서 띄엄띄엄 12장을 뽑아 안 변하는 곳을 특징점에서 빼고(overlay),
     # 라인 정합·라인 보정에서도 뺀다(ignore: 그래픽의 흰 글자를 라인으로 쓰지 않고, 가려진 라인을 '틀림'으로 세지 않음)
-    raw_samples = _sample_frames(raw_v, start, end)
+    raw_samples = getattr(a, "raw_samples", None) or _sample_frames(raw_v, start, end)
     graphics_raw = HG.graphics_mask(raw_samples) if not a.no_graphics_mask else None
     boxes = _graphics_boxes(a.graphics_box, (raw_v.height, raw_v.width))
     if boxes is not None:
@@ -468,6 +565,7 @@ def cmd_track_court(a):
     gap: list | None = [] if prev_good_gray is not None else None  # [(샘플 번호, 회색 화면)], None = 메우기 포기
     n_bridged = 0
     n_consensus = 0
+    lost_run = 0  # 연달아 놓친 샘플 수
     # 진단용: 샘플마다 추적기가 들고 있던 위치(좌표를 못 낸 coast 도 화면 이동으로 예측한 H). 확인 안 된 값이라 판정에는 안 쓴다
     preds = [Hs[0].copy()]
     for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
@@ -486,8 +584,9 @@ def cmd_track_court(a):
                 trk.reset(Hc, frame)
                 r = HG.TrackResult(Hc, sc, "consensus")
                 n_consensus += 1
-        elif r.status in ("cut", "lost"):
+        elif r.status == "cut" or (r.status == "lost" and (lost_run < 5 or lost_run % a.lost_every == 0)):
             # 화면 전환(리플레이·광고) 뒤: 기준 화면·키프레임과 맞춰 다시 찾는다
+            # (오래 놓쳐 있으면 --lost-every 샘플마다만: 클로즈업·광고가 길게 이어질 때 매 샘플 다시 찾기가 가장 느림)
             Hr, sc = trk.relocalize(frame)
             Hc = trk.consensus(frame.shape) if a.consensus else None
             if not strong(Hr, sc) and (Hr is None or sc < a.recover_score) and Hc is not None:
@@ -521,6 +620,7 @@ def cmd_track_court(a):
                         break
         if r.status in ("ok", "recovered"):
             last_good, last_good_gray = r.H, cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        lost_run = lost_run + 1 if r.status == "lost" else 0
         times.append(t)
         Hs.append(r.H if r.H is not None else np.full((3, 3), np.nan))
         preds.append(trk.H.copy() if not trk.lost else np.full((3, 3), np.nan))
@@ -1286,6 +1386,9 @@ def cmd_dashboard(a):
 
 
 # ---------------------------------------------------------------- main
+SPEC_HELP = "코트 규격: FIBA, NBA 또는 체육관별 규격 JSON 경로 (예: {\"base\": \"FIBA\", \"three_radius\": 6.25})"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="gtt", description="GARBAGE TIME tracker: 스코어버그 인식 + 코트 라인 기반 2점/3점 판정")
     sp = p.add_subparsers(dest="cmd", required=True)
@@ -1330,7 +1433,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--video")
     q.add_argument("--image")
     q.add_argument("--t", type=float, default=600)
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--out", default="configs/calib.json")
     q.add_argument("--refine", action="store_true", help="흰 라인 픽셀에 자동으로 더 맞춤")
     q.add_argument("--fresh", action="store_true", help="기존 점 무시하고 새로 찍기")
@@ -1340,7 +1443,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--calib", action="append", default=None,
                    help="캘리브레이션 JSON. 여러 번 주면 첫 번째에서 시작하고 나머지(예: 반대쪽 골대 화면)는 다시 찾기 기준으로 씀")
     q.add_argument("--min-score", type=float, default=0.65, help="라인 일치율이 이보다 낮으면 좌표를 내지 않음")
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--start", type=float, default=None)
     q.add_argument("--end", type=float, default=None)
     q.add_argument("--step", type=float, default=0.2)
@@ -1351,6 +1454,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="좌표를 못 낸 구간이 이 초 이하이고 앞뒤가 정상이면, 양쪽에서 화면 이동으로 따라와 서로 맞을 때만 메움 (0 = 끔)")
     q.add_argument("--lens", default=None, help="lens-fit 결과 JSON. 주면 렌즈 휨을 편 화면에서 추적·판정 (화면 가장자리 정확도)")
     q.add_argument("--no-graphics-mask", action="store_true", help="방송 그래픽 자리를 라인 정합에서 빼지 않음 (비교용)")
+    q.add_argument("--lost-every", type=int, default=1,
+                   help="5샘플 넘게 연달아 놓쳐 있으면 이 샘플마다만 다시 찾기 (1 = 매번). 클로즈업·광고가 잦은 다중 카메라 중계에서 3 정도로 빠르게")
+    q.add_argument("--around", default=None,
+                   help="슛 CSV(t_sec). 주면 경기 전체 대신 슛마다 앞 --before 초 ~ 뒤 --after 초만 추적해 npz 하나로 합침")
+    q.add_argument("--before", type=float, default=20.0, help="--around: 슛 앞 몇 초부터 추적")
+    q.add_argument("--after", type=float, default=5.0, help="--around: 슛 뒤 몇 초까지 추적")
     q.add_argument("--no-consensus", dest="consensus", action="store_false",
                    help="라인으로 확인 못 한 화면을 '서로 다른 시각의 기준 화면 둘 이상이 같은 자리' 로 받지 않음 (비교용)")
     q.add_argument("--graphics-box", action="append", default=None,
@@ -1363,7 +1472,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track", default=None, help="(선택) 추적 결과에서 라인이 잘 맞은 화면을 더 씀")
     q.add_argument("--n-extra", type=int, default=8)
     q.add_argument("--min-score", type=float, default=0.8)
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--out", default="configs/lens.json")
@@ -1373,7 +1482,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--t", type=float, required=True)
     q.add_argument("--calib")
     q.add_argument("--track")
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--refine", action="store_true")
     q.add_argument("--pred", action="store_true", help="진단: 추적기가 예측하던 위치(좌표 못 낸 구간 포함)를 빨간 선으로 같이 그림")
     q.add_argument("--graphics-box", action="append", default=None,
@@ -1389,7 +1498,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--calib")
     q.add_argument("--track")
     q.add_argument("--side", choices=["left", "right"], default=None, help="공격 방향 림. 모르면 가까운 림")
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--window", type=float, default=8.0, help="그 프레임 좌표가 없을 때 앞뒤 몇 초 안의 정상 화면에서 이어 올지")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
@@ -1401,7 +1510,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track")
     q.add_argument("--start", type=float, default=0.0)
     q.add_argument("--side", choices=["left", "right"], default=None)
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--no-graphics-mask", action="store_true")
@@ -1413,7 +1522,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--track")
     q.add_argument("--calib")
     q.add_argument("--side", choices=["left", "right"], default=None, help="CSV 에 side 가 없을 때 공격 방향 림")
-    q.add_argument("--spec", default="FIBA", choices=list(C.SPECS))
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--window", type=float, default=8.0)
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
