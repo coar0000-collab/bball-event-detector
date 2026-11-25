@@ -247,6 +247,71 @@ def cmd_calibrate(a):
     cv2.destroyAllWindows()
 
 
+def cmd_calib_edit(a):
+    """캘리브레이션 JSON 을 열어 노란 코트 선을 마우스로 끌어 고친다. --lens 를 주면 렌즈 휨을 편 화면에서 고치고 그 화면 H 로 저장."""
+    from . import calib_edit as CE
+
+    spec = _spec(a.spec)
+    H, d = _load_calib(a.calib)
+    raw_v = Video(a.video)
+    t = a.t if a.t is not None else float(d.get("t_sec") or 0.0)
+    raw = raw_v.frame_at(t)
+    lens = None
+    if a.lens:
+        from .lens import Lens, convert_h
+
+        lens = Lens.load(a.lens)
+        if lens.is_identity:
+            lens = None
+    if lens is not None:
+        frame = lens.undistort(raw)
+        if not (d.get("lens") and abs(float(d["lens"].get("k1", 0.0)) - lens.k1) < 1e-9):
+            pts = d.get("image_points") or {}
+            Hc = None
+            if len(pts) >= 4:
+                try:
+                    Hc, _ = HG.fit_homography({k: tuple(lens.undistort_pts([v])[0]) for k, v in pts.items()}, spec)
+                except ValueError:
+                    Hc = None
+            H = Hc if Hc is not None else convert_h(H, lens, spec)
+    else:
+        frame = raw
+        if d.get("lens") and float(d["lens"].get("k1", 0.0)) != 0.0:
+            sys.exit(f"{a.calib} 은 렌즈 휨을 편 화면 H 입니다. 같은 --lens 를 주세요.")
+    out = Path(a.out or a.calib)
+    if out.exists() and a.out is None:
+        bak = out.with_name(out.stem + ".bak.json")
+        if not bak.exists():
+            bak.write_text(out.read_text(encoding="utf-8"), encoding="utf-8")
+            print(f"원래 파일 백업: {bak}")
+
+    def save(Hn):
+        lm = C.landmarks(spec)
+        names = list(lm)
+        uv = HG.project(Hn, [lm[n] for n in names])
+        h, w = frame.shape[:2]
+        keep = [i for i in range(len(names)) if 0 <= uv[i][0] < w and 0 <= uv[i][1] < h]
+        img = uv[keep]
+        if lens is not None:
+            img = lens.distort_pts(img)  # image_points 는 늘 원본 화면 좌표 (다른 렌즈 값으로도 다시 맞출 수 있게)
+        pts = {names[i]: [round(float(p[0]), 2), round(float(p[1]), 2)] for i, p in zip(keep, img) if np.all(np.isfinite(p))}
+        o = dict(d)
+        o.update({"spec": spec.name, "t_sec": t, "H_court_to_image": (Hn / Hn[2, 2]).tolist(), "image_points": pts,
+                  "edited_with": "calib-edit"})
+        if lens is not None:
+            o["lens"] = lens.as_dict()
+        else:
+            o.pop("lens", None)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(o, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"저장: {out}")
+
+    print("노란 선 아무 곳이나 잡아 실제 흰 선 위로 끌어 놓으세요. 곧은 선 중간을 잡으면 그 선이 그 자리를 지나게, "
+          "모서리·3점 아크를 잡으면 그 점이 그 자리에 오게 맞춥니다.\n오른쪽 클릭: 고정 빼기, Z 되돌리기, R 처음으로, "
+          "S 저장, Q 닫기 (저장 안 했으면 한 번 더 Q).")
+    CE.run(frame, H, spec, save, WIN_MAX_W, title=f"calib-edit {Path(a.calib).name}")
+
+
 __CALIB_HELP = """
 캘리브레이션 방법
  1) 'court reference' 창의 빨간 점이 지금 찍을 지점입니다. 영상 창에서 그 지점을 클릭하세요.
@@ -407,10 +472,11 @@ def _around_windows(path: str, before: float, after: float, start=None, end=None
 
 
 def _track_around(a):
-    """경기 전체 대신 슛 시각 앞뒤 창만 추적해 npz 하나로 합친다. 창마다 기준 화면(캘리브레이션)과 맞춰 새로 시작한다.
-    (실제 KBA D201: 92분 전체를 0.2초 간격으로 돌리면 놓친 화면마다 다시 찾기를 해서 하루 가까이 걸렸다)"""
+    """경기 전체 대신 슛 시각 앞뒤 창만 추적한다. 추적기 하나로 창들을 차례로 돌아, 앞 창에서 잡은 화면(키프레임)이 뒤 창을
+    다시 찾을 때 기준이 된다. 창이 바뀔 때는 화면 전환처럼 놓친 상태로 보고 기준 화면·키프레임과 다시 맞춘다.
+    (실제 KBA D201: 92분 전체를 0.2초 간격으로 돌리면 하루 가까이 걸렸고, 창마다 따로 새로 시작하면 창 시작 화면이
+    캘리브레이션 화면과 카메라 자세가 달라 대부분 창에서 좌표가 0~1개였다)"""
     import copy
-    import tempfile
 
     wins = _around_windows(a.around, a.before, a.after, a.start, a.end)
     if not wins:
@@ -428,36 +494,10 @@ def _track_around(a):
             raw_samples.append(raw_v.frame_at(float(t)))
         except ValueError:
             pass
-    parts = []
-    with tempfile.TemporaryDirectory() as tmp:
-        for k, (w0, w1) in enumerate(wins):
-            b = copy.copy(a)
-            b.around, b.start, b.end, b.out = None, w0, w1, str(Path(tmp) / f"w{k}.npz")
-            b.raw_samples = raw_samples
-            print(f"[창 {k + 1}/{len(wins)}] {fmt_time(w0)} ~ {fmt_time(w1)}", file=sys.stderr)
-            cmd_track_court(b)
-            z = np.load(b.out)
-            parts.append({f: z[f] for f in z.files})
-    keys = ("times", "H", "H_pred", "line_score", "status", "support")
-    merged = {f: np.concatenate([p[f] for p in parts]) for f in keys}
-    order = np.argsort(merged["times"], kind="stable")
-    merged = {f: x[order] for f, x in merged.items()}
-    # 창이 겹쳐 같은 시각(캘리브레이션 화면 등)이 두 번 들어간 것은 앞의 것만
-    keep = np.ones(len(order), bool)
-    keep[1:] = np.diff(merged["times"]) > 1e-6
-    merged = {f: x[keep] for f, x in merged.items()}
-    extra = {"spec": parts[0]["spec"]}
-    if "lens" in parts[0]:
-        extra["lens"] = parts[0]["lens"]
-    igs = [np.unpackbits(p["ignore"])[: int(np.prod(p["ignore_shape"]))].reshape(p["ignore_shape"]).astype(bool)
-           for p in parts if "ignore" in p]
-    if igs:
-        ig = np.logical_or.reduce(igs)  # 창마다 찾은 그래픽 자리를 모두 뺀다
-        extra["ignore"], extra["ignore_shape"] = np.packbits(ig), np.array(ig.shape)
-    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(a.out, **merged, **extra)
-    ok = int(np.isin(merged["status"].astype(str), _GOOD).sum())
-    print(f"저장: {a.out}  (창 {len(wins)}개, 프레임 {len(merged['times'])}개 중 코트 좌표 있음 {ok}개)")
+    b = copy.copy(a)
+    b.around, b.windows, b.raw_samples = None, wins, raw_samples
+    b.start, b.end = wins[0][0], wins[-1][1]
+    return cmd_track_court(b)
 
 
 def cmd_track_court(a):
@@ -568,9 +608,25 @@ def cmd_track_court(a):
     lost_run = 0  # 연달아 놓친 샘플 수
     # 진단용: 샘플마다 추적기가 들고 있던 위치(좌표를 못 낸 coast 도 화면 이동으로 예측한 H). 확인 안 된 값이라 판정에는 안 쓴다
     preds = [Hs[0].copy()]
-    for t, frame, between in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
+    wins = getattr(a, "windows", None)
+
+    def samples():
+        if not wins:
+            for x in v.iterate_between(step=a.step, start=start + a.step, end=a.end):
+                yield (False,) + x
+            return
+        for k, (w0, w1) in enumerate(wins):
+            for j, x in enumerate(v.iterate_between(step=a.step, start=w0 + (a.step if k == 0 else 0.0), end=w1)):
+                yield (k > 0 and j == 0,) + x
+
+    for new_win, t, frame, between in samples():
         if t <= start:
             continue
+        if new_win:
+            # 다음 슛 창으로 건너뜀: 화면 이동이 끊겼으니 놓친 상태로 보고 기준 화면·키프레임(앞 창들에서 쌓인 것 포함)과 다시 맞춘다
+            trk.lost = True
+            lost_run = 0
+            gap = None
         r = trk.update(frame, between)
         if r.status == "coast" and trk.coast_n % a.reloc_every == 0:
             # 좌표를 못 내는 동안 주기적으로 기준 화면·키프레임과 맞춰 본다: 틀린 곳(반대쪽 골대 등)에 붙어 있었다면
@@ -579,7 +635,7 @@ def cmd_track_court(a):
             if strong(Hr, sc) or (Hr is not None and sc >= max(a.recover_score, 0.75)):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
-            elif a.consensus and (Hc := trk.consensus(frame.shape)) is not None:
+            elif a.consensus and (Hc := trk.consensus(frame.shape, frame=frame)) is not None:
                 # 라인으로는 확인 못 해도 서로 다른 시각의 기준 화면 둘 이상이 같은 자리를 가리킨다
                 trk.reset(Hc, frame)
                 r = HG.TrackResult(Hc, sc, "consensus")
@@ -588,7 +644,7 @@ def cmd_track_court(a):
             # 화면 전환(리플레이·광고) 뒤: 기준 화면·키프레임과 맞춰 다시 찾는다
             # (오래 놓쳐 있으면 --lost-every 샘플마다만: 클로즈업·광고가 길게 이어질 때 매 샘플 다시 찾기가 가장 느림)
             Hr, sc = trk.relocalize(frame)
-            Hc = trk.consensus(frame.shape) if a.consensus else None
+            Hc = trk.consensus(frame.shape, frame=frame) if a.consensus else None
             if not strong(Hr, sc) and (Hr is None or sc < a.recover_score) and Hc is not None:
                 trk.reset(Hc, frame)
                 r = HG.TrackResult(Hc, sc, "consensus")
@@ -680,8 +736,9 @@ def cmd_track_court(a):
                         status=np.array(status),
                         support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name, **extra)
     ok = sum(s in _GOOD for s in status)
-    print(f"저장: {a.out}  (프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
-          f"앞뒤 정상 화면 사이 메움 {n_bridged}개, 기준 화면 여러 개 일치로 찾음 {n_consensus}개)")
+    print(f"저장: {a.out}  (" + (f"슛 앞뒤 창 {len(wins)}개, " if wins else "") + f"프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
+          f"앞뒤 정상 화면 사이 메움 {n_bridged}개, 기준 화면 여러 개 일치로 찾음 {n_consensus}개"
+          f" (흰 선과 어긋나 버림 {trk.consensus_rejected}개))")
 
 
 class _CourtLookup:
@@ -1379,6 +1436,14 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--out", default="configs/calib.json")
     q.add_argument("--refine", action="store_true", help="흰 라인 픽셀에 자동으로 더 맞춤")
     q.add_argument("--fresh", action="store_true", help="기존 점 무시하고 새로 찍기")
+
+    q = add("calib-edit", cmd_calib_edit, "캘리브레이션의 노란 코트 선을 마우스로 끌어 고치기")
+    q.add_argument("--video", required=True)
+    q.add_argument("--calib", required=True, help="고칠 캘리브레이션 JSON")
+    q.add_argument("--t", type=float, default=None, help="화면 시각 (기본: 캘리브레이션의 t_sec)")
+    q.add_argument("--lens", default=None, help="lens-fit 결과 JSON. 주면 렌즈 휨을 편 화면에서 고치고 그 화면 H 로 저장")
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
+    q.add_argument("--out", default=None, help="저장 파일 (기본: --calib 덮어쓰기, 처음 한 번 .bak.json 백업)")
 
     q = add("track-court", cmd_track_court, "팬·줌 카메라를 따라 프레임별 코트 변환 계산")
     q.add_argument("--video", required=True)

@@ -392,3 +392,19 @@ def test_gym_spec_json(tmp_path):
     bad.write_text(json.dumps({"three_radiu": 7.0}), encoding="utf-8")
     with pytest.raises(SystemExit):
         cli._spec(str(bad))
+
+
+def test_calib_edit_saves(synthetic, tmp_path, monkeypatch):
+    """calib-edit: 창에서 S 를 누른 것처럼 저장하면 H·원본 화면 좌표 image_points 가 들어가고, 덮어쓸 때 처음 한 번 백업한다."""
+    from gtt import calib_edit as CE
+
+    d, video, Hs = synthetic
+    calib = tmp_path / "c.json"
+    calib.write_text((d / "calib.json").read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(CE, "run", lambda frame, H, spec, save, *a, **k: save(H) or True)
+    cli.main(["calib-edit", "--video", str(video), "--calib", str(calib)])
+    o = json.loads(calib.read_text(encoding="utf-8"))
+    assert o["edited_with"] == "calib-edit" and len(o["image_points"]) >= 4 and "lens" not in o
+    assert (tmp_path / "c.bak.json").exists()
+    H2, _ = HG.fit_homography({k: tuple(v) for k, v in o["image_points"].items()}, FIBA)
+    assert HG.h_distance(H2, np.array(o["H_court_to_image"]), (720, 1280)) < 0.5
