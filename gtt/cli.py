@@ -306,9 +306,10 @@ def cmd_calib_edit(a):
         out.write_text(json.dumps(o, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"저장: {out}")
 
-    print("노란 선 아무 곳이나 잡아 실제 흰 선 위로 끌어 놓으세요. 곧은 선 중간을 잡으면 그 선이 그 자리를 지나게, "
-          "모서리·3점 아크를 잡으면 그 점이 그 자리에 오게 맞춥니다.\n오른쪽 클릭: 고정 빼기, Z 되돌리기, R 처음으로, "
-          "S 저장, Q 닫기 (저장 안 했으면 한 번 더 Q).")
+    print("그리기: 화면의 흰 선 위를 마우스로 따라 그으세요 (곧은 선은 처음부터 끝까지 끌기, 3점 아크는 곡선을 따라 끌기).\n"
+          "  그은 선마다 가장 가까운 코트 선 이름이 붙고(틀리면 Tab), 그은 선들에 코트 전체가 맞춰집니다. 4줄 이상 그으세요\n"
+          "  (베이스라인, 사이드라인, 자유투 라인, 키 변, 3점 아크처럼 방향이 다른 선). 오른쪽 클릭: 그은 선 지우기.\n"
+          "M: 끌기 모드(노란 선을 잡아 끌기)와 바꾸기, Z 되돌리기, R 처음으로, S 저장, Q 닫기 (저장 안 했으면 한 번 더 Q).")
     CE.run(frame, H, spec, save, WIN_MAX_W, title=f"calib-edit {Path(a.calib).name}")
 
 
@@ -1437,7 +1438,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--refine", action="store_true", help="흰 라인 픽셀에 자동으로 더 맞춤")
     q.add_argument("--fresh", action="store_true", help="기존 점 무시하고 새로 찍기")
 
-    q = add("calib-edit", cmd_calib_edit, "캘리브레이션의 노란 코트 선을 마우스로 끌어 고치기")
+    q = add("calib-edit", cmd_calib_edit, "흰 선 위에 선을 그어(또는 노란 선을 끌어) 캘리브레이션 고치기")
     q.add_argument("--video", required=True)
     q.add_argument("--calib", required=True, help="고칠 캘리브레이션 JSON")
     q.add_argument("--t", type=float, default=None, help="화면 시각 (기본: 캘리브레이션의 t_sec)")
