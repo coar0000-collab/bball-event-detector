@@ -430,7 +430,8 @@ def test_shot_skips_h_the_camera_cannot_make(synthetic, capsys, tmp_path):
     x, y = 1.575 + 7.4, 7.5
     u, v = HG.court_to_image(Hs[60], x, y)
     capsys.readouterr()
-    cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v), "--side", "left"])
+    cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v), "--side", "left",
+              "--max-cam-px", "8"])
     res = json.loads(capsys.readouterr().out)
     assert res["h_source"] != "track" and res["points"] == 3 and res["h_reject"].startswith("track:카메라"), res
     assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15 and res["h_cam_px"] < 8
@@ -440,3 +441,29 @@ def test_shot_skips_h_the_camera_cannot_make(synthetic, capsys, tmp_path):
     cli.main(["cam-check", "--track", str(bad), "--video", str(video), "--out", str(tmp_path / "cam.csv")])
     out = capsys.readouterr()
     assert "넘는 구간 1개" in out.out and "consensus" in out.out and "카메라 자리 (캘리브레이션 1)" in out.err
+
+
+def test_shot_skips_h_that_puts_foot_in_other_half(synthetic, capsys, tmp_path):
+    """공격 방향(--side)을 알 때, 슛 프레임 H 가 발을 하프라인 너머(반대쪽 골대 근처)로 옮기면 그 H 는 버리고 앞뒤에서 이어 온다.
+    (실제 B-LAB holdout 383·414·447·529s: 틀린 H 로 '탑 3점, 라인까지 11~18m' — 발이 반대쪽 림 근처였다)
+    공격 방향을 모르면 가까운 림으로 판정하므로 이 검사는 하지 않는다."""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    z = dict(np.load(track))
+    i = int(np.argmin(np.abs(z["times"] - 6.0)))
+    H = z["H"].copy()
+    H[i] = H[i] @ np.array([[1, 0, -14.0], [0, 1, 0], [0, 0, 1]])  # 발이 14m 오른쪽(반대쪽 골대 3m 앞)으로 옮겨지는 틀린 H
+    z["H"] = H
+    bad = tmp_path / "bad.npz"
+    np.savez(bad, **z)
+    x, y = 1.575 + 7.4, 7.5
+    u, v = HG.court_to_image(Hs[60], x, y)
+    capsys.readouterr()
+    cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v), "--side", "left"])
+    res = json.loads(capsys.readouterr().out)
+    assert res["h_source"] != "track" and res["points"] == 3 and res["h_reject"].startswith("track:반대쪽코트"), res
+    assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15
+    cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v)])
+    res = json.loads(capsys.readouterr().out)
+    assert res["h_source"] == "track" and res["side"] == "right" and res["points"] == 2  # 방향을 모르면 못 거름

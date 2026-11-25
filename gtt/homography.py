@@ -846,7 +846,7 @@ class CourtTracker:
                  min_score: float = 0.65, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None,
                  keyframe_score: float = 0.7, max_jump_px: float = 15.0, weak_inliers: int = 100,
                  min_good_lines: int = 2, min_line_frac: float = 0.6, min_area_frac: float = 0.1,
-                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None, max_cam_px: float = 8.0):
+                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None, max_cam_px: float = 0.0):
         """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
         0.36~0.47, 키가 옆으로 밀린 틀린 화면이 0.55~0.60, 맞은 화면은 0.71 이상이었으므로 0.65.
         keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
@@ -861,8 +861,8 @@ class CourtTracker:
         코트가 찌그러진 H 로 보고 쓰지 않는다. (실제 영상에서 좌표 1322개 중 1091개가 키 넓이 0~60px² 인 찌그러진 H 였다)
         ignore: 라인 정합에서 뺄 자리(방송 그래픽, 렌즈 휨을 편 화면의 검정 여백) = True (graphics_mask).
         max_cam_px: consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리(camera_pose)에서 돌리기·당기기만으로 이 px 안으로
-        흉내 낼 수 있어야 한다 (camera_fit_px). 0 이면 끔. (실제 B-LAB holdout: 라인이 25%+ 맞아 lines_contradict 를 통과한
-        비틀린 consensus 가 슛 4개를 '라인까지 11~18m' 로 냈다)"""
+        흉내 낼 수 있어야 한다 (camera_fit_px). 0 이면 끔(기본). 실제 영상에서는 맞는 H 도 카메라 차이가 중앙 10px·90% 28px
+        (B-LAB), 캘리브레이션 화면 자체가 6~18px 이라 아직 거르는 기준으로 못 쓴다 — 진단(cam-check)용."""
         self.spec = spec
         self.ignore = ignore
         self.H = H0.copy()
@@ -1098,7 +1098,7 @@ class CourtTracker:
         H = H / H[2, 2]
         if not self.sane(H, shape):
             return None
-        r = self.camera_px(H, shape)
+        r = self.camera_px(H, shape) if self.max_cam_px else float("nan")
         if self.max_cam_px and np.isfinite(r) and r > self.max_cam_px:
             # 기준 화면 여럿이 같은 자리를 가리켜도, 중계 카메라 자리에서 돌리기·당기기로 만들 수 없는 화면이면 받지 않는다
             self.camera_rejected += 1
