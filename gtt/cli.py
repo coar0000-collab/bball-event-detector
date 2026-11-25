@@ -554,7 +554,8 @@ def cmd_track_court(a):
         overlay[cv2.dilate(lens.invalid_mask().astype(np.uint8), np.ones((9, 9), np.uint8)) > 0] = 0  # 검정 여백 경계는 특징점 아님
     # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
     trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score,
-                          ignore=ignore, max_cam_px=getattr(a, "max_cam_px", 0.0))
+                          ignore=ignore, max_cam_px=getattr(a, "max_cam_px", 0.0),
+                          consensus_line_frac=getattr(a, "consensus_line_frac", 0.25))
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
     # 사람이 맞춘 화면은 그 시각의 정답이기도 하다: (시각, H, 회색 화면). 추적 결과에 그 시각으로 그대로 넣고,
     # 그 직후 샘플에서 추적이 놓쳐 있으면 이 화면에서 이어 붙여 다시 잡는다.
@@ -1185,6 +1186,45 @@ def cmd_cam_check(a):
         print(f"저장: {a.out}")
 
 
+def cmd_line_check(a):
+    """추적 결과(npz)의 샘플마다 그 H 로 그린 코트 라인이 화면 흰 선과 얼마나 맞는지 (consensus 기준 정하기·틀린 H 찾기 진단).
+    줄마다 8px(--tol) 안 30% 이상 겹치면 '맞은 줄'. center_x 는 화면 가운데가 보는 코트 x (하프라인 = 길이/2)."""
+    spec = _spec(a.spec)
+    v = Video(a.video)
+    look = _lookup(a, v)
+    tr = look.track
+    times, Hs, st = tr["times"], tr["H"], tr["status"].astype(str)
+    want = set(a.status.split(",")) if a.status else None
+    rows = []
+    for i in range(len(times)):
+        if (want and st[i] not in want) or not np.all(np.isfinite(Hs[i])):
+            continue
+        if a.start is not None and times[i] < a.start or a.end is not None and times[i] > a.end:
+            continue
+        frame = look.undistort(v.frame_at(float(times[i])))
+        e = HG.line_evidence(frame, Hs[i], spec, look.ignore, tol=a.tol)
+        frac = e["n_good"] / e["n_vis"] if e["n_vis"] else float("nan")
+        fd = e["n_good_d"] / e["n_vis_d"] if e["n_vis_d"] else float("nan")
+        rows.append({"t_sec": round(float(times[i]), 3), "status": st[i], "n_vis": e["n_vis"], "n_good": e["n_good"],
+                     "good_frac": round(frac, 3) if np.isfinite(frac) else "", "cross": e["cross"],
+                     "n_vis_d": e["n_vis_d"], "n_good_d": e["n_good_d"],
+                     "distinct_frac": round(fd, 3) if np.isfinite(fd) else "",
+                     "contradict": int(HG.lines_contradict(frame, Hs[i], spec, look.ignore, frac=a.frac)),
+                     "density": round(e["density"], 4), "area": round(e["area"], 3),
+                     "center_x": round(e["center_x"], 2) if np.isfinite(e["center_x"]) else ""})
+    for s_ in sorted({r["status"] for r in rows}):
+        fr = np.array([r["good_frac"] for r in rows if r["status"] == s_ and r["good_frac"] != ""], float)
+        fd = np.array([r["distinct_frac"] for r in rows if r["status"] == s_ and r["distinct_frac"] != ""], float)
+        nc = sum(r["contradict"] for r in rows if r["status"] == s_)
+        if len(fr):
+            print(f"{s_}: {len(fr)}개, 맞은 줄 비율 중앙 {np.median(fr):.2f}, 10% {np.percentile(fr, 10):.2f}, "
+                  + ", ".join(f"<{q:.2f} {int((fr < q).sum())}개" for q in (0.25, 0.4, 0.5, 0.6))
+                  + (f" / 키·아크 줄 맞은 비율 중앙 {np.median(fd):.2f}, <0.5 {int((fd < 0.5).sum())}개" if len(fd) else "")
+                  + f" / 흰 선과 어긋남(버릴 것) {nc}개")
+    _write_csv(a.out, rows)
+    print(f"저장: {a.out} ({len(rows)}개)")
+
+
 def cmd_overlay(a):
     spec = _spec(a.spec)
     v = Video(a.video)
@@ -1639,6 +1679,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--max-cam-px", type=float, default=0.0,
                    help="consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나야 함 "
                         "(0 = 끔, 기본. 실제 영상에서 맞는 H 도 10~28px 이라 아직 진단용)")
+    q.add_argument("--consensus-line-frac", type=float, default=0.25,
+                   help="코트 안에 흰 선이 보이는데 consensus H 로 그린 줄 가운데 이 비율 미만만 흰 선(8px 안)과 겹치면 버림")
     q.add_argument("--no-consensus", dest="consensus", action="store_false",
                    help="라인으로 확인 못 한 화면을 '서로 다른 시각의 기준 화면 둘 이상이 같은 자리' 로 받지 않음 (비교용)")
     q.add_argument("--graphics-box", action="append", default=None,
@@ -1662,6 +1704,21 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--max-cam-px", type=float, default=8.0)
     q.add_argument("--out", default=None, help="샘플별 CSV (t_sec, status, cam_px)")
+
+    q = add("line-check", cmd_line_check, "추적 결과의 H 마다 코트 라인이 화면 흰 선과 얼마나 맞는지 (consensus 기준 진단)")
+    q.add_argument("--track", required=True)
+    q.add_argument("--video", required=True)
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
+    q.add_argument("--status", default="consensus", help="볼 상태 (쉼표로 여러 개, 빈칸 = 모두)")
+    q.add_argument("--start", type=float, default=None)
+    q.add_argument("--end", type=float, default=None)
+    q.add_argument("--tol", type=float, default=8.0)
+    q.add_argument("--frac", type=float, default=0.25, help="contradict 열: track-court --consensus-line-frac 와 같은 기준")
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
+    q.add_argument("--no-graphics-mask", action="store_true")
+    q.add_argument("--out", default="out/line_check.csv")
+    q.set_defaults(calib=None)
 
     q = add("overlay", cmd_overlay, "코트 라인을 영상 프레임에 겹쳐 그려 확인")
     q.add_argument("--video", required=True)
