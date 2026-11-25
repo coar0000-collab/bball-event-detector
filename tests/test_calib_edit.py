@@ -68,3 +68,49 @@ def test_render_and_magnifier_shapes():
     assert img.shape == f.shape
     mg = CE.magnifier(img, 5.0, 5.0)
     assert mg.shape == (320, 320, 3)
+
+
+def _seg(H, a, b):
+    return HG.project(H, [a, b])
+
+
+def test_draw_lines_fits_court_and_names_them():
+    """흰 선 위에 그은 선들(선의 일부만)에 자동으로 코트 선 이름을 붙이고, 그 선들로 코트 전체를 맞춘다."""
+    _, Htrue = make_scene()
+    ed = CE.Editor(_wrong(Htrue), (720, 1280), FIBA)
+    m, kw = FIBA.width / 2, FIBA.key_width / 2
+    strokes = {
+        "baseline_L": ((0, 1.0), (0, 12.0)),
+        "L_key_bot": ((1.0, m - kw), (4.5, m - kw)),
+        "L_ft_line": ((5.8, m - kw + 0.3), (5.8, m + kw - 0.3)),
+        "sideline_bot": ((4.0, 0), (12.0, 0)),
+        "halfcourt": ((14.0, 2.0), (14.0, 11.0)),
+    }
+    for name, (a, b) in strokes.items():
+        st = ed.add_stroke(_seg(Htrue, a, b))
+        assert st is not None and st.name == name, (name, st and st.name, ed.candidates)
+    assert HG.h_distance(ed.H, Htrue, (720, 1280)) < 1.0
+    assert max(r for _, r in ed.residuals()) < 0.5
+
+
+def test_draw_arc_and_tab_and_undo():
+    """3점 아크를 따라 그은 곡선은 아크로 맞추고, Tab 으로 이름을 바꾸고, 되돌리기·오른쪽 클릭 지우기가 된다."""
+    import math
+
+    _, Htrue = make_scene()
+    ed = CE.Editor(_wrong(Htrue), (720, 1280), FIBA)
+    rx, m, R = FIBA.rim_from_baseline, FIBA.width / 2, FIBA.three_radius
+    arc = [(rx + R * math.cos(t), m + R * math.sin(t)) for t in np.linspace(-0.9, 0.9, 40)]
+    st = ed.add_stroke(HG.project(Htrue, arc))
+    assert st.kind == "arc" and st.name == "L_arc"
+    for name, (a, b) in {"baseline_L": ((0, 1.0), (0, 12.0)), "L_ft_line": ((5.8, m - 2.1), (5.8, m + 2.1)),
+                         "sideline_bot": ((4.0, 0), (12.0, 0))}.items():
+        assert ed.add_stroke(_seg(Htrue, a, b)).name == name
+    assert HG.h_distance(ed.H, Htrue, (720, 1280)) < 1.5
+    before = ed.strokes[-1].name
+    assert ed.cycle_last() != before
+    ed.undo()  # Tab 이 아니라 마지막 선 긋기 되돌리기
+    assert len(ed.strokes) == 3
+    p = ed.strokes[0].pts[5]
+    assert ed.remove_near(*p) and len(ed.strokes) == 2
+    assert ed.add_stroke([(10, 10), (12, 11)]) is None  # 너무 짧음
