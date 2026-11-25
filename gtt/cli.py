@@ -904,7 +904,7 @@ def _read_motions(v, look, i0: int, i1: int, keep: set, every: int, mask=None, o
 def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: float = 0.1, agree_m: float = 0.2,
                    near_s: float = 0.6, min_score: float = 0.65, max_cam_px: float = 0.0,
                    off_court_m: float = 1.0, side: str | None = None,
-                   far_m: float = 1.5) -> tuple[np.ndarray | None, dict]:
+                   far_m: float = 1.5, one_way_s: float = 3.0) -> tuple[np.ndarray | None, dict]:
     """슛 시각 t 의 코트 변환 (H, 정보). 추적 결과에 그 프레임 좌표가 없으면(coast·lost) 앞뒤 정상 샘플에서 화면 이동으로 이어 온다.
 
     - 그 프레임에 좌표가 있으면 그대로 ("track").
@@ -914,13 +914,19 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
     - 한쪽뿐이거나 둘이 어긋나면: near_s 초 안의 가까운 쪽 이동은 그대로 믿고 ("near"), 그보다 멀면 그 H 를 그 화면 흰 라인에
       다시 맞춰 추적과 같은 기준(일치율 min_score, 보이는 줄 대부분 맞고 방향 엇갈림)을 통과할 때만 ("verified").
     - 그래도 안 되면 앞뒤 2분 안의 정상 화면들과 직접 맞춰 여러 장이 같은 답을 낼 때만 ("multi-view", _multi_view).
+    - 그래도 안 되면, one_way_s 초 안의 한쪽 길 H 로 그린 키·자유투 라인·아크·코너 직선이 그 화면 흰 선과 절반 넘게 맞을 때
+      ("one-way"). 슛 순간은 패닝·줌으로 흐려 라인 정합 일치율이 0.3 대로 떨어지기 쉽다 (실제 KBA D201 181·529.6·1038.5s:
+      1~2초 전까지 정상이었는데 슛 직전 팬·줌에서 놓침). 이어 온 시간만큼 _judge 가 라인 근처 기준을 넓힌다.
     - 아니면 None.
     정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길·여러 화면의 발 자리 차이 m), h_votes,
     h_cam_px(고른 H 가 캘리브레이션 카메라 자리에서 얼마나 흉내 나는가 px), h_reject(버린 출처와 이유).
 
     어느 출처든 (1) 발 자리가 코트 밖 off_court_m 넘게 나가거나 (2) 공격 방향(side)을 알 때 발 자리가 그 림에서 하프라인
     너머 far_m 보다 멀거나 (3) max_cam_px > 0 이고 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 그 안으로 만들 수
-    없는 H 면 버리고 다음 출처로 간다. (실제 B-LAB holdout: 틀린 H 가 슛 4개를 '탑 3점, 라인까지 11~18m' 로 냈다 —
+    없는 H 면 버리고 다음 출처로 간다.
+    단 (2) 에서 그 H 로 그린 키·아크 등이 슛 화면 흰 선과 거의 다(75%+) 맞으면, 코트가 180° 돌려도 똑같이 생긴 탓에 반대편
+    카메라 화면(또는 반대쪽 골대 화면)을 뒤집어 맞춘 것이다 — 흰 선만으로는 둘을 못 가르고 공격 방향이 가른다. 그때는 코트를
+    180° 돌린 H 를 쓴다 (h_source 에 '+180'). (실제 B-LAB holdout 383·414·447·529s: 발을 180° 돌리면 넷 다 정답 2/3점) (실제 B-LAB holdout: 틀린 H 가 슛 4개를 '탑 3점, 라인까지 11~18m' 로 냈다 —
     발이 반대쪽 골대 근처로 옮겨진 것, 둘은 우연히 점수만 맞음. 하프라인 너머 버저비터는 좌표 없음 → 사람 판정)"""
     info = {"h_source": "none", "h_gap_s": "", "h_agree_m": "", "h_votes": "", "h_cam_px": "", "h_reject": ""}
     if look.track is None:
@@ -943,7 +949,18 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
             cache[i] = not (np.isfinite(r) and r > max_cam_px)
         return cache[i]
 
-    def accept(src: str, Hx) -> bool:
+    shot_frame: list = []
+
+    def frame_t() -> np.ndarray:
+        if not shot_frame:
+            shot_frame.append(look.undistort(v.frame_at(t)))
+        return shot_frame[0]
+
+    far_d = spec.length / 2 - spec.rim_from_baseline + far_m
+    R180 = np.array([[-1.0, 0.0, spec.length], [0.0, -1.0, spec.width], [0.0, 0.0, 1.0]])
+
+    def take(src: str, Hx):
+        """출처 src 의 H 를 검사해 쓸 H (그대로 또는 180° 돌린 것) 를 돌려준다. 못 쓰면 None (이유는 h_reject)."""
         why = None
         if uv is not None:
             x, y = HG.image_to_court(Hx, *uv)
@@ -952,25 +969,36 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
             elif side in ("left", "right"):
                 rx, ry = spec.rim(side)
                 d = float(np.hypot(x - rx, y - ry))
-                if d > spec.length / 2 - spec.rim_from_baseline + far_m:
+                if d > far_d:
                     why = f"반대쪽코트(공격 림까지 {d:.1f}m)"
+                    e = HG.line_evidence(frame_t(), Hx, spec, look.ignore, tol=8.0)
+                    ox, oy = spec.rim("right" if side == "left" else "left")
+                    if (e["n_vis_d"] >= 2 and e["n_good_d"] >= 0.75 * e["n_vis_d"]
+                            and float(np.hypot(x - ox, y - oy)) <= far_d):
+                        rejects.append(f"{src}:{why}→키·아크 {e['n_good_d']}/{e['n_vis_d']} 맞아 180° 돌림")
+                        info["h_reject"] = "; ".join(rejects)
+                        Hx = Hx @ R180
+                        src = src + "+180"
+                        why = None
         r = look.cam_px(Hx, spec, shape) if max_cam_px > 0 else float("nan")
         if why is None and np.isfinite(r) and r > max_cam_px:
             why = f"카메라{r:.0f}px"
         if why is not None:
             rejects.append(f"{src}:{why}")
             info["h_reject"] = "; ".join(rejects)
-            return False
+            return None
         info["h_cam_px"] = round(r, 1) if np.isfinite(r) else ""
-        return True
+        info["h_source"] = src
+        return Hx
 
     half = 0.5 / (v.fps or 30.0)
     exact = np.flatnonzero(fin & (np.abs(times - t) <= half))
     if len(exact):
         i = int(exact[np.argmin(np.abs(times[exact] - t))])
-        if accept("track", Hs[i]):
-            info.update(h_source="track", h_gap_s=0.0)
-            return Hs[i], info
+        Hx = take("track", Hs[i])
+        if Hx is not None:
+            info["h_gap_s"] = 0.0
+            return Hx, info
     before = np.flatnonzero(good & (times < t) & (times >= t - window))
     after = np.flatnonzero(good & (times > t) & (times <= t + window))
     ia = next((int(i) for i in before[::-1] if sample_ok(int(i))), None)
@@ -986,8 +1014,8 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
     orb = HG.make_orb()
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     if ia is None and ib is None:
-        return _multi_view(look, v, t, look.undistort(v.frame_at(t)), spec, uv, mask, orb, matcher, info, agree_m=agree_m,
-                           sample_ok=sample_ok, accept=accept)
+        return _multi_view(look, v, t, frame_t(), spec, uv, mask, orb, matcher, info, agree_m=agree_m,
+                           sample_ok=sample_ok, accept=take)
     gaps = [abs(t - times[i]) for i in (ia, ib) if i is not None]
     info["h_gap_s"] = round(float(min(gaps)), 2)
     fps = v.fps or 30.0
@@ -1025,16 +1053,14 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
         info["h_agree_m"] = round(dm, 3)
         Hm = 0.5 * (Hf + Hb)
         Hm = Hm / Hm[2, 2]
-        if dm <= agree_m and accept("two-way", Hm):
-            info["h_source"] = "two-way"
-            return Hm, info
+        if dm <= agree_m and (Hx := take("two-way", Hm)) is not None:
+            return Hx, info
     # 한쪽 길만: 가까우면 그대로, 멀면 그 화면 라인에 다시 맞춰 확인
     cands = sorted([(abs(t - times[i]), Hx) for i, Hx in ((ia, Hf), (ib, Hb)) if i is not None and Hx is not None],
                    key=lambda c: c[0])
-    if cands and cands[0][0] <= near_s and accept("near", cands[0][1]):
-        info["h_source"] = "near"
-        return cands[0][1], info
-    frame = look.undistort(v.frame_at(t))
+    if cands and cands[0][0] <= near_s and (Hx := take("near", cands[0][1])) is not None:
+        return Hx, info
+    frame = frame_t()
     for _, Hx in cands:
         Hr, sc, sup = HG.refine_homography(frame, Hx, spec, return_support=True, ignore=look.ignore)
         for _ in range(3):
@@ -1043,11 +1069,26 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
                 break
             Hr, sc, sup = H2, s2, sup2
         if (sc >= min_score and HG.support_ok(sup) and HG.h_distance(Hr, Hx, frame.shape, spec) <= 10.0
-                and accept("verified", Hr)):
-            info["h_source"] = "verified"
-            return Hr, info
-    return _multi_view(look, v, t, frame, spec, uv, mask, orb, matcher, info, agree_m=agree_m,
-                       sample_ok=sample_ok, accept=accept)
+                and (Hv := take("verified", Hr)) is not None):
+            return Hv, info
+    Hm, info = _multi_view(look, v, t, frame, spec, uv, mask, orb, matcher, info, agree_m=agree_m,
+                           sample_ok=sample_ok, accept=take)
+    if Hm is not None:
+        return Hm, info
+    # 한쪽 길만 몇 초: 그 H 로 그린 키·아크 등이 슛 화면 흰 선과 절반 넘게 맞으면 쓴다
+    for gap, Hx in cands:
+        if gap > one_way_s:
+            continue
+        e = HG.line_evidence(frame, Hx, spec, look.ignore, tol=8.0)
+        if e["n_vis_d"] < 2 or e["n_good_d"] < 0.5 * e["n_vis_d"] or HG.lines_contradict(frame, Hx, spec, look.ignore):
+            rejects.append(f"one-way {gap:.1f}s:키·아크 {e['n_good_d']}/{e['n_vis_d']}")
+            info["h_reject"] = "; ".join(rejects)
+            continue
+        if (Hx2 := take("one-way", Hx)) is not None:
+            info["h_gap_s"] = round(float(gap), 2)
+            return Hx2, info
+    info["h_source"] = "none"
+    return None, info
 
 
 def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, matcher, info: dict, span: float = 120.0,
@@ -1110,21 +1151,25 @@ def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, match
     Hm = Hm / Hm[2, 2]
     P = np.stack([d[3] for d in grp])
     spread = float(np.max(np.linalg.norm(P[:, None] - P[None], axis=2)))  # 같은 답을 낸 화면끼리 가장 먼 거리 (최대 2×agree_m)
-    if accept is not None and not accept("multi-view", Hm):
-        return None, info
-    info["h_source"] = "multi-view"
     info["h_agree_m"] = round(spread, 3)
     info["h_gap_s"] = round(float(min(abs(d[0] - t) for d in grp)), 2)
+    if accept is not None:
+        Hx = accept("multi-view", Hm)
+        if Hx is None:
+            info["h_source"] = "none"
+            return None, info
+        return Hx, info
+    info["h_source"] = "multi-view"
     return Hm, info
 
 
 def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0, max_cam_px: float = 0.0,
-           off_court_m: float = 1.0):
+           off_court_m: float = 1.0, one_way_m_per_s: float = 0.15, one_way_s: float = 3.0):
     """원본 화면 발 위치 하나를 판정 (shot·rejudge 공용). 반환: (ShotCall 또는 None, H 정보, 편 화면 좌표)."""
     u, vv = look.to_canvas(u_raw, v_raw)
     if v is not None:
         H, info = _court_at_shot(look, v, t, spec, uv=(u, vv), window=window, max_cam_px=max_cam_px,
-                                 off_court_m=off_court_m, side=side)
+                                 off_court_m=off_court_m, side=side, one_way_s=one_way_s)
     else:
         H = look.at(t)
         info = {"h_source": "track" if H is not None else "none", "h_gap_s": "", "h_agree_m": "", "h_votes": ""}
@@ -1132,9 +1177,14 @@ def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, windo
         return None, info, (u, vv)
     frame = look.undistort(v.frame_at(t)) if v is not None else None
     call = HG.classify_click(H, u, vv, spec, side=side, frame=frame, ignore=look.ignore)
-    if info.get("h_agree_m") not in ("", None) and info["h_source"] in ("two-way", "multi-view"):
-        # 두 길이 발 자리에서 어긋난 만큼 위치가 흔들릴 수 있다 → 라인 근처 기준을 넓힌다
-        call.margin_sigma = float(np.hypot(call.margin_sigma, float(info["h_agree_m"])))
+    src = str(info.get("h_source", "")).split("+")[0]
+    extra = 0.0
+    if info.get("h_agree_m") not in ("", None) and src in ("two-way", "multi-view"):
+        extra = float(info["h_agree_m"])  # 두 길이 발 자리에서 어긋난 만큼 위치가 흔들릴 수 있다
+    elif src == "one-way" and info.get("h_gap_s") not in ("", None):
+        extra = one_way_m_per_s * float(info["h_gap_s"])  # 한쪽 길로 이어 온 시간만큼 화면 이동 오차가 쌓일 수 있다
+    if extra > 0:
+        call.margin_sigma = float(np.hypot(call.margin_sigma, extra))
         call.near_line = call.near_line or abs(call.margin) < max(0.3, 2.0 * call.margin_sigma)
     return call, info, (u, vv)
 
@@ -1270,7 +1320,7 @@ def cmd_shot(a):
     look = _lookup(a, v)
     t = a.t or 0.0
     call, info, (u, vv) = _judge(look, v, t, a.u, a.v, spec, side=a.side, window=a.window, max_cam_px=a.max_cam_px,
-                                 off_court_m=a.off_court_m)
+                                 off_court_m=a.off_court_m, one_way_s=a.one_way_s)
     if call is None:
         sys.exit("코트 변환이 없습니다 (" + json.dumps(info, ensure_ascii=False) + ")")
     out = call.as_dict()
@@ -1300,7 +1350,7 @@ def cmd_rejudge(a):
             continue
         side = r.get("side") if r.get("side") in ("left", "right") else a.side
         call, info, _ = _judge(look, v, t, u, vv, spec, side=side, window=a.window, max_cam_px=a.max_cam_px,
-                               off_court_m=a.off_court_m)
+                               off_court_m=a.off_court_m, one_way_s=a.one_way_s)
         is_ft = str(r.get("zone", "")).upper() == "FT"
         for k in _CALL_KEYS + ("court_points", "h_source", "h_gap_s", "h_agree_m", "h_votes", "h_cam_px", "h_reject"):
             r2.pop(k, None)  # 예전 판정 값이 남지 않게 (좌표 없음이면 빈칸)
@@ -1803,6 +1853,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--window", type=float, default=8.0, help="그 프레임 좌표가 없을 때 앞뒤 몇 초 안의 정상 화면에서 이어 올지")
     q.add_argument("--max-cam-px", type=float, default=0.0, help="rejudge 와 같음 (0 = 끔)")
     q.add_argument("--off-court-m", type=float, default=1.0, help="rejudge 와 같음")
+    q.add_argument("--one-way-s", type=float, default=3.0, help="rejudge 와 같음")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--no-graphics-mask", action="store_true")
@@ -1830,6 +1881,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--max-cam-px", type=float, default=0.0,
                    help="캘리브레이션 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나지 않는 H 는 버리고 다음 출처로 (0 = 끔, 기본)")
     q.add_argument("--off-court-m", type=float, default=1.0, help="발 자리가 코트 밖으로 이 m 넘게 나가면 그 H 는 버림")
+    q.add_argument("--one-way-s", type=float, default=3.0,
+                   help="다른 출처가 다 안 될 때, 이 초 안의 한쪽 정상 샘플에서 화면 이동으로 따라온 H 를 키·아크가 슛 화면 흰 선과 맞으면 씀 (0 = 끔)")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--no-graphics-mask", action="store_true")
