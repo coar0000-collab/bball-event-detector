@@ -529,7 +529,7 @@ def run(frame: np.ndarray, H0: np.ndarray, spec: CourtSpec, save, win_max_w: int
         cv2.imshow(title, np.vstack([view, bar]))
         key = cv2.waitKey(20) & 0xFF
         if key in (ord("s"), ord("S")):
-            save(ed.H)
+            save(ed.H, [{"name": st.name, "kind": st.kind, "pts": np.round(st.pts, 1).tolist()} for st in ed.strokes])
             state.update(saved=True, dirty=False, quit_warn=False, msg="saved")
         elif key in (ord("z"), ord("Z")):
             ed.undo()
