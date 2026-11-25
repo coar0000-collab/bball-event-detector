@@ -285,7 +285,7 @@ def cmd_calib_edit(a):
             bak.write_text(out.read_text(encoding="utf-8"), encoding="utf-8")
             print(f"원래 파일 백업: {bak}")
 
-    def save(Hn):
+    def save(Hn, strokes=None):
         lm = C.landmarks(spec)
         names = list(lm)
         uv = HG.project(Hn, [lm[n] for n in names])
@@ -298,6 +298,8 @@ def cmd_calib_edit(a):
         o = dict(d)
         o.update({"spec": spec.name, "t_sec": t, "H_court_to_image": (Hn / Hn[2, 2]).tolist(), "image_points": pts,
                   "edited_with": "calib-edit"})
+        if strokes is not None:
+            o["drawn_lines"] = strokes  # 그은 선 (편집 화면 좌표, 다시 볼 때)
         if lens is not None:
             o["lens"] = lens.as_dict()
         else:
