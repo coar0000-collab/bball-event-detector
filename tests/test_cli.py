@@ -477,3 +477,57 @@ def test_shot_skips_h_that_puts_foot_in_other_half(synthetic, capsys, tmp_path):
     assert rows[6.0]["contradict"] == "1" and float(rows[6.0]["distinct_frac"]) < 0.5
     assert rows[5.5]["contradict"] == rows[6.5]["contradict"] == "0" and float(rows[5.5]["distinct_frac"]) > 0.9
     assert float(rows[6.0]["center_x"]) - float(rows[5.5]["center_x"]) > 10
+
+
+def test_shot_turns_180_twin_h_around(synthetic, capsys, tmp_path):
+    """코트는 180° 돌려도 흰 선이 똑같아서, 반대편 카메라 화면(또는 반대쪽 골대 화면)을 돌려 맞춘 H 도 키·아크까지 흰 선과 다 맞는다.
+    공격 방향(--side)을 알면 발이 반대쪽 코트로 가는 것으로 알아채고, 선이 다 맞으니 코트를 180° 돌린 H 로 판정한다.
+    (실제 B-LAB holdout 383·414·447·529s: 발을 180° 돌리면 넷 다 정답 2/3점)"""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    z = dict(np.load(track))
+    i = int(np.argmin(np.abs(z["times"] - 6.0)))
+    H = z["H"].copy()
+    H[i] = H[i] @ np.array([[-1.0, 0, 28.0], [0, -1.0, 15.0], [0, 0, 1]])  # 180° 쌍둥이
+    z["H"] = H
+    bad = tmp_path / "twin.npz"
+    np.savez(bad, **z)
+    capsys.readouterr()
+    for x, y, pts in ((1.575 + 7.4, 7.5, 3), (1.575 + 4.0, 9.0, 2)):
+        u, v = HG.court_to_image(Hs[60], x, y)
+        cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v),
+                  "--side", "left"])
+        res = json.loads(capsys.readouterr().out)
+        assert res["h_source"] == "track+180" and res["points"] == pts and "180° 돌림" in res["h_reject"], res
+        assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15
+
+
+def test_shot_one_way_when_shot_frame_is_blurry(synthetic, capsys, tmp_path, monkeypatch):
+    """슛 뒤로는 좌표가 없고(놓침) 슛 순간 화면은 흐려 라인 정합이 안 되며 다른 화면들과도 못 맞출 때, 1초 전 정상 샘플에서 화면
+    이동으로 따라온 H 로 그린 키·아크가 슛 화면 흰 선과 맞으면 쓴다 ("one-way"). 이어 온 시간만큼 라인 근처 기준이 넓어진다.
+    (실제 KBA D201 181·529.6·1038.5s: 1~2초 전까지 정상, 슛 직전 팬·줌에서 놓침)"""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    holes = tmp_path / "holes.npz"
+    _punch_holes(track, holes, 5.2, 30.0)
+    real_refine = HG.refine_homography
+    monkeypatch.setattr(HG, "refine_homography",
+                        lambda frame, H, *a, **k: (H, 0.3, (6, 1, 0)) if k.get("return_support") else (H, 0.3))
+    monkeypatch.setattr(cli, "_multi_view", lambda *a, **k: (None, a[9]))
+    x, y = 1.575 + 7.4, 7.5
+    u, v = HG.court_to_image(Hs[62], x, y)
+    capsys.readouterr()
+    cli.main(["shot", "--track", str(holes), "--video", str(video), "--t", "6.2", "--u", str(u), "--v", str(v), "--side", "left"])
+    res = json.loads(capsys.readouterr().out)
+    assert res["h_source"] == "one-way" and res["points"] == 3 and abs(res["h_gap_s"] - 1.2) < 0.01, res
+    assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15
+    assert res["margin_sigma_m"] >= 0.15 * 1.2 - 1e-6
+    # 3초(--one-way-s) 넘게 떨어지면 쓰지 않는다 (여기선 4.7초)
+    _punch_holes(track, holes, 1.9, 30.0)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["shot", "--track", str(holes), "--video", str(video), "--t", "6.2", "--u", str(u), "--v", str(v),
+                  "--side", "left"])
+    assert "none" in str(e.value)
+    monkeypatch.setattr(HG, "refine_homography", real_refine)
