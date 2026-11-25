@@ -466,14 +466,14 @@ def test_camera_pose_and_fit():
 
 
 def test_consensus_rejects_court_the_camera_cannot_see():
-    """라인이 안 보이는 화면에서 기준 화면 둘이 같은 틀린 자리(코트를 5m 옮긴 H)를 가리키면, 흰 선으로는 못 거르지만
-    캘리브레이션 화면의 카메라 자리에서 돌리기·당기기로는 그런 화면이 안 나오므로 받지 않는다.
+    """(max_cam_px 를 켜면) 라인이 안 보이는 화면에서 기준 화면 둘이 같은 틀린 자리(코트를 5m 옮긴 H)를 가리킬 때, 흰 선으로는
+    못 거르지만 캘리브레이션 화면의 카메라 자리에서 돌리기·당기기로는 그런 화면이 안 나오므로 받지 않는다.
     (실제 B-LAB holdout: 비틀린 consensus 에서 이어 온 H 가 슛 4개를 '탑 3점, 라인까지 11~18m' 로 냄)"""
     f0, H0 = make_scene()
     f1, H1 = make_scene(shift=(-60, 10))
     f2, H2 = _plain_scene((-30, 5))
     wrong = np.array([[1, 0, 5.0], [0, 1, 0], [0, 0, 1]])
-    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False, max_cam_px=8.0)  # 기본은 꺼짐 (실제 영상에서 아직 진단용)
     assert len(trk.cams) == 1
     trk.keyframes, trk.anchors = [], []
     for n, (f, H) in enumerate([(f1, H1 @ wrong), (f0, H0 @ wrong)]):

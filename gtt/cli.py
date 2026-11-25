@@ -554,7 +554,7 @@ def cmd_track_court(a):
         overlay[cv2.dilate(lens.invalid_mask().astype(np.uint8), np.ones((9, 9), np.uint8)) > 0] = 0  # 검정 여백 경계는 특징점 아님
     # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
     trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score,
-                          ignore=ignore, max_cam_px=getattr(a, "max_cam_px", 8.0))
+                          ignore=ignore, max_cam_px=getattr(a, "max_cam_px", 0.0))
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
     # 사람이 맞춘 화면은 그 시각의 정답이기도 하다: (시각, H, 회색 화면). 추적 결과에 그 시각으로 그대로 넣고,
     # 그 직후 샘플에서 추적이 놓쳐 있으면 이 화면에서 이어 붙여 다시 잡는다.
@@ -748,7 +748,7 @@ def cmd_track_court(a):
     print(f"저장: {a.out}  (" + (f"슛 앞뒤 창 {len(wins)}개, " if wins else "") + f"프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
           f"앞뒤 정상 화면 사이 메움 {n_bridged}개, 기준 화면 여러 개 일치로 찾음 {n_consensus}개"
           f" (흰 선과 어긋나 버림 {trk.consensus_rejected}개, 카메라 자리와 안 맞아 버림 {trk.camera_rejected}개))")
-    _print_cam_stats(status, cam_px, getattr(a, "max_cam_px", 8.0))
+    _print_cam_stats(status, cam_px, getattr(a, "max_cam_px", 0.0) or 8.0)
 
 
 def _print_cams(cams) -> None:
@@ -901,8 +901,9 @@ def _read_motions(v, look, i0: int, i1: int, keep: set, every: int, mask=None, o
 
 
 def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: float = 0.1, agree_m: float = 0.2,
-                   near_s: float = 0.6, min_score: float = 0.65, max_cam_px: float = 8.0,
-                   off_court_m: float = 1.0) -> tuple[np.ndarray | None, dict]:
+                   near_s: float = 0.6, min_score: float = 0.65, max_cam_px: float = 0.0,
+                   off_court_m: float = 1.0, side: str | None = None,
+                   far_m: float = 1.5) -> tuple[np.ndarray | None, dict]:
     """슛 시각 t 의 코트 변환 (H, 정보). 추적 결과에 그 프레임 좌표가 없으면(coast·lost) 앞뒤 정상 샘플에서 화면 이동으로 이어 온다.
 
     - 그 프레임에 좌표가 있으면 그대로 ("track").
@@ -916,9 +917,10 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
     정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길·여러 화면의 발 자리 차이 m), h_votes,
     h_cam_px(고른 H 가 캘리브레이션 카메라 자리에서 얼마나 흉내 나는가 px), h_reject(버린 출처와 이유).
 
-    어느 출처든 (1) 발 자리가 코트 밖 off_court_m 넘게 나가거나 (2) 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로
-    max_cam_px 안으로 만들 수 없는 H 면 버리고 다음 출처로 간다. (실제 B-LAB holdout: 비틀린 consensus 에서 온 H 가
-    슛 4개를 '탑 3점, 라인까지 11~18m' 로 냈다 — 둘은 우연히 점수만 맞음)"""
+    어느 출처든 (1) 발 자리가 코트 밖 off_court_m 넘게 나가거나 (2) 공격 방향(side)을 알 때 발 자리가 그 림에서 하프라인
+    너머 far_m 보다 멀거나 (3) max_cam_px > 0 이고 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 그 안으로 만들 수
+    없는 H 면 버리고 다음 출처로 간다. (실제 B-LAB holdout: 틀린 H 가 슛 4개를 '탑 3점, 라인까지 11~18m' 로 냈다 —
+    발이 반대쪽 골대 근처로 옮겨진 것, 둘은 우연히 점수만 맞음. 하프라인 너머 버저비터는 좌표 없음 → 사람 판정)"""
     info = {"h_source": "none", "h_gap_s": "", "h_agree_m": "", "h_votes": "", "h_cam_px": "", "h_reject": ""}
     if look.track is None:
         info["h_source"] = "calib"
@@ -946,6 +948,11 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
             x, y = HG.image_to_court(Hx, *uv)
             if not (-off_court_m <= x <= spec.length + off_court_m and -off_court_m <= y <= spec.width + off_court_m):
                 why = f"코트밖({x:.1f},{y:.1f})"
+            elif side in ("left", "right"):
+                rx, ry = spec.rim(side)
+                d = float(np.hypot(x - rx, y - ry))
+                if d > spec.length / 2 - spec.rim_from_baseline + far_m:
+                    why = f"반대쪽코트(공격 림까지 {d:.1f}m)"
         r = look.cam_px(Hx, spec, shape) if max_cam_px > 0 else float("nan")
         if why is None and np.isfinite(r) and r > max_cam_px:
             why = f"카메라{r:.0f}px"
@@ -1110,13 +1117,13 @@ def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, match
     return Hm, info
 
 
-def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0, max_cam_px: float = 8.0,
+def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0, max_cam_px: float = 0.0,
            off_court_m: float = 1.0):
     """원본 화면 발 위치 하나를 판정 (shot·rejudge 공용). 반환: (ShotCall 또는 None, H 정보, 편 화면 좌표)."""
     u, vv = look.to_canvas(u_raw, v_raw)
     if v is not None:
         H, info = _court_at_shot(look, v, t, spec, uv=(u, vv), window=window, max_cam_px=max_cam_px,
-                                 off_court_m=off_court_m)
+                                 off_court_m=off_court_m, side=side)
     else:
         H = look.at(t)
         info = {"h_source": "track" if H is not None else "none", "h_gap_s": "", "h_agree_m": "", "h_votes": ""}
@@ -1222,7 +1229,8 @@ def cmd_shot(a):
     v = Video(a.video) if a.video else None
     look = _lookup(a, v)
     t = a.t or 0.0
-    call, info, (u, vv) = _judge(look, v, t, a.u, a.v, spec, side=a.side, window=a.window)
+    call, info, (u, vv) = _judge(look, v, t, a.u, a.v, spec, side=a.side, window=a.window, max_cam_px=a.max_cam_px,
+                                 off_court_m=a.off_court_m)
     if call is None:
         sys.exit("코트 변환이 없습니다 (" + json.dumps(info, ensure_ascii=False) + ")")
     out = call.as_dict()
@@ -1628,8 +1636,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="슛 CSV(t_sec). 주면 경기 전체 대신 슛마다 앞 --before 초 ~ 뒤 --after 초만 추적해 npz 하나로 합침")
     q.add_argument("--before", type=float, default=20.0, help="--around: 슛 앞 몇 초부터 추적")
     q.add_argument("--after", type=float, default=5.0, help="--around: 슛 뒤 몇 초까지 추적")
-    q.add_argument("--max-cam-px", type=float, default=8.0,
-                   help="consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나야 함 (0 = 끔)")
+    q.add_argument("--max-cam-px", type=float, default=0.0,
+                   help="consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나야 함 "
+                        "(0 = 끔, 기본. 실제 영상에서 맞는 H 도 10~28px 이라 아직 진단용)")
     q.add_argument("--no-consensus", dest="consensus", action="store_false",
                    help="라인으로 확인 못 한 화면을 '서로 다른 시각의 기준 화면 둘 이상이 같은 자리' 로 받지 않음 (비교용)")
     q.add_argument("--graphics-box", action="append", default=None,
@@ -1677,6 +1686,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--side", choices=["left", "right"], default=None, help="공격 방향 림. 모르면 가까운 림")
     q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--window", type=float, default=8.0, help="그 프레임 좌표가 없을 때 앞뒤 몇 초 안의 정상 화면에서 이어 올지")
+    q.add_argument("--max-cam-px", type=float, default=0.0, help="rejudge 와 같음 (0 = 끔)")
+    q.add_argument("--off-court-m", type=float, default=1.0, help="rejudge 와 같음")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--no-graphics-mask", action="store_true")
@@ -1701,8 +1712,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--side", choices=["left", "right"], default=None, help="CSV 에 side 가 없을 때 공격 방향 림")
     q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--window", type=float, default=8.0)
-    q.add_argument("--max-cam-px", type=float, default=8.0,
-                   help="캘리브레이션 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나지 않는 H 는 버리고 다음 출처로 (0 = 끔)")
+    q.add_argument("--max-cam-px", type=float, default=0.0,
+                   help="캘리브레이션 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나지 않는 H 는 버리고 다음 출처로 (0 = 끔, 기본)")
     q.add_argument("--off-court-m", type=float, default=1.0, help="발 자리가 코트 밖으로 이 m 넘게 나가면 그 H 는 버림")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
