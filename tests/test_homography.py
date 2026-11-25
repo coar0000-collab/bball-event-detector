@@ -375,3 +375,23 @@ def test_consensus_when_lines_not_visible():
     trk2._add_keyframe(cv2_gray(f1), np.array([[1, 0, 45.0], [0, 1, 0], [0, 0, 1]]) @ H1)
     trk2.relocalize(f2)
     assert trk2.consensus(f2.shape) is None
+
+
+def test_consensus_rejects_when_visible_lines_disagree():
+    """기준 화면 둘이 같은 틀린 자리를 가리켜도(둘 다 같은 틀린 H 로 저장됨), 화면에 흰 선이 보이는데 그 선과 크게 어긋나면
+    consensus 로 받지 않는다 (실제 B-LAB holdout 528·529s: 코트가 비틀린 H 를 받아 레이업을 3점으로 판정)."""
+    f0, H0 = make_scene()
+    f1, H1 = make_scene(shift=(-60, 10))
+    f3, H3 = make_scene(shift=(-30, 5))
+    wrong = np.array([[0.9, 0.0, 1.8], [0.0, 0.88, 1.2], [0, 0, 1]])  # 코트 좌표에서 줄이고 옮긴 틀린 대응 (두 화면 모두 같게)
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    trk.keyframes, trk.anchors = [], []
+    for n, (f, H) in enumerate([(f1, H1 @ wrong), (f0, H0 @ wrong)]):
+        trk.n = 20 * (n + 1)
+        trk._add_keyframe(cv2_gray(f), H)
+    trk.relocalize(f3)
+    assert trk.consensus(f3.shape) is not None  # 선을 안 보면 둘이 같은 자리라 받아 버린다
+    assert trk.consensus(f3.shape, frame=f3) is None and trk.consensus_rejected == 1
+    assert not HG.lines_contradict(f3, H3, FIBA)  # 맞는 H 는 통과
+    f2, _ = _plain_scene((-30, 5))
+    assert not HG.lines_contradict(f2, H3, FIBA)  # 흰 선이 없는 화면은 판단하지 않음

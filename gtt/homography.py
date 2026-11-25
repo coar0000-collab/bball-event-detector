@@ -763,6 +763,7 @@ class CourtTracker:
             self.static.update(self.prev)
         self.keyframes: list[tuple] = []  # (keypoints, descriptors, H, 저장한 샘플 번호)
         self.anchors: list[tuple] = []  # 사람이 맞춘 캘리브레이션 화면들 — 지워지지 않는 키프레임 (번호는 음수)
+        self.consensus_rejected = 0  # 흰 선과 어긋나 받지 않은 consensus 수
         self.last_found: list[tuple] = []  # 마지막 relocalize 에서 특징점으로 옮겨 온 후보들 (맞은 점, H, 앵커인가, 번호)
         self._court_pts = np.concatenate([densify(p, 0.5) for p in court_polylines(spec).values()])
         self.add_anchor(frame0, H0)
@@ -934,7 +935,7 @@ class CourtTracker:
         return H, score
 
     def consensus(self, shape, min_inliers: int = 80, agree_px: float = 4.0, min_sep: int = 10,
-                  min_votes: int = 2) -> np.ndarray | None:
+                  min_votes: int = 2, frame: np.ndarray | None = None) -> np.ndarray | None:
         """마지막 relocalize 의 후보 중, 서로 다른 시각(min_sep 샘플 이상 떨어진)의 기준 화면 min_votes 개 이상이 특징점만으로
         옮겨 온 H 가 화면에서 agree_px 안으로 같으면 그 평균 H. 아니면 None.
 
@@ -958,7 +959,13 @@ class CourtTracker:
         w = np.array([g[0] for g in grp], float)
         H = sum(wi * g[1] for wi, g in zip(w, grp)) / w.sum()
         H = H / H[2, 2]
-        return H if self.sane(H, shape) else None
+        if not self.sane(H, shape):
+            return None
+        if frame is not None and lines_contradict(frame, H, self.spec, self.ignore):
+            # 기준 화면 여럿이 같은 자리를 가리켜도, 화면에 보이는 흰 선과 크게 어긋나면 받지 않는다
+            self.consensus_rejected += 1
+            return None
+        return H
 
     def supported(self, sup: tuple) -> bool:
         """보이는 코트 라인 줄 대부분이 실제 선과 겹치고, 맞은 줄의 방향이 엇갈리는가 (line_support 결과)."""
@@ -980,6 +987,34 @@ class CourtTracker:
         self.prev = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.lost = False
         self.coast_n = 0
+
+
+def lines_contradict(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
+                     min_density: float = 0.004, tol: float = 8.0, good: float = 0.3, frac: float = 0.25) -> bool:
+    """H 로 그린 코트 라인이 화면에 실제로 있는 흰 선과 크게 어긋나는가.
+
+    라인이 안 보이는 화면(코트 안에 흰 선 픽셀이 거의 없음)은 판단할 근거가 없으므로 False. 코트 안에 흰 선이 충분히
+    있는데 보이는 줄 대부분(frac 미만만 맞음)이 tol px 안의 흰 선과 겹치지 않으면 True.
+    (실제 B-LAB holdout 528·529·382.6s: 기준 화면 두 장이 같은 틀린 자리로 옮겨져 consensus 가 코트가 비틀린 H 를 받았다)"""
+    h, w = frame.shape[:2]
+    if H is None or not np.all(np.isfinite(H)):
+        return True
+    L, W = spec.length, spec.width
+    poly = project(H, [(0.0, 0.0), (L, 0.0), (L, W), (0.0, W)])
+    if not np.all(np.isfinite(poly)):
+        return True
+    region = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(region, [np.clip(np.round(poly), -1e5, 1e5).astype(np.int32)], 1)
+    mask = line_mask(frame)
+    if ignore is not None and ignore.shape == mask.shape:
+        mask[ignore.astype(bool)] = 0
+        region[ignore.astype(bool)] = 0
+    inside = region > 0
+    if inside.sum() < 0.02 * h * w or float(np.mean(mask[inside] > 0)) < min_density:
+        return False
+    dist = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
+    n_vis, n_good, _ = line_support(dist, H, spec, tol=tol, good=good, ignore=ignore)
+    return n_vis >= 2 and n_good < max(1, int(np.ceil(frac * n_vis)))
 
 
 def support_ok(sup: tuple, min_good_lines: int = 2, min_line_frac: float = 0.6) -> bool:
