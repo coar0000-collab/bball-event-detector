@@ -484,3 +484,22 @@ def test_consensus_rejects_court_the_camera_cannot_see():
     trk.max_cam_px = 0  # 끄면 받아 버린다 (흰 선이 안 보여 lines_contradict 로는 못 거름)
     Hc = trk.consensus(f2.shape, frame=f2)
     assert Hc is not None and HG.h_distance(Hc, H2 @ wrong, f2.shape) < 1.0
+
+
+def test_consensus_rejects_other_basket_mixup():
+    """흰 선이 보이는 화면에서 기준 화면 둘이 같은 자리를 가리키지만 그 H 가 코트를 길이 방향으로 14m 옮긴 것(왼쪽 골대 화면을
+    오른쪽으로 착각)이면 받지 않는다. 사이드라인·하프라인↔베이스라인은 그래도 겹쳐 줄 60% 가 맞지만 키·아크가 제자리에 없다.
+    (실제 B-LAB holdout 383·414·447·529s: consensus 가 발을 반대쪽 코트로 옮김)"""
+    f0, H0 = make_scene()
+    f1, H1 = make_scene(shift=(-60, 10))
+    f3, H3 = make_scene(shift=(-30, 5))
+    wrong = np.array([[1, 0, -14.0], [0, 1, 0], [0, 0, 1]])
+    assert not HG.lines_contradict(f3, H3 @ wrong, FIBA, frac_distinct=0.0)  # 줄 비율만 보면 통과해 버린다
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    trk.keyframes, trk.anchors = [], []
+    for n, (f, H) in enumerate([(f1, H1 @ wrong), (f0, H0 @ wrong)]):
+        trk.n = 20 * (n + 1)
+        trk._add_keyframe(cv2_gray(f), H)
+    trk.relocalize(f3)
+    assert trk.consensus(f3.shape) is not None
+    assert trk.consensus(f3.shape, frame=f3) is None and trk.consensus_rejected == 1

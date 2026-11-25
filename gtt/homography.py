@@ -551,6 +551,22 @@ def view_aspect(H: np.ndarray, shape) -> float:
     return float(sv[1] / sv[0]) if sv[0] > 0 else 0.0
 
 
+_DISTINCT = ("key", "ft", "arc", "corner")  # 코트에서 자리가 하나뿐인 줄 (사이드라인·베이스라인·하프라인은 옮겨도 겹치기 쉬움)
+
+
+def _element_hits(dist: np.ndarray, H: np.ndarray, spec: CourtSpec, tol: float, min_pts: int, good: float,
+                  ignore: np.ndarray | None):
+    """화면에 보이는 코트 라인 줄마다 (이름, 투영 점, 보이는 점 표시, tol px 안 good 비율 이상 겹쳤나)."""
+    h, w = dist.shape
+    for name, pts in _line_elements(spec):
+        uv = project(H, pts)
+        ok = _visible(uv, w, h, ignore, border=5)
+        if ok.sum() < min_pts:
+            continue
+        ui = np.round(uv[ok]).astype(int)
+        yield name, uv, ok, float(np.mean(dist[ui[:, 1], ui[:, 0]] <= tol)) >= good
+
+
 def line_support(dist: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, tol: float = 4.0,
                  min_pts: int = 10, good: float = 0.4, cross_deg: float = 20.0,
                  ignore: np.ndarray | None = None) -> tuple[int, int, int]:
@@ -561,18 +577,12 @@ def line_support(dist: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, tol: f
     실제 중계에서 맞은 줄이 거의 평행한 먼쪽 가로선들뿐이면 일치율 0.8·줄 9/9 여도 틀렸다(선 방향으로 미끄러져도
     겹침은 그대로라 위치가 정해지지 않는다). 코트 전체가 흰 선 하나로 찌그러진 H 도 모든 줄이 같은 선 위에 겹친다.
     그래서 맞은 줄 중 화면에서 cross_deg 이상 방향이 다른 두 줄(또는 휘어 보이는 아크)이 있어야 엇갈림=1."""
-    h, w = dist.shape
     n_vis = n_good = 0
     dirs = []
     curved = False
-    for _, pts in _line_elements(spec):
-        uv = project(H, pts)
-        ok = _visible(uv, w, h, ignore, border=5)
-        if ok.sum() < min_pts:
-            continue
+    for _, uv, ok, hit in _element_hits(dist, H, spec, tol, min_pts, good, ignore):
         n_vis += 1
-        ui = np.round(uv[ok]).astype(int)
-        if float(np.mean(dist[ui[:, 1], ui[:, 0]] <= tol)) >= good:
+        if hit:
             n_good += 1
             q = uv[ok] - uv[ok].mean(axis=0)
             _, sv, vt = np.linalg.svd(q, full_matrices=False)
@@ -846,7 +856,8 @@ class CourtTracker:
                  min_score: float = 0.65, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None,
                  keyframe_score: float = 0.7, max_jump_px: float = 15.0, weak_inliers: int = 100,
                  min_good_lines: int = 2, min_line_frac: float = 0.6, min_area_frac: float = 0.1,
-                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None, max_cam_px: float = 0.0):
+                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None, max_cam_px: float = 0.0,
+                 consensus_line_frac: float = 0.25):
         """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
         0.36~0.47, 키가 옆으로 밀린 틀린 화면이 0.55~0.60, 맞은 화면은 0.71 이상이었으므로 0.65.
         keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
@@ -862,7 +873,9 @@ class CourtTracker:
         ignore: 라인 정합에서 뺄 자리(방송 그래픽, 렌즈 휨을 편 화면의 검정 여백) = True (graphics_mask).
         max_cam_px: consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리(camera_pose)에서 돌리기·당기기만으로 이 px 안으로
         흉내 낼 수 있어야 한다 (camera_fit_px). 0 이면 끔(기본). 실제 영상에서는 맞는 H 도 카메라 차이가 중앙 10px·90% 28px
-        (B-LAB), 캘리브레이션 화면 자체가 6~18px 이라 아직 거르는 기준으로 못 쓴다 — 진단(cam-check)용."""
+        (B-LAB), 캘리브레이션 화면 자체가 6~18px 이라 아직 거르는 기준으로 못 쓴다 — 진단(cam-check)용.
+        consensus_line_frac: 코트 안에 흰 선이 보이는데 consensus H 로 그린 줄 가운데 이 비율 미만만 흰 선과 겹치면 버린다
+        (lines_contradict frac)."""
         self.spec = spec
         self.ignore = ignore
         self.H = H0.copy()
@@ -897,6 +910,7 @@ class CourtTracker:
         self.consensus_rejected = 0  # 흰 선과 어긋나 받지 않은 consensus 수
         self.camera_rejected = 0  # 카메라 자리와 안 맞아 받지 않은 consensus 수
         self.max_cam_px = max_cam_px
+        self.consensus_line_frac = consensus_line_frac
         self.cams: list[np.ndarray] = []  # 캘리브레이션 화면들에서 푼 카메라 자리 (코트 좌표 m)
         self.last_found: list[tuple] = []  # 마지막 relocalize 에서 특징점으로 옮겨 온 후보들 (맞은 점, H, 앵커인가, 번호)
         self._court_pts = np.concatenate([densify(p, 0.5) for p in court_polylines(spec).values()])
@@ -1103,7 +1117,7 @@ class CourtTracker:
             # 기준 화면 여럿이 같은 자리를 가리켜도, 중계 카메라 자리에서 돌리기·당기기로 만들 수 없는 화면이면 받지 않는다
             self.camera_rejected += 1
             return None
-        if frame is not None and lines_contradict(frame, H, self.spec, self.ignore):
+        if frame is not None and lines_contradict(frame, H, self.spec, self.ignore, frac=self.consensus_line_frac):
             # 기준 화면 여럿이 같은 자리를 가리켜도, 화면에 보이는 흰 선과 크게 어긋나면 받지 않는다
             self.consensus_rejected += 1
             return None
@@ -1140,20 +1154,28 @@ class CourtTracker:
         self.coast_n = 0
 
 
-def lines_contradict(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
-                     min_density: float = 0.004, tol: float = 8.0, good: float = 0.3, frac: float = 0.25) -> bool:
-    """H 로 그린 코트 라인이 화면에 실제로 있는 흰 선과 크게 어긋나는가.
+def line_evidence(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
+                  tol: float = 8.0, good: float = 0.3) -> dict:
+    """H 로 그린 코트 라인이 화면의 흰 선과 얼마나 맞는가 (consensus 검사·진단용).
 
-    라인이 안 보이는 화면(코트 안에 흰 선 픽셀이 거의 없음)은 판단할 근거가 없으므로 False. 코트 안에 흰 선이 충분히
-    있는데 보이는 줄 대부분(frac 미만만 맞음)이 tol px 안의 흰 선과 겹치지 않으면 True.
-    (실제 B-LAB holdout 528·529·382.6s: 기준 화면 두 장이 같은 틀린 자리로 옮겨져 consensus 가 코트가 비틀린 H 를 받았다)"""
+    density: 화면 안 코트 안쪽에서 흰 선 픽셀 비율, area: 코트가 화면에서 차지하는 비율, n_vis/n_good/cross: line_support
+    (tol px 안 good 비율 이상 겹친 줄), n_vis_d/n_good_d: 그중 자리가 하나뿐인 줄(키·자유투 라인·아크·코너 직선)만,
+    center_x: 화면 가운데가 보는 코트 x (m, 하프라인 = length/2; 카메라 뒤면 nan)."""
     h, w = frame.shape[:2]
+    out = {"density": 0.0, "area": 0.0, "n_vis": 0, "n_good": 0, "cross": 0, "center_x": float("nan"),
+           "n_vis_d": 0, "n_good_d": 0}
     if H is None or not np.all(np.isfinite(H)):
-        return True
+        return out
+    try:
+        c = np.linalg.solve(H, np.array([w / 2.0, h / 2.0, 1.0]))
+        if abs(c[2]) > 1e-12 and (H @ np.array([c[0] / c[2], c[1] / c[2], 1.0]))[2] * (H @ np.array([spec.length / 2, spec.width / 2, 1.0]))[2] > 0:
+            out["center_x"] = float(c[0] / c[2])
+    except np.linalg.LinAlgError:
+        pass
     L, W = spec.length, spec.width
     poly = project(H, [(0.0, 0.0), (L, 0.0), (L, W), (0.0, W)])
     if not np.all(np.isfinite(poly)):
-        return True
+        return out
     region = np.zeros((h, w), np.uint8)
     cv2.fillPoly(region, [np.clip(np.round(poly), -1e5, 1e5).astype(np.int32)], 1)
     mask = line_mask(frame)
@@ -1161,11 +1183,37 @@ def lines_contradict(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, i
         mask[ignore.astype(bool)] = 0
         region[ignore.astype(bool)] = 0
     inside = region > 0
-    if inside.sum() < 0.02 * h * w or float(np.mean(mask[inside] > 0)) < min_density:
-        return False
+    out["area"] = float(inside.mean())
+    if inside.any():
+        out["density"] = float(np.mean(mask[inside] > 0))
     dist = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
-    n_vis, n_good, _ = line_support(dist, H, spec, tol=tol, good=good, ignore=ignore)
-    return n_vis >= 2 and n_good < max(1, int(np.ceil(frac * n_vis)))
+    out["n_vis"], out["n_good"], out["cross"] = line_support(dist, H, spec, tol=tol, good=good, ignore=ignore)
+    for name, _, _, hit in _element_hits(dist, H, spec, tol, 10, good, ignore):
+        if any(k in name for k in _DISTINCT):
+            out["n_vis_d"] += 1
+            out["n_good_d"] += int(hit)
+    return out
+
+
+def lines_contradict(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
+                     min_density: float = 0.004, tol: float = 8.0, good: float = 0.3, frac: float = 0.25,
+                     frac_distinct: float = 0.5) -> bool:
+    """H 로 그린 코트 라인이 화면에 실제로 있는 흰 선과 크게 어긋나는가.
+
+    라인이 안 보이는 화면(코트 안에 흰 선 픽셀이 거의 없음)은 판단할 근거가 없으므로 False. 코트 안에 흰 선이 충분히
+    있는데 보이는 줄 가운데 frac 미만만 tol px 안의 흰 선과 겹치거나, 자리가 하나뿐인 줄(키·자유투 라인·아크·코너 직선)이
+    둘 이상 보여야 하는데 그중 frac_distinct 미만만 겹치면 True.
+    사이드라인은 코트 길이 방향으로 옮겨도 그대로 겹치고 하프라인·베이스라인도 서로 겹칠 수 있어, 왼쪽 골대 화면을 오른쪽
+    골대로 착각한 H 도 줄 60% 가 '맞음' 이었다 — 그래서 키·아크가 제자리에 있는지를 따로 본다.
+    (실제 B-LAB holdout 383·414·447·529s: 기준 화면 두 장이 같은 틀린 자리로 옮겨져 consensus 가 발을 반대쪽 코트로 옮겼다)"""
+    if H is None or not np.all(np.isfinite(H)):
+        return True
+    e = line_evidence(frame, H, spec, ignore, tol=tol, good=good)
+    if e["area"] < 0.02 or e["density"] < min_density:
+        return False
+    if e["n_vis"] >= 2 and e["n_good"] < max(1, int(np.ceil(frac * e["n_vis"]))):
+        return True
+    return e["n_vis_d"] >= 2 and e["n_good_d"] < max(1, int(np.ceil(frac_distinct * e["n_vis_d"])))
 
 
 def support_ok(sup: tuple, min_good_lines: int = 2, min_line_frac: float = 0.6) -> bool:

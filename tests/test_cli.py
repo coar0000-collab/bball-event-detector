@@ -467,3 +467,13 @@ def test_shot_skips_h_that_puts_foot_in_other_half(synthetic, capsys, tmp_path):
     cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v)])
     res = json.loads(capsys.readouterr().out)
     assert res["h_source"] == "track" and res["side"] == "right" and res["points"] == 2  # 방향을 모르면 못 거름
+    # 진단: 그 샘플만 흰 선과 어긋난다. 사이드라인·하프라인↔베이스라인은 옮겨도 겹쳐 줄 60% 가 '맞음' 이지만, 키·아크처럼
+    # 자리가 하나뿐인 줄은 1/3 만 맞는다 → consensus 였다면 버림 (화면 가운데가 보는 코트 x 도 14m 옮겨짐)
+    out_csv = tmp_path / "lines.csv"
+    cli.main(["line-check", "--track", str(bad), "--video", str(video), "--status", "", "--start", "5.4", "--end", "6.6",
+              "--out", str(out_csv)])
+    with open(out_csv, encoding="utf-8-sig") as f:
+        rows = {round(float(r["t_sec"]), 1): r for r in csv.DictReader(f)}
+    assert rows[6.0]["contradict"] == "1" and float(rows[6.0]["distinct_frac"]) < 0.5
+    assert rows[5.5]["contradict"] == rows[6.5]["contradict"] == "0" and float(rows[5.5]["distinct_frac"]) > 0.9
+    assert float(rows[6.0]["center_x"]) - float(rows[5.5]["center_x"]) > 10
