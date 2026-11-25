@@ -554,7 +554,7 @@ def cmd_track_court(a):
         overlay[cv2.dilate(lens.invalid_mask().astype(np.uint8), np.ones((9, 9), np.uint8)) > 0] = 0  # 검정 여백 경계는 특징점 아님
     # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
     trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score,
-                          ignore=ignore)
+                          ignore=ignore, max_cam_px=getattr(a, "max_cam_px", 8.0))
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
     # 사람이 맞춘 화면은 그 시각의 정답이기도 하다: (시각, H, 회색 화면). 추적 결과에 그 시각으로 그대로 넣고,
     # 그 직후 샘플에서 추적이 놓쳐 있으면 이 화면에서 이어 붙여 다시 잡는다.
@@ -580,6 +580,7 @@ def cmd_track_court(a):
     for tc, _, _ in cal_list:
         print(f"캘리브레이션 {fmt_time(tc)} ({tc:.2f}s) → 그 시각 좌표로 넣음", file=sys.stderr)
     print(f"기준 화면(캘리브레이션) {len(trk.anchors)}개", file=sys.stderr)
+    _print_cams(trk.cams)
 
     def strong(Hr, sc):
         return Hr is not None and trk.last_inliers >= 80 and sc >= trk.min_score
@@ -735,13 +736,38 @@ def cmd_track_court(a):
         extra["ignore"] = np.packbits(ignore.astype(bool))
         extra["ignore_shape"] = np.array(ignore.shape)
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    # 샘플마다 '캘리브레이션 카메라 자리에서 돌리기·당기기로 흉내 낸 차이(px)' — 큰 값은 비틀린 H (진단·판정에서 거름)
+    cam_px = np.array([trk.camera_px(H, frame0.shape) if np.all(np.isfinite(H)) else np.nan for H in Hs])
+    if trk.cams:
+        extra["cam_C"] = np.stack(trk.cams)
     np.savez_compressed(a.out, times=np.array(times), H=np.stack(Hs), H_pred=np.stack(preds), line_score=np.array(scores),
                         status=np.array(status),
-                        support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name, **extra)
+                        support=np.array(support, dtype=int).reshape(-1, 3), spec=spec.name, cam_px=cam_px,
+                        frame_shape=np.array(frame0.shape[:2]), **extra)
     ok = sum(s in _GOOD for s in status)
     print(f"저장: {a.out}  (" + (f"슛 앞뒤 창 {len(wins)}개, " if wins else "") + f"프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
           f"앞뒤 정상 화면 사이 메움 {n_bridged}개, 기준 화면 여러 개 일치로 찾음 {n_consensus}개"
-          f" (흰 선과 어긋나 버림 {trk.consensus_rejected}개))")
+          f" (흰 선과 어긋나 버림 {trk.consensus_rejected}개, 카메라 자리와 안 맞아 버림 {trk.camera_rejected}개))")
+    _print_cam_stats(status, cam_px, getattr(a, "max_cam_px", 8.0))
+
+
+def _print_cams(cams) -> None:
+    """캘리브레이션 화면들에서 푼 카메라 자리. 같은 중계 카메라면 서로 1~2m 안이어야 한다 (멀면 캘리브레이션 하나가 틀렸거나 다른 카메라)."""
+    for k, C in enumerate(cams):
+        print(f"카메라 자리 (캘리브레이션 {k + 1}): x={C[0]:.1f} y={C[1]:.1f} 높이={C[2]:.1f} m", file=sys.stderr)
+    for i in range(len(cams)):
+        for j in range(i + 1, len(cams)):
+            print(f"  캘리브레이션 {i + 1}↔{j + 1} 카메라 자리 차이 {np.linalg.norm(cams[i] - cams[j]):.2f} m", file=sys.stderr)
+
+
+def _print_cam_stats(status, cam_px, max_px: float) -> None:
+    st = np.array(status).astype(str)
+    cam_px = np.asarray(cam_px, float)
+    for s_ in sorted(set(st)):
+        r = cam_px[(st == s_) & np.isfinite(cam_px)]
+        if len(r):
+            print(f"  {s_}: 카메라 차이 중앙 {np.median(r):.1f}px, 90% {np.percentile(r, 90):.1f}px, "
+                  f"{max_px:g}px 넘음 {int((r > max_px).sum())}/{len(r)}", file=sys.stderr)
 
 
 class _CourtLookup:
@@ -811,6 +837,37 @@ class _CourtLookup:
     def at(self, t: float, tol: float = 0.6) -> np.ndarray | None:
         return self.nearest(t, tol)[0]
 
+    def shape(self, v) -> tuple[int, int]:
+        """H 가 쓰는 화면 크기 (높이, 폭): 렌즈 휨 보정이면 편 화면(canvas)."""
+        if self.track is not None and "frame_shape" in self.track.files:
+            return tuple(int(x) for x in self.track["frame_shape"])
+        if self.lens is not None:
+            w, h = self.lens.canvas_size
+            return int(h), int(w)
+        return int(v.height), int(v.width)
+
+    def cams(self, spec, shape) -> list:
+        """캘리브레이션 화면들의 카메라 자리 (추적 때 저장한 것, 없으면 추적 결과의 calib 샘플에서 푼다)."""
+        if not hasattr(self, "_cams"):
+            self._cams = []
+            if self.track is not None:
+                if "cam_C" in self.track.files:
+                    self._cams = [np.asarray(c, float) for c in self.track["cam_C"]]
+                else:
+                    st = self.track["status"].astype(str)
+                    for H in self.track["H"][st == "calib"]:
+                        p = HG.camera_pose(H, shape, spec)
+                        if p is not None and not any(np.linalg.norm(p[2] - c) < 0.05 for c in self._cams):
+                            self._cams.append(p[2])
+        return self._cams
+
+    def cam_px(self, H, spec, shape) -> float:
+        cams = self.cams(spec, shape)
+        if H is None or not cams:
+            return float("nan")
+        rs = [r for r in (HG.camera_fit_px(H, shape, C, spec) for C in cams) if not np.isnan(r)]
+        return float(min(rs)) if rs else float("nan")
+
 
 _GOOD = ("ok", "recovered", "calib", "bridged", "consensus")
 _CALL_KEYS = ("points", "zone", "zone_kr", "side", "hand_side", "dist_to_rim_m", "margin_m", "near_line", "court_x", "court_y",
@@ -844,7 +901,8 @@ def _read_motions(v, look, i0: int, i1: int, keep: set, every: int, mask=None, o
 
 
 def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: float = 0.1, agree_m: float = 0.2,
-                   near_s: float = 0.6, min_score: float = 0.65) -> tuple[np.ndarray | None, dict]:
+                   near_s: float = 0.6, min_score: float = 0.65, max_cam_px: float = 8.0,
+                   off_court_m: float = 1.0) -> tuple[np.ndarray | None, dict]:
     """슛 시각 t 의 코트 변환 (H, 정보). 추적 결과에 그 프레임 좌표가 없으면(coast·lost) 앞뒤 정상 샘플에서 화면 이동으로 이어 온다.
 
     - 그 프레임에 좌표가 있으면 그대로 ("track").
@@ -855,31 +913,73 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
       다시 맞춰 추적과 같은 기준(일치율 min_score, 보이는 줄 대부분 맞고 방향 엇갈림)을 통과할 때만 ("verified").
     - 그래도 안 되면 앞뒤 2분 안의 정상 화면들과 직접 맞춰 여러 장이 같은 답을 낼 때만 ("multi-view", _multi_view).
     - 아니면 None.
-    정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길·여러 화면의 발 자리 차이 m), h_votes."""
-    info = {"h_source": "none", "h_gap_s": "", "h_agree_m": "", "h_votes": ""}
+    정보: h_source, h_gap_s(가장 가까운 정상 샘플까지 초), h_agree_m(두 길·여러 화면의 발 자리 차이 m), h_votes,
+    h_cam_px(고른 H 가 캘리브레이션 카메라 자리에서 얼마나 흉내 나는가 px), h_reject(버린 출처와 이유).
+
+    어느 출처든 (1) 발 자리가 코트 밖 off_court_m 넘게 나가거나 (2) 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로
+    max_cam_px 안으로 만들 수 없는 H 면 버리고 다음 출처로 간다. (실제 B-LAB holdout: 비틀린 consensus 에서 온 H 가
+    슛 4개를 '탑 3점, 라인까지 11~18m' 로 냈다 — 둘은 우연히 점수만 맞음)"""
+    info = {"h_source": "none", "h_gap_s": "", "h_agree_m": "", "h_votes": "", "h_cam_px": "", "h_reject": ""}
     if look.track is None:
         info["h_source"] = "calib"
         return look.fixed, info
     times, Hs, st = look.track["times"], look.track["H"], look.track["status"]
     fin = np.all(np.isfinite(Hs.reshape(len(Hs), -1)), axis=1)
     good = fin & np.isin(st.astype(str), _GOOD)
+    shape = look.shape(v)
+    saved = look.track["cam_px"] if "cam_px" in look.track.files and "cam_C" in look.track.files else None
+    rejects: list[str] = []
+    cache: dict[int, bool] = {}
+
+    def sample_ok(i: int) -> bool:
+        """추적 샘플 i 의 H 가 카메라 자리와 맞는가 (모르면 통과)."""
+        if max_cam_px <= 0:
+            return True
+        if i not in cache:
+            r = float(saved[i]) if saved is not None else look.cam_px(Hs[i], spec, shape)
+            cache[i] = not (np.isfinite(r) and r > max_cam_px)
+        return cache[i]
+
+    def accept(src: str, Hx) -> bool:
+        why = None
+        if uv is not None:
+            x, y = HG.image_to_court(Hx, *uv)
+            if not (-off_court_m <= x <= spec.length + off_court_m and -off_court_m <= y <= spec.width + off_court_m):
+                why = f"코트밖({x:.1f},{y:.1f})"
+        r = look.cam_px(Hx, spec, shape) if max_cam_px > 0 else float("nan")
+        if why is None and np.isfinite(r) and r > max_cam_px:
+            why = f"카메라{r:.0f}px"
+        if why is not None:
+            rejects.append(f"{src}:{why}")
+            info["h_reject"] = "; ".join(rejects)
+            return False
+        info["h_cam_px"] = round(r, 1) if np.isfinite(r) else ""
+        return True
+
     half = 0.5 / (v.fps or 30.0)
     exact = np.flatnonzero(fin & (np.abs(times - t) <= half))
     if len(exact):
         i = int(exact[np.argmin(np.abs(times[exact] - t))])
-        info.update(h_source="track", h_gap_s=0.0)
-        return Hs[i], info
+        if accept("track", Hs[i]):
+            info.update(h_source="track", h_gap_s=0.0)
+            return Hs[i], info
     before = np.flatnonzero(good & (times < t) & (times >= t - window))
     after = np.flatnonzero(good & (times > t) & (times <= t + window))
-    ia = int(before[-1]) if len(before) else None
-    ib = int(after[0]) if len(after) else None
+    ia = next((int(i) for i in before[::-1] if sample_ok(int(i))), None)
+    ib = next((int(i) for i in after if sample_ok(int(i))), None)
+    if len(before) and ia != int(before[-1]):
+        rejects.append(f"앞 샘플 {times[int(before[-1])]:.1f}s:카메라")
+    if len(after) and ib != int(after[0]):
+        rejects.append(f"뒤 샘플 {times[int(after[0])]:.1f}s:카메라")
+    info["h_reject"] = "; ".join(rejects)
     mask = None
     if look.ignore is not None:
         mask = np.where(cv2.dilate(look.ignore.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0, 0, 255).astype(np.uint8)
     orb = HG.make_orb()
     matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     if ia is None and ib is None:
-        return _multi_view(look, v, t, look.undistort(v.frame_at(t)), spec, uv, mask, orb, matcher, info, agree_m=agree_m)
+        return _multi_view(look, v, t, look.undistort(v.frame_at(t)), spec, uv, mask, orb, matcher, info, agree_m=agree_m,
+                           sample_ok=sample_ok, accept=accept)
     gaps = [abs(t - times[i]) for i in (ia, ib) if i is not None]
     info["h_gap_s"] = round(float(min(gaps)), 2)
     fps = v.fps or 30.0
@@ -915,14 +1015,15 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
         else:
             dm = HG.h_distance(Hf, Hb, (v.height, v.width), spec) * 0.05
         info["h_agree_m"] = round(dm, 3)
-        if dm <= agree_m:
-            Hm = 0.5 * (Hf + Hb)
+        Hm = 0.5 * (Hf + Hb)
+        Hm = Hm / Hm[2, 2]
+        if dm <= agree_m and accept("two-way", Hm):
             info["h_source"] = "two-way"
-            return Hm / Hm[2, 2], info
+            return Hm, info
     # 한쪽 길만: 가까우면 그대로, 멀면 그 화면 라인에 다시 맞춰 확인
     cands = sorted([(abs(t - times[i]), Hx) for i, Hx in ((ia, Hf), (ib, Hb)) if i is not None and Hx is not None],
                    key=lambda c: c[0])
-    if cands and cands[0][0] <= near_s:
+    if cands and cands[0][0] <= near_s and accept("near", cands[0][1]):
         info["h_source"] = "near"
         return cands[0][1], info
     frame = look.undistort(v.frame_at(t))
@@ -933,14 +1034,17 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
             if s2 <= sc + 0.005:
                 break
             Hr, sc, sup = H2, s2, sup2
-        if sc >= min_score and HG.support_ok(sup) and HG.h_distance(Hr, Hx, frame.shape, spec) <= 10.0:
+        if (sc >= min_score and HG.support_ok(sup) and HG.h_distance(Hr, Hx, frame.shape, spec) <= 10.0
+                and accept("verified", Hr)):
             info["h_source"] = "verified"
             return Hr, info
-    return _multi_view(look, v, t, frame, spec, uv, mask, orb, matcher, info, agree_m=agree_m)
+    return _multi_view(look, v, t, frame, spec, uv, mask, orb, matcher, info, agree_m=agree_m,
+                       sample_ok=sample_ok, accept=accept)
 
 
 def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, matcher, info: dict, span: float = 120.0,
-                n_src: int = 30, min_inliers: int = 60, agree_m: float = 0.2, min_votes: int = 2, min_sep: float = 2.0):
+                n_src: int = 30, min_inliers: int = 60, agree_m: float = 0.2, min_votes: int = 2, min_sep: float = 2.0,
+                sample_ok=None, accept=None):
     """슛 프레임을 추적이 잘 된 다른 화면들(앞뒤 span 초 안, 서로 min_sep 초 이상 떨어진 n_src 장 + 사람 캘리브레이션 화면)과
     직접 특징점으로 맞춘다. 중계 카메라는 한 자리에서 돌고 당기기만 하므로 두 화면 사이는 관중석까지 통째로 하나의 화면 변환이다.
     서로 다른 시각의 화면 min_votes 장 이상에서 옮겨 온 H 가 발 자리에서 한 후보의 agree_m 안에 모일 때만 쓴다
@@ -949,7 +1053,7 @@ def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, match
     times, Hs, st = look.track["times"], look.track["H"], look.track["status"].astype(str)
     fin = np.all(np.isfinite(Hs.reshape(len(Hs), -1)), axis=1)
     good = fin & np.isin(st, _VERIFIED)
-    near_idx = [int(i) for i in np.flatnonzero(good & (np.abs(times - t) <= span))]
+    near_idx = [int(i) for i in np.flatnonzero(good & (np.abs(times - t) <= span)) if sample_ok is None or sample_ok(int(i))]
     near_idx.sort(key=lambda i: abs(times[i] - t))
     picks: list[int] = []
     for i in near_idx:
@@ -998,17 +1102,21 @@ def _multi_view(look, v, t: float, frame: np.ndarray, spec, uv, mask, orb, match
     Hm = Hm / Hm[2, 2]
     P = np.stack([d[3] for d in grp])
     spread = float(np.max(np.linalg.norm(P[:, None] - P[None], axis=2)))  # 같은 답을 낸 화면끼리 가장 먼 거리 (최대 2×agree_m)
+    if accept is not None and not accept("multi-view", Hm):
+        return None, info
     info["h_source"] = "multi-view"
     info["h_agree_m"] = round(spread, 3)
     info["h_gap_s"] = round(float(min(abs(d[0] - t) for d in grp)), 2)
     return Hm, info
 
 
-def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0):
+def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, window: float = 8.0, max_cam_px: float = 8.0,
+           off_court_m: float = 1.0):
     """원본 화면 발 위치 하나를 판정 (shot·rejudge 공용). 반환: (ShotCall 또는 None, H 정보, 편 화면 좌표)."""
     u, vv = look.to_canvas(u_raw, v_raw)
     if v is not None:
-        H, info = _court_at_shot(look, v, t, spec, uv=(u, vv), window=window)
+        H, info = _court_at_shot(look, v, t, spec, uv=(u, vv), window=window, max_cam_px=max_cam_px,
+                                 off_court_m=off_court_m)
     else:
         H = look.at(t)
         info = {"h_source": "track" if H is not None else "none", "h_gap_s": "", "h_agree_m": "", "h_votes": ""}
@@ -1021,6 +1129,53 @@ def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, windo
         call.margin_sigma = float(np.hypot(call.margin_sigma, float(info["h_agree_m"])))
         call.near_line = call.near_line or abs(call.margin) < max(0.3, 2.0 * call.margin_sigma)
     return call, info, (u, vv)
+
+
+def cmd_cam_check(a):
+    """추적 결과(npz)의 H 마다 '캘리브레이션 카메라 자리에서 돌리기·당기기로 흉내 낸 차이(px)' 를 재서, 상태별 분포와
+    기준(--max-cam-px)을 넘는 구간을 출력한다. 카메라 자리 검사 전에 만든 npz 도 된다 (그때는 --video 로 화면 크기를 앎)."""
+    spec = _spec(a.spec)
+    look = _CourtLookup(None, a.track)
+    tr = look.track
+    v = Video(a.video) if a.video else None
+    if v is None and "frame_shape" not in tr.files and look.lens is None:
+        sys.exit("화면 크기를 알 수 없습니다: --video 를 주세요.")
+    shape = look.shape(v)
+    cams = look.cams(spec, shape)
+    if not cams:
+        sys.exit("카메라 자리를 못 풀었습니다 (calib 샘플이 없거나 실제 카메라로 풀리지 않음).")
+    _print_cams(cams)
+    times, Hs, st = tr["times"], tr["H"], tr["status"].astype(str)
+    if "cam_px" in tr.files and "cam_C" in tr.files:
+        cam_px = np.asarray(tr["cam_px"], float)
+    else:
+        cam_px = np.array([look.cam_px(H, spec, shape) if np.all(np.isfinite(H)) else np.nan for H in Hs])
+    _print_cam_stats(st, cam_px, a.max_cam_px)
+    over = np.isfinite(cam_px) & (cam_px > a.max_cam_px)
+    spans, k = [], 0
+    idx = np.flatnonzero(np.isfinite(cam_px))
+    while k < len(idx):
+        if not over[idx[k]]:
+            k += 1
+            continue
+        j = k
+        while j + 1 < len(idx) and over[idx[j + 1]]:
+            j += 1
+        seg = idx[k:j + 1]
+        spans.append(seg)
+        k = j + 1
+    print(f"{a.max_cam_px:g}px 넘는 구간 {len(spans)}개" + (" (앞 40개)" if len(spans) > 40 else ""))
+    for seg in spans[:40]:
+        kinds = {}
+        for i in seg:
+            kinds[st[i]] = kinds.get(st[i], 0) + 1
+        print(f"  {times[seg[0]]:.1f}~{times[seg[-1]]:.1f}s  {len(seg)}개 {kinds}  카메라 차이 "
+              f"{np.nanmin(cam_px[seg]):.0f}~{np.nanmax(cam_px[seg]):.0f}px")
+    if a.out:
+        _write_csv(a.out, [{"t_sec": round(float(times[i]), 3), "status": st[i],
+                            "cam_px": "" if not np.isfinite(cam_px[i]) else round(float(cam_px[i]), 2)}
+                           for i in range(len(times))])
+        print(f"저장: {a.out}")
 
 
 def cmd_overlay(a):
@@ -1096,9 +1251,10 @@ def cmd_rejudge(a):
             out.append(r2)
             continue
         side = r.get("side") if r.get("side") in ("left", "right") else a.side
-        call, info, _ = _judge(look, v, t, u, vv, spec, side=side, window=a.window)
+        call, info, _ = _judge(look, v, t, u, vv, spec, side=side, window=a.window, max_cam_px=a.max_cam_px,
+                               off_court_m=a.off_court_m)
         is_ft = str(r.get("zone", "")).upper() == "FT"
-        for k in _CALL_KEYS + ("court_points", "h_source", "h_gap_s", "h_agree_m", "h_votes"):
+        for k in _CALL_KEYS + ("court_points", "h_source", "h_gap_s", "h_agree_m", "h_votes", "h_cam_px", "h_reject"):
             r2.pop(k, None)  # 예전 판정 값이 남지 않게 (좌표 없음이면 빈칸)
         if call is None:
             n_none += 1
@@ -1118,7 +1274,9 @@ def cmd_rejudge(a):
               + (f"{r2['points']}점 {r2.get('zone_kr', '')} 라인까지 {r2.get('margin_m', '')}m"
                  + (" 라인근처" if str(r2.get("near_line")) == "True" else "") if call is not None else "좌표 없음")
               + f"  [{info['h_source']}" + (f", {info['h_gap_s']}s" if info["h_gap_s"] != "" else "")
-              + (f", 두 길 차이 {info['h_agree_m']}m" if info["h_agree_m"] != "" else "") + "]")
+              + (f", 두 길 차이 {info['h_agree_m']}m" if info["h_agree_m"] != "" else "")
+              + (f", 카메라 {info['h_cam_px']}px" if info.get("h_cam_px", "") != "" else "")
+              + (f", 버림: {info['h_reject']}" if info.get("h_reject") else "") + "]")
     keys = list(dict.fromkeys(k for r in out for k in r))
     _write_csv(a.out, [{k: r.get(k, "") for k in keys} for r in out])
     src = {}
@@ -1528,6 +1686,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="슛 CSV(t_sec). 주면 경기 전체 대신 슛마다 앞 --before 초 ~ 뒤 --after 초만 추적해 npz 하나로 합침")
     q.add_argument("--before", type=float, default=20.0, help="--around: 슛 앞 몇 초부터 추적")
     q.add_argument("--after", type=float, default=5.0, help="--around: 슛 뒤 몇 초까지 추적")
+    q.add_argument("--max-cam-px", type=float, default=8.0,
+                   help="consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나야 함 (0 = 끔)")
     q.add_argument("--no-consensus", dest="consensus", action="store_false",
                    help="라인으로 확인 못 한 화면을 '서로 다른 시각의 기준 화면 둘 이상이 같은 자리' 로 받지 않음 (비교용)")
     q.add_argument("--graphics-box", action="append", default=None,
@@ -1544,6 +1704,13 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--out", default="configs/lens.json")
+
+    q = add("cam-check", cmd_cam_check, "추적 결과의 H 가 캘리브레이션 카메라 자리와 맞는지 (비틀린 H 찾기)")
+    q.add_argument("--track", required=True)
+    q.add_argument("--video", default=None, help="카메라 자리 검사 전에 만든 npz 면 화면 크기를 알기 위해 필요")
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
+    q.add_argument("--max-cam-px", type=float, default=8.0)
+    q.add_argument("--out", default=None, help="샘플별 CSV (t_sec, status, cam_px)")
 
     q = add("overlay", cmd_overlay, "코트 라인을 영상 프레임에 겹쳐 그려 확인")
     q.add_argument("--video", required=True)
@@ -1592,6 +1759,9 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--side", choices=["left", "right"], default=None, help="CSV 에 side 가 없을 때 공격 방향 림")
     q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--window", type=float, default=8.0)
+    q.add_argument("--max-cam-px", type=float, default=8.0,
+                   help="캘리브레이션 카메라 자리에서 돌리기·당기기로 이 px 안으로 흉내 나지 않는 H 는 버리고 다음 출처로 (0 = 끔)")
+    q.add_argument("--off-court-m", type=float, default=1.0, help="발 자리가 코트 밖으로 이 m 넘게 나가면 그 H 는 버림")
     q.add_argument("--graphics-box", action="append", default=None,
                    help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 {\"boxes\": [[x,y,w,h]...], \"reference_size\": [w,h]} JSON. 라인으로 쓰지 않고 가려진 것으로 봄")
     q.add_argument("--no-graphics-mask", action="store_true")

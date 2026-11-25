@@ -408,3 +408,35 @@ def test_calib_edit_saves(synthetic, tmp_path, monkeypatch):
     assert (tmp_path / "c.bak.json").exists()
     H2, _ = HG.fit_homography({k: tuple(v) for k, v in o["image_points"].items()}, FIBA)
     assert HG.h_distance(H2, np.array(o["H_court_to_image"]), (720, 1280)) < 0.5
+
+
+def test_shot_skips_h_the_camera_cannot_make(synthetic, capsys, tmp_path):
+    """슛 프레임의 추적 H 가 코트를 5m 옮긴 틀린 H(consensus)면, 캘리브레이션 카메라 자리에서는 나올 수 없는 화면이라 버리고
+    앞뒤 정상 화면에서 이어 온다 (버린 이유는 h_reject). 맞는 추적 샘플은 모두 카메라 자리와 몇 px 안."""
+    d, video, Hs = synthetic
+    track = tmp_path / "tr.npz"
+    cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
+    z = dict(np.load(track))
+    assert len(z["cam_C"]) == 1 and tuple(z["frame_shape"]) == (720, 1280)
+    assert np.nanmax(z["cam_px"]) < 8
+    i = int(np.argmin(np.abs(z["times"] - 6.0)))
+    H = z["H"].copy()
+    H[i] = H[i] @ np.array([[1, 0, 5.0], [0, 1, 0], [0, 0, 1]])
+    st = z["status"].astype("<U10")
+    st[i] = "consensus"
+    z["H"], z["status"] = H, st
+    bad = tmp_path / "bad.npz"
+    np.savez(bad, **z)
+    x, y = 1.575 + 7.4, 7.5
+    u, v = HG.court_to_image(Hs[60], x, y)
+    capsys.readouterr()
+    cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v), "--side", "left"])
+    res = json.loads(capsys.readouterr().out)
+    assert res["h_source"] != "track" and res["points"] == 3 and res["h_reject"].startswith("track:카메라"), res
+    assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15 and res["h_cam_px"] < 8
+    # 진단: 카메라 자리 검사 전에 만든 npz 처럼 cam_px 가 없어도 다시 재서 틀린 샘플 구간을 보여 준다
+    z.pop("cam_px"), z.pop("cam_C"), z.pop("frame_shape")
+    np.savez(bad, **z)
+    cli.main(["cam-check", "--track", str(bad), "--video", str(video), "--out", str(tmp_path / "cam.csv")])
+    out = capsys.readouterr()
+    assert "넘는 구간 1개" in out.out and "consensus" in out.out and "카메라 자리 (캘리브레이션 1)" in out.err
