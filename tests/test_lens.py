@@ -15,8 +15,9 @@ def distorted_scene(k1, shift=(0.0, 0.0), seed=0, thick=3):
     HG.draw_court(top, T, FIBA, (255, 255, 255), thick)
     h, w = top.shape[:2]
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-    dst = np.float32([[150, 120], [1130, 120], [1400, 700], [-120, 700]]) + np.float32(shift)
-    Hcam = cv2.getPerspectiveTransform(src, dst)
+    from test_homography import _DST0, pan_h
+
+    Hcam = pan_h(shift) @ cv2.getPerspectiveTransform(src, _DST0)  # 카메라를 제자리에서 돌린 화면
     lens = Lens(k1, 1280, 720)
     P = np.array([[1, 0, lens.pad], [0, 1, lens.pad], [0, 0, 1.0]])
     cw, ch = lens.canvas_size

@@ -52,6 +52,134 @@ def court_to_image(H: np.ndarray, x: float, y: float) -> tuple[float, float]:
     return float(u), float(v)
 
 
+# ---------------------------------------------------------------- 카메라 자리
+def camera_pose(H: np.ndarray, shape, spec: CourtSpec = FIBA):
+    """코트→화면 H 를 실제 카메라 하나로 풀어 본다 (주점 = 화면 가운데, 정사각 픽셀 가정).
+
+    반환: (초점거리 px, R 3x3 코트→카메라 회전, C 카메라 자리 코트 좌표 m [x, y, 높이]) 또는 None (그런 카메라가 없음).
+    중계 카메라는 한 자리에서 돌고 당기기만 하므로, 맞는 H 들은 모두 같은 C 를 가리킨다."""
+    if H is None or not np.all(np.isfinite(H)):
+        return None
+    h, w = shape[:2]
+    T = np.array([[1.0, 0.0, -(w - 1) / 2.0], [0.0, 1.0, -(h - 1) / 2.0], [0.0, 0.0, 1.0]])
+    M = T @ np.asarray(H, float)
+    M = M / np.linalg.norm(M)
+    a, b = M[:2, 0], M[:2, 1]
+    p, q = M[2, 0], M[2, 1]
+    # r1·r2 = 0, |r1| = |r2| 두 식을 1/f² 하나로 최소제곱
+    A = np.array([a @ b, a @ a - b @ b])
+    B = -np.array([p * q, p * p - q * q])
+    den = float(A @ A)
+    if not np.isfinite(den) or den <= 1e-30:
+        return None
+    s = float(A @ B) / den
+    if not np.isfinite(s) or s <= 0:
+        return None
+    f = 1.0 / math.sqrt(s)
+    G = np.diag([1.0 / f, 1.0 / f, 1.0]) @ M
+    lam = 0.5 * (np.linalg.norm(G[:, 0]) + np.linalg.norm(G[:, 1]))
+    r1, r2, t = G[:, 0] / lam, G[:, 1] / lam, G[:, 2] / lam
+    cx, cy = spec.length / 2, spec.width / 2
+    if r1[2] * cx + r2[2] * cy + t[2] < 0:  # 코트가 카메라 앞에 오게
+        r1, r2, t = -r1, -r2, -t
+    U, _, Vt = np.linalg.svd(np.column_stack([r1, r2, np.cross(r1, r2)]))
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        return None
+    return f, R, -R.T @ t
+
+
+def _cam_h(f: float, R: np.ndarray, C: np.ndarray, shape) -> np.ndarray:
+    """카메라 (초점거리 f, 회전 R, 자리 C) 로 코트 바닥(z=0)을 찍은 H."""
+    h, w = shape[:2]
+    K = np.array([[f, 0.0, (w - 1) / 2.0], [0.0, f, (h - 1) / 2.0], [0.0, 0.0, 1.0]])
+    M = np.array([[1.0, 0.0, -C[0]], [0.0, 1.0, -C[1]], [0.0, 0.0, -C[2]]])
+    Hc = K @ R @ M
+    return Hc / Hc[2, 2]
+
+
+def _court_grid(spec: CourtSpec, step: float = 1.0, pad: float = 1.0) -> np.ndarray:
+    xs = np.arange(-pad, spec.length + pad + 1e-9, step)
+    ys = np.arange(-pad, spec.width + pad + 1e-9, step)
+    return np.array([(x, y) for x in xs for y in ys], float)
+
+
+def camera_fit_px(H: np.ndarray, shape, C, spec: CourtSpec = FIBA, iters: int = 12, min_pts: int = 6) -> float:
+    """카메라 자리를 C 로 고정하고 (돌리기·당기기만 허용) H 를 얼마나 흉내 낼 수 있는가: 화면 안 코트 점들의 평균 px 차이.
+
+    같은 카메라의 맞는 H 는 몇 px 안이고, 특징점이 엉뚱하게 맞아 코트가 비틀린 H 는 수십 px 이 나온다.
+    코트가 화면에 거의 안 보이면(점 min_pts 개 미만) 판단할 수 없어 nan. 그런 카메라로 못 풀면 inf."""
+    if H is None or not np.all(np.isfinite(H)):
+        return float("inf")
+    C = np.asarray(C, float)
+    h, w = shape[:2]
+    G = _court_grid(spec)
+    uv = project(H, G)
+    vis = np.all(np.isfinite(uv), axis=1) & (uv[:, 0] >= 0) & (uv[:, 0] < w) & (uv[:, 1] >= 0) & (uv[:, 1] < h)
+    Hn = np.asarray(H, float) / H[2, 2]
+    depth_sign = np.sign((Hn @ np.array([spec.length / 2, spec.width / 2, 1.0]))[2])
+    vis &= np.sign(Hn[2, 0] * G[:, 0] + Hn[2, 1] * G[:, 1] + Hn[2, 2]) == depth_sign
+    if vis.sum() < min_pts:
+        return float("nan")
+    X, target = G[vis], uv[vis]
+    # 처음 값: T·H·M_C⁻¹ = λ K R 에서 f, R
+    T = np.array([[1.0, 0.0, -(w - 1) / 2.0], [0.0, 1.0, -(h - 1) / 2.0], [0.0, 0.0, 1.0]])
+    Mc = np.array([[1.0, 0.0, -C[0]], [0.0, 1.0, -C[1]], [0.0, 0.0, -C[2]]])
+    try:
+        P = T @ Hn @ np.linalg.inv(Mc)
+    except np.linalg.LinAlgError:
+        return float("inf")
+    PP = P @ P.T
+    if PP[2, 2] <= 0 or PP[0, 0] + PP[1, 1] <= 0:
+        return float("inf")
+    f = math.sqrt(0.5 * (PP[0, 0] + PP[1, 1]) / PP[2, 2])
+    Q = np.diag([1.0 / f, 1.0 / f, 1.0]) @ P
+    d = np.linalg.det(Q)
+    if not np.isfinite(d) or abs(d) < 1e-30:
+        return float("inf")
+    Q = Q / np.cbrt(d)
+    U, _, Vt = np.linalg.svd(Q)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:
+        return float("inf")
+    rv = cv2.Rodrigues(R)[0].ravel()
+    th = np.array([math.log(f), *rv])
+
+    def resid(th):
+        Rm = cv2.Rodrigues(th[1:].reshape(3, 1))[0]
+        Hc = _cam_h(math.exp(th[0]), Rm, C, shape)
+        cam = (Rm @ np.column_stack([X[:, 0] - C[0], X[:, 1] - C[1], np.full(len(X), -C[2])]).T)[2]
+        if np.any(cam <= 0):  # 코트 점이 카메라 뒤
+            return None
+        return (project(Hc, X) - target).ravel()
+
+    r = resid(th)
+    if r is None:
+        return float("inf")
+    mu = 1e-3
+    for _ in range(iters):
+        J = np.empty((len(r), 4))
+        for k in range(4):
+            e = np.zeros(4)
+            e[k] = 1e-6
+            rk = resid(th + e)
+            if rk is None:
+                return float(np.mean(np.hypot(*r.reshape(-1, 2).T)))
+            J[:, k] = (rk - r) / 1e-6
+        A = J.T @ J
+        g = J.T @ r
+        step = np.linalg.solve(A + mu * np.diag(np.diag(A) + 1e-12), -g)
+        r2 = resid(th + step)
+        if r2 is not None and r2 @ r2 < r @ r:
+            th, r = th + step, r2
+            mu *= 0.3
+            if np.linalg.norm(step) < 1e-9:
+                break
+        else:
+            mu *= 10
+    return float(np.mean(np.hypot(*r.reshape(-1, 2).T)))
+
+
 def _three_center_samples(H: np.ndarray, spec: CourtSpec, side: str, step_m: float = 0.05):
     """3점 라인 띠 가운데 선의 점들을 화면에 투영한 것과, 각 점에서 라인 바깥쪽(3점 쪽)을 가리키는 화면 단위 벡터."""
     from .court import three_line_edges
@@ -718,7 +846,7 @@ class CourtTracker:
                  min_score: float = 0.65, use_static_mask: bool = True, overlay_mask: np.ndarray | None = None,
                  keyframe_score: float = 0.7, max_jump_px: float = 15.0, weak_inliers: int = 100,
                  min_good_lines: int = 2, min_line_frac: float = 0.6, min_area_frac: float = 0.1,
-                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None):
+                 min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None, max_cam_px: float = 8.0):
         """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
         0.36~0.47, 키가 옆으로 밀린 틀린 화면이 0.55~0.60, 맞은 화면은 0.71 이상이었으므로 0.65.
         keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
@@ -731,7 +859,10 @@ class CourtTracker:
         min_area_frac, min_aspect_frac: 사람이 맞춘 캘리브레이션 화면들과 비교한 절대 기준 (sane). 키 투영 넓이가 그중 가장
         작은 것의 min_area_frac 배보다 작거나, 화면 가운데의 코트 납작한 정도(view_aspect)가 min_aspect_frac 배보다 작으면
         코트가 찌그러진 H 로 보고 쓰지 않는다. (실제 영상에서 좌표 1322개 중 1091개가 키 넓이 0~60px² 인 찌그러진 H 였다)
-        ignore: 라인 정합에서 뺄 자리(방송 그래픽, 렌즈 휨을 편 화면의 검정 여백) = True (graphics_mask)."""
+        ignore: 라인 정합에서 뺄 자리(방송 그래픽, 렌즈 휨을 편 화면의 검정 여백) = True (graphics_mask).
+        max_cam_px: consensus 로 받을 H 가 캘리브레이션 화면들의 카메라 자리(camera_pose)에서 돌리기·당기기만으로 이 px 안으로
+        흉내 낼 수 있어야 한다 (camera_fit_px). 0 이면 끔. (실제 B-LAB holdout: 라인이 25%+ 맞아 lines_contradict 를 통과한
+        비틀린 consensus 가 슛 4개를 '라인까지 11~18m' 로 냈다)"""
         self.spec = spec
         self.ignore = ignore
         self.H = H0.copy()
@@ -764,6 +895,9 @@ class CourtTracker:
         self.keyframes: list[tuple] = []  # (keypoints, descriptors, H, 저장한 샘플 번호)
         self.anchors: list[tuple] = []  # 사람이 맞춘 캘리브레이션 화면들 — 지워지지 않는 키프레임 (번호는 음수)
         self.consensus_rejected = 0  # 흰 선과 어긋나 받지 않은 consensus 수
+        self.camera_rejected = 0  # 카메라 자리와 안 맞아 받지 않은 consensus 수
+        self.max_cam_px = max_cam_px
+        self.cams: list[np.ndarray] = []  # 캘리브레이션 화면들에서 푼 카메라 자리 (코트 좌표 m)
         self.last_found: list[tuple] = []  # 마지막 relocalize 에서 특징점으로 옮겨 온 후보들 (맞은 점, H, 앵커인가, 번호)
         self._court_pts = np.concatenate([densify(p, 0.5) for p in court_polylines(spec).values()])
         self.add_anchor(frame0, H0)
@@ -771,6 +905,9 @@ class CourtTracker:
     def add_anchor(self, frame: np.ndarray, H: np.ndarray) -> None:
         """캘리브레이션한 화면(예: 왼쪽 골대, 오른쪽 골대)을 다시 찾기 기준으로 넣는다."""
         self._ref_geom.append((key_area(H, self.spec), view_aspect(H, frame.shape)))
+        pose = camera_pose(H, frame.shape, self.spec)
+        if pose is not None:
+            self.cams.append(pose[2])
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         kp, des = self.orb.detectAndCompute(gray, self._mask(gray))
         if des is not None and len(kp) >= 50:
@@ -961,11 +1098,25 @@ class CourtTracker:
         H = H / H[2, 2]
         if not self.sane(H, shape):
             return None
+        r = self.camera_px(H, shape)
+        if self.max_cam_px and np.isfinite(r) and r > self.max_cam_px:
+            # 기준 화면 여럿이 같은 자리를 가리켜도, 중계 카메라 자리에서 돌리기·당기기로 만들 수 없는 화면이면 받지 않는다
+            self.camera_rejected += 1
+            return None
         if frame is not None and lines_contradict(frame, H, self.spec, self.ignore):
             # 기준 화면 여럿이 같은 자리를 가리켜도, 화면에 보이는 흰 선과 크게 어긋나면 받지 않는다
             self.consensus_rejected += 1
             return None
         return H
+
+    def camera_px(self, H: np.ndarray | None, shape) -> float:
+        """H 가 캘리브레이션 화면들의 카메라 자리 중 하나에서 돌리기·당기기만으로 얼마나 흉내 나는가 (px, 작을수록 맞음).
+        카메라 자리를 모르거나 코트가 거의 안 보이면 nan."""
+        if H is None or not self.cams:
+            return float("nan")
+        rs = [camera_fit_px(H, shape, C, self.spec) for C in self.cams]
+        fin = [r for r in rs if not np.isnan(r)]
+        return float(min(fin)) if fin else float("nan")
 
     def supported(self, sup: tuple) -> bool:
         """보이는 코트 라인 줄 대부분이 실제 선과 겹치고, 맞은 줄의 방향이 엇갈리는가 (line_support 결과)."""

@@ -1,3 +1,4 @@
+import functools
 import cv2
 import numpy as np
 import pytest
@@ -6,8 +7,39 @@ from gtt import homography as HG
 from gtt.court import FIBA, classify_shot, landmarks
 
 
+_DST0 = np.float32([[150, 120], [1130, 120], [1400, 700], [-120, 700]])
+
+
+@functools.lru_cache(maxsize=4)
+def _base_f(shape):
+    """기본 화면(_DST0) H 를 실제 카메라로 풀었을 때의 초점거리 px."""
+    import cv2
+
+    top, T = HG.render_topdown(FIBA, px_per_m=40)
+    th, tw = top.shape[:2]
+    base = cv2.getPerspectiveTransform(np.float32([[0, 0], [tw, 0], [tw, th], [0, th]]), _DST0)
+    return HG.camera_pose(base @ T, shape, FIBA)[0]
+
+
+def pan_h(shift, shape=(720, 1280)):
+    """중계 카메라를 제자리에서 돌린(팬·틸트) 화면 변환 K·R·K⁻¹: 화면 가운데가 shift px 만큼 옮겨진다.
+    (예전처럼 화면을 그냥 평행이동하면 실제 카메라로는 못 만드는 H 라 카메라 자리 검사에 걸린다)"""
+    import cv2
+
+    h, w = shape
+    f = _base_f(shape)
+    K = np.array([[f, 0, (w - 1) / 2.0], [0, f, (h - 1) / 2.0], [0, 0, 1.0]])
+    d = np.array([shift[0] / f, shift[1] / f, 1.0])
+    d /= np.linalg.norm(d)
+    axis = np.cross([0.0, 0.0, 1.0], d)
+    n = np.linalg.norm(axis)
+    R = np.eye(3) if n < 1e-12 else cv2.Rodrigues(axis / n * np.arccos(np.clip(d[2], -1, 1)))[0]
+    P = K @ R @ np.linalg.inv(K)
+    return P / P[2, 2]
+
+
 def make_scene(shift=(0.0, 0.0), seed=0):
-    """중계 카메라처럼 비스듬히 본 합성 코트 영상과 정답 H(코트→화면)."""
+    """중계 카메라처럼 비스듬히 본 합성 코트 영상과 정답 H(코트→화면). shift: 카메라를 제자리에서 돌려 화면 가운데가 옮겨지는 px."""
     top, T = HG.render_topdown(FIBA, px_per_m=40)
     rng = np.random.default_rng(seed)
     # ORB 가 잡을 수 있도록 관중석·바닥 무늬 같은 질감을 넣는다 (코트와 함께 움직임).
@@ -17,9 +49,7 @@ def make_scene(shift=(0.0, 0.0), seed=0):
     HG.draw_court(top, T, FIBA, (255, 255, 255), 3)
     h, w = top.shape[:2]
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-    dst = np.float32([[150, 120], [1130, 120], [1400, 700], [-120, 700]])
-    dst += np.float32(shift)
-    Hcam = cv2.getPerspectiveTransform(src, dst)
+    Hcam = pan_h(shift) @ cv2.getPerspectiveTransform(src, _DST0)
     frame = cv2.warpPerspective(top, Hcam, (1280, 720), borderValue=(40, 40, 40))
     return frame, Hcam @ T
 
@@ -350,8 +380,7 @@ def _plain_scene(shift, seed=0):
     top = cv2.add(np.full_like(top, top[3, 3]), cv2.merge([tex, tex, tex]))
     h, w = top.shape[:2]
     src = np.float32([[0, 0], [w, 0], [w, h], [0, h]])
-    dst = np.float32([[150, 120], [1130, 120], [1400, 700], [-120, 700]]) + np.float32(shift)
-    Hcam = cv2.getPerspectiveTransform(src, dst)
+    Hcam = pan_h(shift) @ cv2.getPerspectiveTransform(src, _DST0)
     return cv2.warpPerspective(top, Hcam, (1280, 720), borderValue=(40, 40, 40)), Hcam @ T
 
 
@@ -395,3 +424,63 @@ def test_consensus_rejects_when_visible_lines_disagree():
     assert not HG.lines_contradict(f3, H3, FIBA)  # 맞는 H 는 통과
     f2, _ = _plain_scene((-30, 5))
     assert not HG.lines_contradict(f2, H3, FIBA)  # 흰 선이 없는 화면은 판단하지 않음
+
+
+def _camera_h(C, target, f, shape=(720, 1280)):
+    """코트 좌표 C(m) 에 있는 카메라가 target 을 바라보며 초점거리 f px 로 찍은 코트 바닥 H (실제 카메라 모형)."""
+    C = np.asarray(C, float)
+    z = np.asarray(target, float) - C
+    z /= np.linalg.norm(z)
+    x = np.cross(z, [0.0, 0.0, 1.0])
+    x /= np.linalg.norm(x)
+    R = np.vstack([x, np.cross(z, x), z])
+    h, w = shape
+    K = np.array([[f, 0, (w - 1) / 2.0], [0, f, (h - 1) / 2.0], [0, 0, 1.0]])
+    H = K @ R @ np.array([[1, 0, -C[0]], [0, 1, -C[1]], [0, 0, -C[2]]])
+    return H / H[2, 2]
+
+
+def test_camera_pose_and_fit():
+    """실제 카메라로 찍은 H 는 카메라 자리가 그대로 풀리고, 같은 자리에서 돌리고 당긴 화면은 그 자리로 흉내 난다(≈0px).
+    카메라를 옮기거나 코트를 비튼 H 는 수십 px — 중계 카메라는 한 자리에서 돌고 당기기만 하므로 틀린 H 를 가려낸다."""
+    shape = (720, 1280)
+    C = np.array([14.0, -12.0, 7.0])
+    H1 = _camera_h(C, (21, 7.5, 0), 1400)
+    f, R, Cp = HG.camera_pose(H1, shape, FIBA)
+    assert abs(f - 1400) < 1e-3 and np.allclose(Cp, C, atol=1e-6)
+    assert HG.camera_fit_px(_camera_h(C, (6, 9, 0), 2200), shape, C) < 0.01  # 반대쪽으로 돌리고 당김
+    assert HG.camera_fit_px(_camera_h(C + [3, 0, 0], (21, 7.5, 0), 1400), shape, C) > 20  # 다른 자리 카메라
+    assert HG.camera_fit_px(H1 @ np.array([[1, 0, 5.0], [0, 1, 0], [0, 0, 1]]), shape, C) > 20  # 코트를 5m 옮긴 H
+    assert HG.camera_fit_px(H1 @ np.array([[1, 0.3, 0], [0, 1, 0], [0, 0, 1.0]]), shape, C) > 20  # 비튼 H
+    # 사람이 찍은 캘리브레이션처럼 2px 흔들린 H 에서 푼 자리도 거의 같고, 그 자리로 다른 화면도 몇 px 안
+    rng = np.random.default_rng(0)
+    grid = np.array([[x, y] for x in range(14, 29, 2) for y in range(0, 16, 3)], float)
+    uv = HG.project(H1, grid)
+    vis = (uv[:, 0] > 0) & (uv[:, 0] < 1280) & (uv[:, 1] > 0) & (uv[:, 1] < 720)
+    Hn, _ = cv2.findHomography(grid[vis], uv[vis] + rng.normal(0, 2.0, (vis.sum(), 2)), 0)
+    Cn = HG.camera_pose(Hn, shape, FIBA)[2]
+    assert np.linalg.norm(Cn - C) < 0.5
+    assert HG.camera_fit_px(_camera_h(C, (8, 6, 0), 1800), shape, Cn) < 3
+    # 코트가 화면에 안 보이면(천장을 봄) 판단하지 않음
+    assert np.isnan(HG.camera_fit_px(_camera_h(C, (14, 0, 40), 1400), shape, C))
+
+
+def test_consensus_rejects_court_the_camera_cannot_see():
+    """라인이 안 보이는 화면에서 기준 화면 둘이 같은 틀린 자리(코트를 5m 옮긴 H)를 가리키면, 흰 선으로는 못 거르지만
+    캘리브레이션 화면의 카메라 자리에서 돌리기·당기기로는 그런 화면이 안 나오므로 받지 않는다.
+    (실제 B-LAB holdout: 비틀린 consensus 에서 이어 온 H 가 슛 4개를 '탑 3점, 라인까지 11~18m' 로 냄)"""
+    f0, H0 = make_scene()
+    f1, H1 = make_scene(shift=(-60, 10))
+    f2, H2 = _plain_scene((-30, 5))
+    wrong = np.array([[1, 0, 5.0], [0, 1, 0], [0, 0, 1]])
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    assert len(trk.cams) == 1
+    trk.keyframes, trk.anchors = [], []
+    for n, (f, H) in enumerate([(f1, H1 @ wrong), (f0, H0 @ wrong)]):
+        trk.n = 20 * (n + 1)
+        trk._add_keyframe(cv2_gray(f), H)
+    trk.relocalize(f2)
+    assert trk.consensus(f2.shape, frame=f2) is None and trk.camera_rejected == 1
+    trk.max_cam_px = 0  # 끄면 받아 버린다 (흰 선이 안 보여 lines_contradict 로는 못 거름)
+    Hc = trk.consensus(f2.shape, frame=f2)
+    assert Hc is not None and HG.h_distance(Hc, H2 @ wrong, f2.shape) < 1.0
