@@ -33,6 +33,7 @@ def _fit_window(img: np.ndarray) -> tuple[np.ndarray, float]:
 
 def _spec(name: str) -> C.CourtSpec:
     """FIBA·NBA 또는 체육관별 규격 JSON 경로 ({"base": "FIBA", "name": "...", "three_radius": 6.75, ...}).
+    "hidden": [[x0, y0, x1, y1], ...] 은 중계 카메라에서 늘 안 보이는 코트 자리 (gtt hidden-lines).
     아마추어 체육관은 3점 라인이 옛 규격(6.25m)으로 남아 있거나 두 줄로 칠해진 곳이 있어, 경기에 쓰는 실제 칠한 라인에 맞춘다."""
     if name.upper() in C.SPECS:
         return C.SPECS[name.upper()]
@@ -46,7 +47,10 @@ def _spec(name: str) -> C.CourtSpec:
     if bad:
         sys.exit(f"{name}: 모르는 항목 {bad} (쓸 수 있는 것: {sorted(fields)})")
     d.setdefault("name", p.stem)
-    return dataclasses.replace(base, **{k: (v if k == "name" else float(v)) for k, v in d.items()})
+    hidden = tuple(tuple(float(x) for x in r) for r in d.pop("hidden", []) or [])
+    if any(len(r) != 4 for r in hidden):
+        sys.exit(f"{name}: hidden 은 [x0, y0, x1, y1] 목록이어야 합니다")
+    return dataclasses.replace(base, hidden=hidden, **{k: (v if k == "name" else float(v)) for k, v in d.items()})
 
 
 def _write_csv(path: str, rows: list[dict]) -> None:
@@ -1218,6 +1222,102 @@ def cmd_cam_check(a):
         print(f"저장: {a.out}")
 
 
+def cmd_hidden_lines(a):
+    """캘리브레이션 화면(사람이 맞춘 H)에서 화면 안에 있는데도 흰 선이 전혀 안 보이는 코트 라인 자리를 찾아, 규격 JSON 의
+    hidden(코트 직사각형)으로 저장한다. 라인 정합 점수·줄 검사에서 그 자리를 빼면 맞는 H 의 점수가 제대로 나온다.
+    (실제 KBA D201: 화면 아래 끝에 걸린 가까운 사이드라인·가까운 코너 직선·하프라인 아래쪽이 늘 0~15% — 맞는 H 도 일치율
+    0.57~0.67, 줄 검사 10줄 중 5~6줄이라 다시 찾기·consensus 기준을 못 넘었다)
+    화면 가장자리 --edge-px 안과 그래픽 자리는 보지 않고, 선수에 잠깐 가린 것과 가르려고 --min-run-m 넘게 이어진 자리만 넣는다."""
+    spec = _spec(a.spec)
+    base = dataclasses.replace(spec, hidden=())
+    raw_v = Video(a.video)
+    lens = None
+    if a.lens:
+        from .lens import Lens
+
+        lens = Lens.load(a.lens)
+    graphics_raw = _graphics_raw(raw_v, 0.0, raw_v.duration or 600.0, a.graphics_box, auto=not a.no_graphics_mask)
+    if lens is not None:
+        from .lens import canvas_ignore
+
+        ignore = canvas_ignore(lens, graphics_raw)
+    else:
+        ignore = graphics_raw
+    polys = {n: HG.densify(p, 0.2) for n, p in C.court_polylines(base).items()}
+    seen = {n: np.zeros(len(p), int) for n, p in polys.items()}
+    hits = {n: np.zeros(len(p), int) for n, p in polys.items()}
+    shown = None
+    for c in a.calib:
+        H, d = _load_calib(c)
+        if d.get("t_sec") is None:
+            sys.exit(f"{c} 에 t_sec(캘리브레이션한 화면 시각)가 없습니다")
+        raw = raw_v.frame_at(float(d["t_sec"]))
+        if lens is not None:
+            H, _ = _calib_on_canvas(H, d, raw, lens, base, ignore)
+            frame = lens.undistort(raw)
+        else:
+            frame = raw
+        h, w = frame.shape[:2]
+        m = HG.line_mask(frame) > 0
+        if ignore is not None:
+            m &= ~ignore
+        dist = cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 5)
+        learn = np.zeros((h, w), np.uint8) if ignore is None else ignore.astype(np.uint8)
+        k = 2 * int(a.edge_px) + 1
+        learn = cv2.dilate(learn, np.ones((k, k), np.uint8)) > 0  # 그래픽·검정 여백 가장자리 근처는 보지 않음
+        for n, pts in polys.items():
+            uv = HG.project(H, pts)
+            ok = HG._visible(uv, w, h, learn, border=int(a.edge_px))
+            ui = np.round(uv[ok]).astype(int)
+            seen[n][ok] += 1
+            hits[n][ok] += dist[ui[:, 1], ui[:, 0]] <= a.tol
+        if shown is None:
+            shown = (frame.copy(), H)
+    rects, found = [], []
+    for n, pts in polys.items():
+        miss = np.flatnonzero((seen[n] > 0) & (hits[n] == 0))
+        if not len(miss):
+            continue
+        runs = np.split(miss, np.flatnonzero(np.diff(miss) > 2) + 1)  # 한 점 빠진 곳은 이어서 본다
+        for r in runs:
+            seg = pts[r[0]: r[-1] + 1]
+            length = float(np.sum(np.linalg.norm(np.diff(seg, axis=0), axis=1))) if len(seg) > 1 else 0.0
+            if length < a.min_run_m:
+                continue
+            found.append((n, length, seg[0], seg[-1]))
+            step = max(1, int(round(a.piece_m / 0.2)))
+            for i in range(0, len(seg), step):
+                q = seg[i: i + step + 1]
+                rects.append([round(float(q[:, 0].min() - a.pad_m), 2), round(float(q[:, 1].min() - a.pad_m), 2),
+                              round(float(q[:, 0].max() + a.pad_m), 2), round(float(q[:, 1].max() + a.pad_m), 2)])
+    for n, length, p0, p1 in found:
+        print(f"{n}: ({p0[0]:.1f},{p0[1]:.1f}) ~ ({p1[0]:.1f},{p1[1]:.1f}) {length:.1f}m 안 보임")
+    for n in polys:
+        if seen[n].any():
+            vis = seen[n] > 0
+            print(f"  {n}: 화면 안 {int(vis.sum())}점 중 흰 선 {int((hits[n][vis] > 0).sum())}점")
+    p = Path(a.spec)
+    d = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"base": spec.name}
+    d["hidden"] = rects
+    Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+    Path(a.out).write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"저장: {a.out} (안 보이는 자리 {len(found)}곳, 직사각형 {len(rects)}개)")
+    if a.image and shown is not None:
+        img, H = shown
+        hid = dataclasses.replace(base, hidden=tuple(tuple(r) for r in rects))
+        for n, pts in polys.items():
+            uv = HG.project(H, pts)
+            keep = HG.unhidden(hid, pts)
+            for i in range(len(pts) - 1):
+                col = (0, 255, 255) if keep[i] and keep[i + 1] else (0, 0, 255)  # 노랑 = 점수에 씀, 빨강 = 뺌
+                p0, p1 = uv[i], uv[i + 1]
+                if np.all(np.isfinite([*p0, *p1])) and max(abs(p0).max(), abs(p1).max()) < 1e5:
+                    cv2.line(img, tuple(int(round(x)) for x in p0), tuple(int(round(x)) for x in p1), col, 2)
+        Path(a.image).parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(a.image, img)
+        print(f"그림: {a.image} (노랑 = 점수에 씀, 빨강 = 안 보여서 뺌)")
+
+
 def cmd_line_check(a):
     """추적 결과(npz)의 샘플마다 그 H 로 그린 코트 라인이 화면 흰 선과 얼마나 맞는지 (consensus 기준 정하기·틀린 H 찾기 진단).
     줄마다 8px(--tol) 안 30% 이상 겹치면 '맞은 줄'. center_x 는 화면 가운데가 보는 코트 x (하프라인 = 길이/2)."""
@@ -1739,6 +1839,22 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--max-cam-px", type=float, default=8.0)
     q.add_argument("--out", default=None, help="샘플별 CSV (t_sec, status, cam_px)")
+
+    q = add("hidden-lines", cmd_hidden_lines, "캘리브레이션 화면에서 늘 안 보이는 코트 라인 자리를 찾아 규격 JSON 의 hidden 으로 저장")
+    q.add_argument("--video", required=True)
+    q.add_argument("--calib", action="append", required=True, help="t_sec 가 있는 캘리브레이션 JSON (여러 번, 양쪽 골대 화면)")
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
+    q.add_argument("--lens", default=None, help="lens-fit 결과 JSON (캘리브레이션을 편 화면으로 옮겨서 봄)")
+    q.add_argument("--tol", type=float, default=4.0, help="이 px 안에 흰 선이 있으면 보임")
+    q.add_argument("--edge-px", type=float, default=30.0, help="화면·그래픽·검정 여백 가장자리 이 px 안은 보지 않음")
+    q.add_argument("--min-run-m", type=float, default=2.0, help="이보다 길게 이어져 안 보이는 자리만 (선수에 잠깐 가린 것 빼기)")
+    q.add_argument("--piece-m", type=float, default=1.0, help="안 보이는 자리를 이 길이 조각의 직사각형으로 저장")
+    q.add_argument("--pad-m", type=float, default=0.15, help="직사각형 여유 (m)")
+    q.add_argument("--graphics-box", action="append", default=None,
+                   help="방송 그래픽 자리 원본 화면 x,y,w,h (여러 번) 또는 JSON")
+    q.add_argument("--no-graphics-mask", action="store_true")
+    q.add_argument("--image", default=None, help="첫 캘리브레이션 화면에 쓸 줄(노랑)·뺀 줄(빨강)을 그린 그림")
+    q.add_argument("--out", required=True, help="저장할 규격 JSON (원래 --spec 내용 + hidden)")
 
     q = add("line-check", cmd_line_check, "추적 결과의 H 마다 코트 라인이 화면 흰 선과 얼마나 맞는지 (consensus 기준 진단)")
     q.add_argument("--track", required=True)

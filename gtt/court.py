@@ -29,6 +29,9 @@ class CourtSpec:
     line_width: float = 0.05
     # 찍은 '두 발 가운데'에서 림 쪽 발끝까지 (신발 길이 절반 정도). 라인을 밟았는지는 발끝으로 정한다.
     foot_reach: float = 0.14
+    # 이 체육관 중계 카메라에서 늘 안 보이는 코트 자리 (x0, y0, x1, y1) 직사각형들. 라인 정합 점수·줄 검사에서 뺀다.
+    # 예: 화면 아래 끝에 걸리는 가까운 사이드라인 (gtt hidden-lines 가 캘리브레이션 화면에서 찾는다)
+    hidden: tuple = ()
 
     @property
     def corner_offset(self) -> float:

@@ -4,6 +4,7 @@ H 는 항상 "코트(m) → 화면(px)" 방향으로 저장한다. 화면 → �
 """
 from __future__ import annotations
 
+import functools
 import math
 
 from dataclasses import dataclass
@@ -517,7 +518,30 @@ def _line_elements(spec: CourtSpec = FIBA) -> list[tuple[str, np.ndarray]]:
         el[f"{sd}_corner_a"] = [(fx(0), m - c), (fx(ce), m - c)]
         el[f"{sd}_corner_b"] = [(fx(0), m + c), (fx(ce), m + c)]
         el[f"{sd}_arc"] = polys[f"{sd}_three"][2:-2]
-    return [(k, densify(v, 0.2)) for k, v in el.items()]
+    out = []
+    for k, v in el.items():
+        pts = densify(v, 0.2)
+        pts = pts[unhidden(spec, pts)]
+        if len(pts):
+            out.append((k, pts))
+    return out
+
+
+def unhidden(spec: CourtSpec, pts: np.ndarray) -> np.ndarray:
+    """코트 점들 중 spec.hidden(늘 안 보이는 코트 자리)에 안 걸리는 것 = True."""
+    pts = np.asarray(pts, float)
+    keep = np.ones(len(pts), bool)
+    for x0, y0, x1, y1 in spec.hidden:
+        keep &= ~((pts[:, 0] >= min(x0, x1)) & (pts[:, 0] <= max(x0, x1))
+                  & (pts[:, 1] >= min(y0, y1)) & (pts[:, 1] <= max(y0, y1)))
+    return keep
+
+
+@functools.lru_cache(maxsize=16)
+def _score_pts(spec: CourtSpec, step: float) -> np.ndarray:
+    """라인 정합 점수·잔차에 쓰는 코트 라인 점 (step m 간격, 늘 안 보이는 자리 뺌)."""
+    pts = np.concatenate([densify(p, step) for p in court_polylines(spec).values()])
+    return pts[unhidden(spec, pts)]
 
 
 def key_area(H: np.ndarray, spec: CourtSpec = FIBA) -> float:
@@ -663,7 +687,7 @@ def refine_homography(
     def out(Hx, sc):
         return (Hx, sc, line_support(dist, Hx, spec, ignore=ignore)) if return_support else (Hx, sc)
 
-    court_pts = np.concatenate([densify(p, 0.2) for p in court_polylines(spec).values()])
+    court_pts = _score_pts(spec, 0.2)
     if mask.sum() < min_matches:
         return out(H, 0.0)
     xs = np.tile(np.arange(w, dtype=np.float32), (h, 1))
@@ -774,7 +798,7 @@ def line_residual(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, cap:
     cnt = cv2.boxFilter(mf, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
     sx = cv2.boxFilter(mf * xs, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
     sy = cv2.boxFilter(mf * ys, -1, k, normalize=False, borderType=cv2.BORDER_CONSTANT)
-    pts = np.concatenate([densify(p, 0.1) for p in court_polylines(spec).values()])
+    pts = _score_pts(spec, 0.1)
     uv = project(H, pts)
     ok = _visible(uv, w, h, ignore, border=r + 1)
     if ok.sum() == 0:

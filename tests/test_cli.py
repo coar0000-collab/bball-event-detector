@@ -534,3 +534,37 @@ def test_shot_one_way_when_shot_frame_is_blurry(synthetic, capsys, tmp_path, mon
                   "--side", "left"])
     assert "none" in str(e.value)
     monkeypatch.setattr(HG, "refine_homography", real_refine)
+
+
+def test_hidden_lines_learns_court_spots_the_camera_never_sees(tmp_path, capsys):
+    """캘리브레이션 화면에서 화면 안인데도 늘 흰 선이 안 보이는 자리(예: 화면 아래 끝 가까운 사이드라인)를 찾아 규격 JSON 의
+    hidden 으로 저장하고, 그 규격으로는 맞는 H 의 일치율·줄 검사가 제대로 나온다.
+    (실제 KBA D201: 가까운 사이드라인·코너 직선·하프라인 아래쪽이 늘 0~15% → 맞는 H 도 0.57~0.67, 줄 10개 중 5~6개)"""
+    from test_homography import make_scene
+
+    frame, H = make_scene(shift=(-200.0, 0.0))
+    # 코트 y=0 사이드라인을 따라 띠를 칠해 가린다 (관중·기록석에 늘 가리는 자리)
+    band = np.array([HG.court_to_image(H, x, y) for x, y in [(-2, -0.8), (30, -0.8), (30, 0.8), (-2, 0.8)]], np.float32)
+    cv2.fillPoly(frame, [np.round(band).astype(np.int32)], (60, 60, 60))
+    video = tmp_path / "v.avi"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (1280, 720))
+    for _ in range(10):
+        w.write(frame)
+    w.release()
+    calib = tmp_path / "calib.json"
+    calib.write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "H_court_to_image": H.tolist()}))
+    out = tmp_path / "court_hidden.json"
+    cli.main(["hidden-lines", "--video", str(video), "--calib", str(calib), "--no-graphics-mask", "--out", str(out),
+              "--image", str(tmp_path / "hidden.png")])
+    txt = capsys.readouterr().out
+    assert "boundary" in txt and (tmp_path / "hidden.png").exists()
+    spec = cli._spec(str(out))
+    assert len(spec.hidden) >= 5
+    # 가린 사이드라인(y=0)은 빠지고, 키·아크·반대쪽 사이드라인은 그대로
+    assert not HG.unhidden(spec, np.array([[10.0, 0.0], [20.0, 0.0]])).any()
+    assert HG.unhidden(spec, np.array([[5.8, 7.5], [1.575 + 6.75, 7.5], [10.0, 15.0]])).all()
+    raw = Video(str(video)).frame_at(0.0)
+    _, s0, sup0 = HG.refine_homography(raw, H, FIBA, return_support=True)
+    _, s1, sup1 = HG.refine_homography(raw, H, spec, return_support=True)
+    assert s1 > s0 and s1 >= 0.9
+    assert sup1[0] < sup0[0] or sup1[1] / sup1[0] >= sup0[1] / sup0[0]
