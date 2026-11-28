@@ -576,3 +576,41 @@ def test_hidden_lines_learns_court_spots_the_camera_never_sees(tmp_path, capsys)
     cli.main(["hidden-lines", "--video", str(video), "--calib", str(calib), "--calib", str(calib), "--no-graphics-mask",
               "--min-views", "2", "--out", str(out2)])
     assert cli._spec(str(out2)).hidden == spec.hidden
+
+
+def test_frame_fit_finds_per_frame_lens_for_zoomed_view(tmp_path, capsys):
+    """줌 렌즈는 줌에 따라 휨이 달라, 기준 화면의 k1 하나로 편 화면끼리는 화면 변환 하나로 맞지 않는다. frame-fit 은 대상
+    화면의 k1 을 바꿔 가며 기준 화면에서 옮겨 와 흰 선에 맞추고, 가장 잘 맞는 k1 과 H 를 그 화면의 캘리브레이션으로 낸다.
+    (실제 KBA D201: k1 -0.26 하나로는 줌이 다른 24 화면이 특징점 500~850개인데도 일치율 0.06~0.69 로 틀렸다)"""
+    from test_lens import distorted_scene
+
+    from gtt.lens import Lens
+
+    raw_a, _, lens_a, Ha = distorted_scene(-0.10, shift=(0.0, 0.0))
+    raw_b, _, lens_b, Hb = distorted_scene(-0.22, shift=(-90.0, 15.0))
+    video = tmp_path / "zoom.avi"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (1280, 720))
+    for i in range(20):
+        w.write(raw_a if i < 10 else raw_b)
+    w.release()
+    calib = tmp_path / "anchor.json"
+    calib.write_text(json.dumps({"spec": "FIBA", "t_sec": 0.0, "H_court_to_image": Ha.tolist(), "lens": lens_a.as_dict()}))
+    out = tmp_path / "ff"
+    cli.main(["frame-fit", "--video", str(video), "--calib", str(calib), "--t", "1.5", "--no-graphics-mask",
+              "--k-min", "-0.30", "--k-max", "-0.04", "--k-step", "0.06", "--out-dir", str(out)])
+    txt = capsys.readouterr().out
+    d = json.loads((out / "frame_1_50.json").read_text())
+    assert abs(d["lens"]["k1"] - (-0.22)) < 0.035 and d["line_score"] >= 0.9, txt
+    lb = Lens(**d["lens"])
+    H = np.array(d["H_court_to_image"])
+    for x, y in [(1.575 + 6.0, 7.5), (3.0, 2.0), (8.0, 13.0), (14.0, 7.5)]:
+        p = lb.distort_pts([HG.court_to_image(H, x, y)])[0]
+        q = lens_b.distort_pts([HG.court_to_image(Hb, x, y)])[0]
+        assert np.hypot(*(p - q)) < 4.0, (x, y)
+    # 다른 렌즈의 편 화면에서 맞춘 캘리브레이션은 추적 렌즈의 편 화면으로 옮겨 쓴다. 두 편 화면 사이는 화면 변환 하나가
+    # 아니라 근사라서 화면 가장자리는 10px 안팎 어긋난다 (추적 앵커의 출발점으로는 충분)
+    Hc, _ = cli._calib_on_canvas(H, d, raw_b, lens_a, FIBA, None)
+    for x, y in [(5.8, 7.5), (14.0, 7.5), (8.0, 13.0)]:
+        p = lens_a.distort_pts([HG.court_to_image(Hc, x, y)])[0]
+        q = lens_b.distort_pts([HG.court_to_image(Hb, x, y)])[0]
+        assert np.hypot(*(p - q)) < 20.0, (x, y)

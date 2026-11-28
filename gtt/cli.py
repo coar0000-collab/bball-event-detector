@@ -383,15 +383,22 @@ def _calib_on_canvas(H: np.ndarray, d: dict, frame_raw: np.ndarray, lens, spec, 
     """원본 화면에서 맞춘 캘리브레이션 H 를 렌즈 휨을 편 화면(canvas) 용으로 바꾼다. (H, 일치율)
 
     사람이 찍은 점(image_points)이 있으면 그 점을 펴서 다시 맞추고, 없으면 H 를 옮긴 뒤 흰 라인에 다시 맞춘다."""
-    from .lens import convert_h
+    from .lens import Lens, convert_h, convert_h_between
 
+    dl = d.get("lens") or {}
+    d_lens = (Lens(float(dl["k1"]), int(dl["width"]), int(dl["height"]), int(dl.get("pad", -1)))
+              if dl and abs(float(dl.get("k1", 0.0))) > 1e-9 else None)
     if lens is None or lens.is_identity:
-        return H, None  # 휨 보정 없음(k1=0): 원본 화면 그대로
-    if d.get("lens") and abs(float(d["lens"].get("k1", 0.0)) - lens.k1) < 1e-9:
+        # 휨 보정 없음(k1=0): 원본 화면 그대로. 다른 k1 로 편 화면에서 맞춘 캘리브레이션(frame-fit)이면 원본으로 옮긴다
+        return (convert_h_between(H, d_lens, None, spec) if d_lens is not None else H), None
+    if d_lens is not None and abs(d_lens.k1 - lens.k1) < 1e-9:
         return H, None  # 이미 편 화면에서 맞춘 캘리브레이션
     Hc = None
     pts = d.get("image_points") or {}
-    if len(pts) >= 4:
+    if d_lens is not None:
+        # 다른 k1 로 편 화면에서 맞춘 캘리브레이션 (줌에 따라 휨이 달라 화면마다 k1 을 따로 맞춘 것, gtt frame-fit)
+        Hc = convert_h_between(H, d_lens, lens, spec)
+    elif len(pts) >= 4:
         und = {k: tuple(lens.undistort_pts([v])[0]) for k, v in pts.items()}
         try:
             Hc, _ = HG.fit_homography(und, spec)
@@ -1222,6 +1229,120 @@ def cmd_cam_check(a):
         print(f"저장: {a.out}")
 
 
+def cmd_frame_fit(a):
+    """화면마다 렌즈 휨 k1 을 따로 찾아 그 화면의 코트 H 를 맞춘다 (줌 렌즈는 줌에 따라 휨이 달라진다).
+
+    기준 캘리브레이션 화면(--calib)과 대상 화면을 각자의 k1 로 편 뒤 특징점으로 화면 변환 F 를 구해 H = F × 기준 H 로
+    옮기고, 흰 선에 다시 맞춘다. 대상 화면의 k1 을 --k-min~--k-max 에서 바꿔 가며 일치율이 가장 높은 것을 고른다.
+    두 화면이 각자 제대로 펴졌을 때만 둘 사이가 화면 변환 하나라서, 맞는 k1 에서 일치율이 뚜렷이 높다.
+    (실제 KBA D201: k1 -0.26 하나로 편 화면끼리는 줌이 다른 24 화면 모두 특징점 500~850개인데 일치율 0.06~0.69 로 틀렸다)
+    결과는 --out-dir 에 화면마다 캘리브레이션 JSON(그 화면의 lens 포함)과 겹친 그림으로 저장. track-court --calib 에 그대로
+    넣으면 추적 렌즈의 편 화면으로 옮겨 앵커로 쓴다."""
+    from .lens import Lens, canvas_ignore
+
+    spec = _spec(a.spec)
+    raw_v = Video(a.video)
+    w, h = raw_v.width, raw_v.height
+    graphics_raw = _graphics_raw(raw_v, 0.0, raw_v.duration or 600.0, a.graphics_box, auto=not a.no_graphics_mask)
+    base_lens = Lens.load(a.lens) if a.lens else None
+    ks = [round(float(k), 4) for k in np.arange(a.k_min, a.k_max + 1e-9, a.k_step)]
+    lenses: dict = {}
+
+    def lens_of(k):
+        if k not in lenses:
+            lenses[k] = Lens(k, w, h)
+        return lenses[k]
+
+    orb = HG.make_orb()
+    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    def feats(img, ign):
+        g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        m = None if ign is None else np.where(cv2.dilate(ign.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0, 0, 255).astype(np.uint8)
+        return orb.detectAndCompute(g, m)
+
+    anchors = []
+    for c in a.calib:
+        H, d = _load_calib(c)
+        if d.get("t_sec") is None:
+            sys.exit(f"{c} 에 t_sec 가 없습니다")
+        dl = d.get("lens") or {}
+        la = (Lens(float(dl["k1"]), int(dl["width"]), int(dl["height"]), int(dl.get("pad", -1)))
+              if dl and abs(float(dl.get("k1", 0.0))) > 1e-9 else None)
+        raw_a = raw_v.frame_at(float(d["t_sec"]))
+        if la is None and base_lens is not None and not base_lens.is_identity:
+            H, _ = _calib_on_canvas(H, d, raw_a, base_lens, spec, canvas_ignore(base_lens, graphics_raw))
+            la = base_lens
+        img_a = la.undistort(raw_a) if la is not None else raw_a
+        ign_a = canvas_ignore(la, graphics_raw) if la is not None else graphics_raw
+        kp, des = feats(img_a, ign_a)
+        anchors.append((Path(c).stem, H, kp, des))
+    out_dir = Path(a.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for t in a.t:
+        raw = raw_v.frame_at(float(t))
+        best = None  # (support 통과, 일치율, k1, H, sup, 앵커, inliers)
+        curve, cands = [], []
+        for k in ks:
+            lt = lens_of(k)
+            img = lt.undistort(raw)
+            ign = canvas_ignore(lt, graphics_raw)
+            kp2, d2 = feats(img, ign)
+            if d2 is None or len(kp2) < 40:
+                continue
+            kbest = None
+            for name, Ha, kp1, d1 in anchors:
+                if d1 is None:
+                    continue
+                m = matcher.match(d1, d2)
+                if len(m) < 40:
+                    continue
+                p1 = np.float32([kp1[x.queryIdx].pt for x in m])
+                p2 = np.float32([kp2[x.trainIdx].pt for x in m])
+                F, inl = cv2.findHomography(p1, p2, HG.ROBUST, 3.0)
+                if F is None or inl is None or int(inl.sum()) < 40:
+                    continue
+                Hr, sc, sup = HG.refine_best(img, F @ Ha, spec, ignore=ign, rounds=6, wide_px=int(a.wide_px))
+                cand = (HG.support_ok(sup), sc, k, Hr, sup, name, int(inl.sum()))
+                if kbest is None or cand[:2] > kbest[:2]:
+                    kbest = cand
+            if kbest is None:
+                continue
+            curve.append((k, kbest[1]))
+            cands.append(kbest)
+        if cands:
+            # 일치율(±4px 안 비율)은 맞는 k1 근처에서 1.0 에 붙으므로, 가장 좋은 것에서 0.02 안의 후보들은 흰 선 가운데까지
+            # 평균 거리(line_residual)가 가장 작은 것으로 고른다 (lens-fit 과 같은 기준)
+            top = max(c[:2] for c in cands)
+            near = [c for c in cands if c[0] == top[0] and c[1] >= top[1] - 0.02]
+            res = []
+            for c in near:
+                lt = lens_of(c[2])
+                res.append(HG.line_residual(lt.undistort(raw), c[3], spec, ignore=canvas_ignore(lt, graphics_raw))[0])
+            best = near[int(np.argmin(res))]
+        if best is None:
+            print(f"{t:.2f}s: 기준 화면과 못 맞춤")
+            rows.append({"t_sec": t, "k1": "", "line_score": "", "support": "", "anchor": "", "inliers": ""})
+            continue
+        okay, sc, k, Hr, sup, name, n = best
+        lt = lens_of(k)
+        rows.append({"t_sec": t, "k1": k, "line_score": round(sc, 3), "support": "/".join(map(str, sup)), "anchor": name,
+                     "inliers": n})
+        print(f"{t:.2f}s: k1 {k:+.3f} 일치율 {sc:.3f} 줄 {sup[1]}/{sup[0]} 엇갈림 {sup[2]} (기준 {name}, 특징점 {n})  "
+              + " ".join(f"{kk:+.2f}:{ss:.2f}" for kk, ss in curve))
+        stem = f"frame_{t:.2f}".replace(".", "_")
+        (out_dir / f"{stem}.json").write_text(json.dumps({
+            "spec": spec.name, "t_sec": float(t), "H_court_to_image": Hr.tolist(), "lens": lt.as_dict(),
+            "line_score": round(sc, 4), "support": list(sup), "made_by": "frame-fit", "anchor": name}, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        img = lt.undistort(raw)
+        HG.draw_court(img, Hr, spec, (0, 255, 255), 2)
+        cv2.imwrite(str(out_dir / f"{stem}.jpg"), img)
+    _write_csv(str(out_dir / "frame_fit.csv"), rows)
+    print(f"저장: {out_dir} (화면마다 JSON·그림, frame_fit.csv)")
+
+
 def cmd_hidden_lines(a):
     """캘리브레이션 화면(사람이 맞춘 H)에서 화면 안에 있는데도 흰 선이 전혀 안 보이는 코트 라인 자리를 찾아, 규격 JSON 의
     hidden(코트 직사각형)으로 저장한다. 라인 정합 점수·줄 검사에서 그 자리를 빼면 맞는 H 의 점수가 제대로 나온다.
@@ -1254,17 +1375,25 @@ def cmd_hidden_lines(a):
         if d.get("t_sec") is None:
             sys.exit(f"{c} 에 t_sec(캘리브레이션한 화면 시각)가 없습니다")
         raw = raw_v.frame_at(float(d["t_sec"]))
-        if lens is not None:
+        dl = d.get("lens") or {}
+        own = None
+        if dl and abs(float(dl.get("k1", 0.0))) > 1e-9:
+            from .lens import Lens, canvas_ignore as _ci
+
+            own = Lens(float(dl["k1"]), int(dl["width"]), int(dl["height"]), int(dl.get("pad", -1)))
+        if own is not None:  # 그 화면만의 렌즈로 편 화면에서 맞춘 캘리브레이션 (frame-fit) → 그 편 화면에서 본다
+            frame, ign = own.undistort(raw), _ci(own, graphics_raw)
+        elif lens is not None:
             H, _ = _calib_on_canvas(H, d, raw, lens, base, ignore)
-            frame = lens.undistort(raw)
+            frame, ign = lens.undistort(raw), ignore
         else:
-            frame = raw
+            frame, ign = raw, ignore
         h, w = frame.shape[:2]
         m = HG.line_mask(frame) > 0
-        if ignore is not None:
-            m &= ~ignore
+        if ign is not None:
+            m &= ~ign
         dist = cv2.distanceTransform((~m).astype(np.uint8), cv2.DIST_L2, 5)
-        learn = np.zeros((h, w), np.uint8) if ignore is None else ignore.astype(np.uint8)
+        learn = np.zeros((h, w), np.uint8) if ign is None else ign.astype(np.uint8)
         k = 2 * int(a.edge_px) + 1
         learn = cv2.dilate(learn, np.ones((k, k), np.uint8)) > 0  # 그래픽·검정 여백 가장자리 근처는 보지 않음
         for n, pts in polys.items():
@@ -1841,6 +1970,20 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
     q.add_argument("--max-cam-px", type=float, default=8.0)
     q.add_argument("--out", default=None, help="샘플별 CSV (t_sec, status, cam_px)")
+
+    q = add("frame-fit", cmd_frame_fit, "화면마다 렌즈 휨 k1 을 따로 찾아 코트 H 를 맞춤 (줌 렌즈, 기준 캘리브레이션에서 옮겨 옴)")
+    q.add_argument("--video", required=True)
+    q.add_argument("--calib", action="append", required=True, help="기준 캘리브레이션 JSON (t_sec 필요, 여러 번)")
+    q.add_argument("--lens", default=None, help="기준 캘리브레이션에 lens 가 없을 때 그 화면을 펼 렌즈 JSON")
+    q.add_argument("--t", type=float, action="append", required=True, help="맞출 화면 시각 (여러 번)")
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
+    q.add_argument("--k-min", type=float, default=-0.40)
+    q.add_argument("--k-max", type=float, default=0.0)
+    q.add_argument("--k-step", type=float, default=0.02)
+    q.add_argument("--wide-px", type=float, default=24.0, help="12px 창 정합이 0.8 에 못 미치면 이 창으로도")
+    q.add_argument("--graphics-box", action="append", default=None, help="방송 그래픽 자리 원본 화면 x,y,w,h 또는 JSON")
+    q.add_argument("--no-graphics-mask", action="store_true")
+    q.add_argument("--out-dir", required=True)
 
     q = add("hidden-lines", cmd_hidden_lines, "캘리브레이션 화면에서 늘 안 보이는 코트 라인 자리를 찾아 규격 JSON 의 hidden 으로 저장")
     q.add_argument("--video", required=True)

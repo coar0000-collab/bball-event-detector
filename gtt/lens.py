@@ -157,6 +157,26 @@ def convert_h(H_raw: np.ndarray, lens: Lens, spec=None) -> np.ndarray:
     return H / H[2, 2]
 
 
+def convert_h_between(H: np.ndarray, lens_from: "Lens | None", lens_to: "Lens | None", spec=None) -> np.ndarray:
+    """lens_from 의 편 화면(None 이면 원본 화면)에서 맞춘 H 를 lens_to 의 편 화면(None 이면 원본)용으로 옮긴다.
+    두 화면 사이는 호모그래피가 아니므로 근사다 (옮긴 뒤 라인에 다시 맞춰야 한다)."""
+    from .court import FIBA, court_polylines
+    from .homography import densify, project
+
+    spec = spec or FIBA
+    pts = np.concatenate([densify(p, 0.25) for p in court_polylines(spec).values()])
+    uv = project(H, pts)
+    raw = lens_from.distort_pts(uv) if lens_from is not None and not lens_from.is_identity else uv
+    ref = lens_from or lens_to
+    w, h = (ref.width, ref.height) if ref is not None else (np.inf, np.inf)
+    m = np.all(np.isfinite(raw), axis=1) & (raw[:, 0] >= 0) & (raw[:, 0] < w) & (raw[:, 1] >= 0) & (raw[:, 1] < h)
+    if m.sum() < 8:
+        raise ValueError("원본 화면 안에 코트 점이 너무 적습니다")
+    dst = lens_to.undistort_pts(raw[m]) if lens_to is not None and not lens_to.is_identity else raw[m]
+    Hc, _ = cv2.findHomography(pts[m], dst, 0)
+    return Hc / Hc[2, 2]
+
+
 class LensVideo:
     """Video 와 같은 모양으로 쓰되 화면을 편 화면(canvas)으로 돌려준다."""
 
