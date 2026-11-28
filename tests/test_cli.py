@@ -479,17 +479,17 @@ def test_shot_skips_h_that_puts_foot_in_other_half(synthetic, capsys, tmp_path):
     assert float(rows[6.0]["center_x"]) - float(rows[5.5]["center_x"]) > 10
 
 
-def test_shot_turns_180_twin_h_around(synthetic, capsys, tmp_path):
-    """코트는 180° 돌려도 흰 선이 똑같아서, 반대편 카메라 화면(또는 반대쪽 골대 화면)을 돌려 맞춘 H 도 키·아크까지 흰 선과 다 맞는다.
-    공격 방향(--side)을 알면 발이 반대쪽 코트로 가는 것으로 알아채고, 선이 다 맞으니 코트를 180° 돌린 H 로 판정한다.
-    (실제 B-LAB holdout 383·414·447·529s: 발을 180° 돌리면 넷 다 정답 2/3점)"""
+def test_shot_drops_far_court_h_even_if_lines_fit(synthetic, capsys, tmp_path):
+    """코트는 180° 돌려도 흰 선이 똑같아서 키·아크까지 흰 선과 다 맞는 H 라도, 공격 방향(--side)으로 보아 발이 반대쪽 코트로
+    가면 버리고 앞뒤에서 이어 온다. 돌려 쓰지 않는다.
+    (실제 B-LAB holdout 383·414·447·529s: 그런 H 는 쌍둥이가 아니라 팬·줌이 틀린 H 였다 — 돌리면 529s 레이업이 6m)"""
     d, video, Hs = synthetic
     track = tmp_path / "tr.npz"
     cli.main(["track-court", "--video", str(video), "--calib", str(d / "calib.json"), "--step", "0.5", "--out", str(track)])
     z = dict(np.load(track))
     i = int(np.argmin(np.abs(z["times"] - 6.0)))
     H = z["H"].copy()
-    H[i] = H[i] @ np.array([[-1.0, 0, 28.0], [0, -1.0, 15.0], [0, 0, 1]])  # 180° 쌍둥이
+    H[i] = H[i] @ np.array([[-1.0, 0, 28.0], [0, -1.0, 15.0], [0, 0, 1]])  # 흰 선은 다 맞는 180° 쌍둥이
     z["H"] = H
     bad = tmp_path / "twin.npz"
     np.savez(bad, **z)
@@ -499,7 +499,8 @@ def test_shot_turns_180_twin_h_around(synthetic, capsys, tmp_path):
         cli.main(["shot", "--track", str(bad), "--video", str(video), "--t", "6.0", "--u", str(u), "--v", str(v),
                   "--side", "left"])
         res = json.loads(capsys.readouterr().out)
-        assert res["h_source"] == "track+180" and res["points"] == pts and "180° 돌림" in res["h_reject"], res
+        assert res["h_source"] not in ("track", "none") and "+" not in res["h_source"], res
+        assert res["points"] == pts and res["h_reject"].startswith("track:반대쪽코트"), res
         assert np.hypot(res["court_x"] - x, res["court_y"] - y) < 0.15
 
 

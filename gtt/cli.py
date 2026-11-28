@@ -924,10 +924,10 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
     어느 출처든 (1) 발 자리가 코트 밖 off_court_m 넘게 나가거나 (2) 공격 방향(side)을 알 때 발 자리가 그 림에서 하프라인
     너머 far_m 보다 멀거나 (3) max_cam_px > 0 이고 캘리브레이션 화면들의 카메라 자리에서 돌리기·당기기로 그 안으로 만들 수
     없는 H 면 버리고 다음 출처로 간다.
-    단 (2) 에서 그 H 로 그린 키·아크 등이 슛 화면 흰 선과 거의 다(75%+) 맞으면, 코트가 180° 돌려도 똑같이 생긴 탓에 반대편
-    카메라 화면(또는 반대쪽 골대 화면)을 뒤집어 맞춘 것이다 — 흰 선만으로는 둘을 못 가르고 공격 방향이 가른다. 그때는 코트를
-    180° 돌린 H 를 쓴다 (h_source 에 '+180'). (실제 B-LAB holdout 383·414·447·529s: 발을 180° 돌리면 넷 다 정답 2/3점) (실제 B-LAB holdout: 틀린 H 가 슛 4개를 '탑 3점, 라인까지 11~18m' 로 냈다 —
-    발이 반대쪽 골대 근처로 옮겨진 것, 둘은 우연히 점수만 맞음. 하프라인 너머 버저비터는 좌표 없음 → 사람 판정)"""
+    (실제 B-LAB holdout 383·414·447·529s: 틀린 H 가 발을 반대쪽 골대 근처로 옮겨 '탑 3점, 라인까지 11~18m' 로 냈다.
+    그 H 들은 카메라 자리가 캘리브레이션과 같아 반대쪽 골대 쌍둥이가 아니라 팬·줌만 틀린 H 였고 (쌍둥이면 카메라가 코트 건너편),
+    오른쪽 키를 실제 왼쪽 키 위에 얹어 키 선은 맞는다. 그래서 (2) 는 흰 선이 맞아도 버린다. 180° 돌려 쓰면 키 근처 슛은 점수가
+    맞지만 키에서 먼 발은 틀린다 — 529s 레이업이 6m. 하프라인 너머 버저비터는 좌표 없음 → 사람 판정)"""
     info = {"h_source": "none", "h_gap_s": "", "h_agree_m": "", "h_votes": "", "h_cam_px": "", "h_reject": ""}
     if look.track is None:
         info["h_source"] = "calib"
@@ -957,10 +957,9 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
         return shot_frame[0]
 
     far_d = spec.length / 2 - spec.rim_from_baseline + far_m
-    R180 = np.array([[-1.0, 0.0, spec.length], [0.0, -1.0, spec.width], [0.0, 0.0, 1.0]])
 
     def take(src: str, Hx):
-        """출처 src 의 H 를 검사해 쓸 H (그대로 또는 180° 돌린 것) 를 돌려준다. 못 쓰면 None (이유는 h_reject)."""
+        """출처 src 의 H 를 검사해 쓸 수 있으면 그대로 돌려준다. 못 쓰면 None (이유는 h_reject)."""
         why = None
         if uv is not None:
             x, y = HG.image_to_court(Hx, *uv)
@@ -971,15 +970,6 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
                 d = float(np.hypot(x - rx, y - ry))
                 if d > far_d:
                     why = f"반대쪽코트(공격 림까지 {d:.1f}m)"
-                    e = HG.line_evidence(frame_t(), Hx, spec, look.ignore, tol=8.0)
-                    ox, oy = spec.rim("right" if side == "left" else "left")
-                    if (e["n_vis_d"] >= 2 and e["n_good_d"] >= 0.75 * e["n_vis_d"]
-                            and float(np.hypot(x - ox, y - oy)) <= far_d):
-                        rejects.append(f"{src}:{why}→키·아크 {e['n_good_d']}/{e['n_vis_d']} 맞아 180° 돌림")
-                        info["h_reject"] = "; ".join(rejects)
-                        Hx = Hx @ R180
-                        src = src + "+180"
-                        why = None
         r = look.cam_px(Hx, spec, shape) if max_cam_px > 0 else float("nan")
         if why is None and np.isfinite(r) and r > max_cam_px:
             why = f"카메라{r:.0f}px"
@@ -1177,7 +1167,7 @@ def _judge(look, v, t: float, u_raw: float, v_raw: float, spec, side=None, windo
         return None, info, (u, vv)
     frame = look.undistort(v.frame_at(t)) if v is not None else None
     call = HG.classify_click(H, u, vv, spec, side=side, frame=frame, ignore=look.ignore)
-    src = str(info.get("h_source", "")).split("+")[0]
+    src = str(info.get("h_source", ""))
     extra = 0.0
     if info.get("h_agree_m") not in ("", None) and src in ("two-way", "multi-view"):
         extra = float(info["h_agree_m"])  # 두 길이 발 자리에서 어긋난 만큼 위치가 흔들릴 수 있다
