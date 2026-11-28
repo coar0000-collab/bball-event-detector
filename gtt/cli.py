@@ -784,10 +784,16 @@ class _CourtLookup:
     화면은 undistort(), 원본 화면에서 찍은 점은 to_canvas() 로 옮겨 쓴다. ignore: 라인 정합에서 뺀 자리(방송 그래픽 등)."""
 
     def __init__(self, calib: str | None, track: str | None):
-        self.fixed = _load_calib(calib)[0] if calib else None
+        self.fixed, d = _load_calib(calib) if calib else (None, {})
         self.track = np.load(track, allow_pickle=False) if track else None
         self.lens = None
         self.ignore = None
+        dl = d.get("lens") or {}
+        if self.track is None and dl and abs(float(dl.get("k1", 0.0))) > 1e-9:
+            # 편 화면에서 맞춘 캘리브레이션 (frame-fit·calib-edit): 찍은 점은 그 렌즈로 펴서 쓴다
+            from .lens import Lens
+
+            self.lens = Lens(float(dl["k1"]), int(dl["width"]), int(dl["height"]), int(dl.get("pad", -1)))
         if self.track is not None:
             if "lens" in self.track.files:
                 from .lens import Lens

@@ -607,6 +607,14 @@ def test_frame_fit_finds_per_frame_lens_for_zoomed_view(tmp_path, capsys):
         p = lb.distort_pts([HG.court_to_image(H, x, y)])[0]
         q = lens_b.distort_pts([HG.court_to_image(Hb, x, y)])[0]
         assert np.hypot(*(p - q)) < 4.0, (x, y)
+    # 그 화면 캘리브레이션으로 바로 판정: 원본 화면에서 찍은 발(3점 라인 0.3m 바깥)을 그 화면의 렌즈로 펴서 본다
+    th = np.radians(40)
+    dd = FIBA.three_radius + 0.3 + FIBA.foot_reach
+    x, y = 1.575 + dd * np.cos(th), 7.5 + dd * np.sin(th)
+    u, v = lens_b.distort_pts([HG.court_to_image(Hb, x, y)])[0]
+    cli.main(["shot", "--calib", str(out / "frame_1_50.json"), "--u", str(u), "--v", str(v), "--side", "left"])
+    res = json.loads(capsys.readouterr().out)
+    assert res["points"] == 3 and abs(res["margin_m"] - 0.3) < 0.08, res
     # 다른 렌즈의 편 화면에서 맞춘 캘리브레이션은 추적 렌즈의 편 화면으로 옮겨 쓴다. 두 편 화면 사이는 화면 변환 하나가
     # 아니라 근사라서 화면 가장자리는 10px 안팎 어긋난다 (추적 앵커의 출발점으로는 충분)
     Hc, _ = cli._calib_on_canvas(H, d, raw_b, lens_a, FIBA, None)
