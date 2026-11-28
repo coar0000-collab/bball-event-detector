@@ -83,3 +83,19 @@ def test_convert_h_and_lens_video():
     assert lv.frame_at(0).shape[1] == lens.canvas_size[0] and lv.fps == 30.0
     t, f, between = next(lv.iterate_between())
     assert f.shape == between[0].shape == (lens.canvas_size[1], lens.canvas_size[0], 3)
+
+
+def test_court_gap_between_lenses():
+    """서로 다른 k1 로 편 화면에서 맞춘 두 H 가 같은 코트를 보면 0m 가까이, 코트가 1m 옮겨진 H 면 1m 안팎.
+    k1 이 다른 편 화면끼리는 화면 변환 하나로 맞지 않아, k1 이 0.06 다르면 0.1m, 0.2 다르면 0.35m 쯤 어긋나 보인다."""
+    from gtt.lens import convert_h_between, court_gap_m
+
+    raw, _, lens_a, Ha = distorted_scene(-0.10)
+    assert court_gap_m(Ha, lens_a, Ha, Lens(-0.10, 1280, 720), raw.shape, FIBA) < 1e-6
+    lens_b = Lens(-0.16, 1280, 720)
+    Hb = convert_h_between(Ha, lens_a, lens_b, FIBA)
+    assert court_gap_m(Ha, lens_a, Hb, lens_b, raw.shape, FIBA) < 0.15
+    T = np.array([[1, 0, 1.0], [0, 1, 0], [0, 0, 1]])  # 코트에서 x 로 1m 옮김
+    g = court_gap_m(Ha, lens_a, Hb @ T, lens_b, raw.shape, FIBA)
+    assert 0.8 < g < 1.2
+    assert court_gap_m(Ha, lens_a, Ha, None, raw.shape, FIBA) > 0.05  # 렌즈를 빼면 다르게 봄

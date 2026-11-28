@@ -622,3 +622,83 @@ def test_frame_fit_finds_per_frame_lens_for_zoomed_view(tmp_path, capsys):
         p = lens_a.distort_pts([HG.court_to_image(Hc, x, y)])[0]
         q = lens_b.distort_pts([HG.court_to_image(Hb, x, y)])[0]
         assert np.hypot(*(p - q)) < 20.0, (x, y)
+
+
+def _ff_video(tmp_path):
+    """기준 화면 A(k1 -0.10, t=0), 대상 화면 B(k1 -0.22, 옆으로 돈 화면, t=1~2s), 기준 화면 C(k1 -0.16, t=2~3s)."""
+    from test_lens import distorted_scene
+
+    raw_a, _, lens_a, Ha = distorted_scene(-0.10, shift=(0.0, 0.0))
+    raw_b, _, lens_b, Hb = distorted_scene(-0.22, shift=(-90.0, 15.0))
+    raw_c, _, lens_c, Hc = distorted_scene(-0.16, shift=(40.0, -10.0))
+    video = tmp_path / "zoom.avi"
+    w = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 10, (1280, 720))
+    for i in range(30):
+        w.write(raw_a if i < 10 else raw_b if i < 20 else raw_c)
+    w.release()
+    calibs = []
+    for name, t, H, lens in [("A", 0.0, Ha, lens_a), ("C", 2.5, Hc, lens_c)]:
+        p = tmp_path / f"anchor_{name}.json"
+        p.write_text(json.dumps({"spec": "FIBA", "t_sec": t, "H_court_to_image": H.tolist(), "lens": lens.as_dict()}))
+        calibs.append(str(p))
+    return video, calibs, lens_b, Hb
+
+
+def test_frame_fit_votes_prefer_spot_where_anchors_agree(tmp_path):
+    """일치율만으로는 맞는 H 와 틀린 H 가 갈리지 않는다 (실제 KBA D201: 틀린 H 0.77~0.87). 서로 다른 기준 화면에서 출발해
+    같은 코트 자리로 모인 후보가 많은 쪽을 고른다 — 한 기준 화면에서만 나온, 일치율이 조금 더 높은 엉뚱한 자리는 버린다."""
+    from gtt.lens import Lens
+
+    video, calibs, lens_b, Hb = _ff_video(tmp_path)
+    ff = cli._FrameFitter.__new__(cli._FrameFitter)
+    ff.spec, ff.graphics_raw, ff.w, ff.h = FIBA, None, 1280, 720
+    ff.agree_m, ff.min_score, ff.per_anchor = 0.3, 0.65, 4
+    ff._lenses, ff._ign = {}, {}
+    raw = Video(str(video)).frame_at(1.5)
+    T = np.array([[1, 0, 1.2], [0, 1, 0.0], [0, 0, 1]])  # 코트에서 1.2m 옮겨진 자리
+    right = {"k": -0.22, "H": Hb, "sup": (8, 7, 0), "ok": True, "inliers": 300}
+    cands = [dict(right, anchor="A", score=0.86), dict(right, anchor="C", score=0.85),
+             {"k": -0.22, "anchor": "D", "H": Hb @ T, "score": 0.90, "sup": (8, 7, 0), "ok": True, "inliers": 500}]
+    best, info, members = ff.choose(raw, cands)
+    assert best["anchor"] in ("A", "C") and info["votes"] == 2 and info["routes"] == 3
+    assert info["rival_votes"] == 1 and info["rival_score"] == 0.9 and 1.0 < info["rival_gap_m"] < 1.4
+    assert sorted(m["anchor"] for m in members) == ["A", "C"]
+    assert isinstance(ff.lens_of(-0.22), Lens)
+
+
+def test_judge_shots_judges_each_shot_on_its_own_frame_and_resumes(tmp_path, capsys, monkeypatch):
+    """슛마다 그 화면에서 k1·H 를 따로 맞춰 판정한다 (추적 없이). 두 기준 화면이 같은 자리로 모이면 votes 2.
+    끝난 슛은 다시 돌릴 때 건너뛴다 (데스크톱 PC 가 꺼져도 이어서)."""
+    video, calibs, lens_b, Hb = _ff_video(tmp_path)
+    th = np.radians(40)
+
+    def foot(dd):
+        x, y = 1.575 + dd * np.cos(th), 7.5 + dd * np.sin(th)
+        return lens_b.distort_pts([HG.court_to_image(Hb, x, y)])[0]
+
+    u3, v3 = foot(FIBA.three_radius + 0.4 + FIBA.foot_reach)
+    u2, v2 = foot(FIBA.three_radius - 0.8 + FIBA.foot_reach)
+    shots = tmp_path / "shots.csv"
+    with open(shots, "w", newline="", encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=["t_sec", "u", "v", "side", "zone", "team"])
+        wr.writeheader()
+        wr.writerow({"t_sec": 1.5, "u": f"{u3:.1f}", "v": f"{v3:.1f}", "side": "left", "zone": "", "team": "home"})
+        wr.writerow({"t_sec": 1.5, "u": f"{u2:.1f}", "v": f"{v2:.1f}", "side": "left", "zone": "", "team": "away"})
+        wr.writerow({"t_sec": 1.6, "u": "", "v": "", "side": "left", "zone": "", "team": "home"})  # 좌표 없음
+    out = tmp_path / "judged.csv"
+    args = ["judge-shots", "--shots", str(shots), "--video", str(video), "--calib", calibs[0], "--calib", calibs[1],
+            "--no-graphics-mask", "--k-min", "-0.28", "--k-max", "-0.16", "--k-step", "0.06", "--out", str(out),
+            "--img-dir", str(tmp_path / "img")]
+    cli.main(args)
+    txt = capsys.readouterr().out
+    rows = list(csv.DictReader(open(out, encoding="utf-8")))
+    assert [r["points"] for r in rows] == ["3", "2", ""], txt
+    assert abs(float(rows[0]["margin_m"]) - 0.4) < 0.1 and abs(float(rows[1]["margin_m"]) + 0.8) < 0.1, txt
+    assert rows[0]["h_source"] == "frame-fit" and rows[0]["ff_votes"] == "2" and rows[0]["ff_split"] == "False", txt
+    assert abs(float(rows[0]["ff_k1"]) - (-0.22)) < 0.035
+    assert (tmp_path / "img" / "shot_1_50.jpg").exists() and (tmp_path / "img" / "shot_1_50.json").exists()
+    # 다시 돌리면 끝난 슛은 다시 맞추지 않는다
+    monkeypatch.setattr(cli._FrameFitter, "candidates", lambda self, raw: (_ for _ in ()).throw(AssertionError("refit")))
+    cli.main(args)
+    rows2 = list(csv.DictReader(open(out, encoding="utf-8")))
+    assert [r["points"] for r in rows2] == ["3", "2", ""]

@@ -1235,73 +1235,78 @@ def cmd_cam_check(a):
         print(f"저장: {a.out}")
 
 
-def cmd_frame_fit(a):
-    """화면마다 렌즈 휨 k1 을 따로 찾아 그 화면의 코트 H 를 맞춘다 (줌 렌즈는 줌에 따라 휨이 달라진다).
+class _FrameFitter:
+    """화면 하나의 렌즈 휨 k1 과 코트 H 를 기준 캘리브레이션 화면들에서 옮겨 와 맞춘다 (frame-fit·judge-shots 공용).
 
-    기준 캘리브레이션 화면(--calib)과 대상 화면을 각자의 k1 로 편 뒤 특징점으로 화면 변환 F 를 구해 H = F × 기준 H 로
-    옮기고, 흰 선에 다시 맞춘다. 대상 화면의 k1 을 --k-min~--k-max 에서 바꿔 가며 일치율이 가장 높은 것을 고른다.
-    두 화면이 각자 제대로 펴졌을 때만 둘 사이가 화면 변환 하나라서, 맞는 k1 에서 일치율이 뚜렷이 높다.
-    (실제 KBA D201: k1 -0.26 하나로 편 화면끼리는 줌이 다른 24 화면 모두 특징점 500~850개인데 일치율 0.06~0.69 로 틀렸다)
-    결과는 --out-dir 에 화면마다 캘리브레이션 JSON(그 화면의 lens 포함)과 겹친 그림으로 저장. track-court --calib 에 그대로
-    넣으면 추적 렌즈의 편 화면으로 옮겨 앵커로 쓴다."""
-    from .lens import Lens, canvas_ignore
+    기준 화면과 대상 화면을 각자의 k1 로 편 뒤 특징점으로 화면 변환 F 를 구해 H = F × 기준 H 로 옮기고 흰 선에 다시 맞춘다.
+    대상 화면의 k1 을 바꿔 가며 기준 화면마다 후보를 만든다.
 
-    spec = _spec(a.spec)
-    raw_v = Video(a.video)
-    w, h = raw_v.width, raw_v.height
-    graphics_raw = _graphics_raw(raw_v, 0.0, raw_v.duration or 600.0, a.graphics_box, auto=not a.no_graphics_mask)
-    base_lens = Lens.load(a.lens) if a.lens else None
-    ks = [round(float(k), 4) for k in np.arange(a.k_min, a.k_max + 1e-9, a.k_step)]
-    lenses: dict = {}
+    고르기: 일치율만으로는 맞는 H 와 틀린 H 가 갈리지 않는다 (실제 KBA D201: 틀린 H 가 0.77~0.87, 맞는 H 가 0.75~0.89).
+    틀린 H 는 특징점이 한 기준 화면에서 엉뚱하게 이어져 생기므로, 서로 다른 기준 화면에서 출발한 후보들이 같은 코트 자리로
+    모이는지(court_gap_m 이 agree_m 안) 본다. 같은 자리로 모인 기준 화면 수(votes)가 가장 많은 무리에서 일치율로 고른다."""
 
-    def lens_of(k):
-        if k not in lenses:
-            lenses[k] = Lens(k, w, h)
-        return lenses[k]
+    def __init__(self, raw_v, calibs, spec, base_lens, graphics_raw, k_min=-0.40, k_max=0.0, k_step=0.02, wide_px=24,
+                 agree_m=0.3, min_score=0.65, per_anchor=4):
+        from .lens import Lens, canvas_ignore
 
-    orb = HG.make_orb()
-    matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.spec, self.graphics_raw, self.wide_px = spec, graphics_raw, int(wide_px)
+        self.w, self.h = raw_v.width, raw_v.height
+        self.ks = [round(float(k), 4) for k in np.arange(k_min, k_max + 1e-9, k_step)]
+        self.agree_m, self.min_score, self.per_anchor = float(agree_m), float(min_score), int(per_anchor)
+        self._lenses: dict = {}
+        self._ign: dict = {}
+        self.orb = HG.make_orb()
+        self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        self.anchors = []
+        for c in calibs:
+            H, d = _load_calib(c)
+            if d.get("t_sec") is None:
+                sys.exit(f"{c} 에 t_sec 가 없습니다")
+            dl = d.get("lens") or {}
+            la = (Lens(float(dl["k1"]), int(dl["width"]), int(dl["height"]), int(dl.get("pad", -1)))
+                  if dl and abs(float(dl.get("k1", 0.0))) > 1e-9 else None)
+            raw_a = raw_v.frame_at(float(d["t_sec"]))
+            if la is None and base_lens is not None and not base_lens.is_identity:
+                H, _ = _calib_on_canvas(H, d, raw_a, base_lens, spec, canvas_ignore(base_lens, graphics_raw))
+                la = base_lens
+            img_a = la.undistort(raw_a) if la is not None else raw_a
+            ign_a = canvas_ignore(la, graphics_raw) if la is not None else graphics_raw
+            kp, des = self._feats(img_a, ign_a)
+            self.anchors.append((Path(c).stem, H, kp, des))
 
-    def feats(img, ign):
+    def lens_of(self, k):
+        from .lens import Lens
+
+        if k not in self._lenses:
+            self._lenses[k] = Lens(k, self.w, self.h)
+        return self._lenses[k]
+
+    def ignore_of(self, k):
+        from .lens import canvas_ignore
+
+        if k not in self._ign:
+            self._ign[k] = canvas_ignore(self.lens_of(k), self.graphics_raw)
+        return self._ign[k]
+
+    def _feats(self, img, ign):
         g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         m = None if ign is None else np.where(cv2.dilate(ign.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0, 0, 255).astype(np.uint8)
-        return orb.detectAndCompute(g, m)
+        return self.orb.detectAndCompute(g, m)
 
-    anchors = []
-    for c in a.calib:
-        H, d = _load_calib(c)
-        if d.get("t_sec") is None:
-            sys.exit(f"{c} 에 t_sec 가 없습니다")
-        dl = d.get("lens") or {}
-        la = (Lens(float(dl["k1"]), int(dl["width"]), int(dl["height"]), int(dl.get("pad", -1)))
-              if dl and abs(float(dl.get("k1", 0.0))) > 1e-9 else None)
-        raw_a = raw_v.frame_at(float(d["t_sec"]))
-        if la is None and base_lens is not None and not base_lens.is_identity:
-            H, _ = _calib_on_canvas(H, d, raw_a, base_lens, spec, canvas_ignore(base_lens, graphics_raw))
-            la = base_lens
-        img_a = la.undistort(raw_a) if la is not None else raw_a
-        ign_a = canvas_ignore(la, graphics_raw) if la is not None else graphics_raw
-        kp, des = feats(img_a, ign_a)
-        anchors.append((Path(c).stem, H, kp, des))
-    out_dir = Path(a.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for t in a.t:
-        raw = raw_v.frame_at(float(t))
-        best = None  # (support 통과, 일치율, k1, H, sup, 앵커, inliers)
-        curve, cands = [], []
-        for k in ks:
-            lt = lens_of(k)
+    def candidates(self, raw) -> list[dict]:
+        """k1 × 기준 화면마다 후보 하나씩: {k, anchor, H, score, sup, ok, inliers}."""
+        out = []
+        for k in self.ks:
+            lt = self.lens_of(k)
             img = lt.undistort(raw)
-            ign = canvas_ignore(lt, graphics_raw)
-            kp2, d2 = feats(img, ign)
+            ign = self.ignore_of(k)
+            kp2, d2 = self._feats(img, ign)
             if d2 is None or len(kp2) < 40:
                 continue
-            kbest = None
-            for name, Ha, kp1, d1 in anchors:
+            for name, Ha, kp1, d1 in self.anchors:
                 if d1 is None:
                     continue
-                m = matcher.match(d1, d2)
+                m = self.matcher.match(d1, d2)
                 if len(m) < 40:
                     continue
                 p1 = np.float32([kp1[x.queryIdx].pt for x in m])
@@ -1309,44 +1314,233 @@ def cmd_frame_fit(a):
                 F, inl = cv2.findHomography(p1, p2, HG.ROBUST, 3.0)
                 if F is None or inl is None or int(inl.sum()) < 40:
                     continue
-                Hr, sc, sup = HG.refine_best(img, F @ Ha, spec, ignore=ign, rounds=6, wide_px=int(a.wide_px))
-                cand = (HG.support_ok(sup), sc, k, Hr, sup, name, int(inl.sum()))
-                if kbest is None or cand[:2] > kbest[:2]:
-                    kbest = cand
-            if kbest is None:
-                continue
-            curve.append((k, kbest[1]))
-            cands.append(kbest)
-        if cands:
-            # 일치율(±4px 안 비율)은 맞는 k1 근처에서 1.0 에 붙으므로, 가장 좋은 것에서 0.02 안의 후보들은 흰 선 가운데까지
-            # 평균 거리(line_residual)가 가장 작은 것으로 고른다 (lens-fit 과 같은 기준)
-            top = max(c[:2] for c in cands)
-            near = [c for c in cands if c[0] == top[0] and c[1] >= top[1] - 0.02]
-            res = []
-            for c in near:
-                lt = lens_of(c[2])
-                res.append(HG.line_residual(lt.undistort(raw), c[3], spec, ignore=canvas_ignore(lt, graphics_raw))[0])
-            best = near[int(np.argmin(res))]
+                Hr, sc, sup = HG.refine_best(img, F @ Ha, self.spec, ignore=ign, rounds=6, wide_px=self.wide_px)
+                out.append({"k": k, "anchor": name, "H": Hr, "score": float(sc), "sup": tuple(sup),
+                            "ok": bool(HG.support_ok(sup)), "inliers": int(inl.sum())})
+        return out
+
+    def gap(self, a: dict, b: dict) -> float:
+        from .lens import court_gap_m
+
+        return court_gap_m(a["H"], self.lens_of(a["k"]), b["H"], self.lens_of(b["k"]), (self.h, self.w), self.spec)
+
+    def choose(self, raw, cands: list[dict]):
+        """(고른 후보 또는 None, 정보 dict, 같은 무리 후보들 — 기준 화면마다 가장 좋은 것)."""
+        info = {"votes": 0, "routes": 0, "rival_score": "", "rival_votes": "", "rival_gap_m": ""}
+        if not cands:
+            return None, info, []
+        pool = [c for c in cands if c["ok"] and c["score"] >= self.min_score] or cands
+        by_anchor: dict = {}
+        for c in sorted(pool, key=lambda c: -c["score"]):
+            by_anchor.setdefault(c["anchor"], []).append(c)
+        pool = [c for lst in by_anchor.values() for c in lst[: self.per_anchor]]
+        n = len(pool)
+        agree = np.eye(n, dtype=bool)
+        gaps = np.zeros((n, n))
+        for i in range(n):
+            for j in range(i + 1, n):
+                g = max(self.gap(pool[i], pool[j]), self.gap(pool[j], pool[i]))
+                gaps[i, j] = gaps[j, i] = g
+                agree[i, j] = agree[j, i] = g <= self.agree_m
+        votes = [len({pool[j]["anchor"] for j in range(n) if agree[i, j]}) for i in range(n)]
+        top_v = max(votes)
+        group = [i for i in range(n) if votes[i] == top_v]
+        # 일치율(±4px 안 비율)은 맞는 k1 근처에서 1.0 에 붙으므로, 가장 좋은 것에서 0.02 안의 후보들은 흰 선 가운데까지
+        # 평균 거리(line_residual)가 가장 작은 것으로 고른다 (lens-fit 과 같은 기준)
+        top = max((pool[i]["ok"], pool[i]["score"]) for i in group)
+        near = [i for i in group if pool[i]["ok"] == top[0] and pool[i]["score"] >= top[1] - 0.02]
+        res = []
+        for i in near:
+            lt = self.lens_of(pool[i]["k"])
+            res.append(HG.line_residual(lt.undistort(raw), pool[i]["H"], self.spec, ignore=self.ignore_of(pool[i]["k"]))[0])
+        bi = near[int(np.argmin(res))]
+        members: dict = {}
+        for j in range(n):
+            if agree[bi, j] and (pool[j]["anchor"] not in members or pool[j]["score"] > members[pool[j]["anchor"]]["score"]):
+                members[pool[j]["anchor"]] = pool[j]
+        info.update(votes=votes[bi], routes=len(by_anchor))
+        rivals = [j for j in range(n) if not agree[bi, j]]
+        if rivals:
+            r = max(rivals, key=lambda j: (votes[j], pool[j]["score"]))
+            info.update(rival_score=round(pool[r]["score"], 3), rival_votes=votes[r], rival_gap_m=round(float(gaps[bi, r]), 2))
+        return pool[bi], info, list(members.values())
+
+    def save(self, out_dir: Path, stem: str, raw, t: float, best: dict, info: dict, extra: dict | None = None):
+        lt = self.lens_of(best["k"])
+        (out_dir / f"{stem}.json").write_text(json.dumps({
+            "spec": self.spec.name, "t_sec": float(t), "H_court_to_image": best["H"].tolist(), "lens": lt.as_dict(),
+            "line_score": round(best["score"], 4), "support": list(best["sup"]), "made_by": "frame-fit",
+            "anchor": best["anchor"], "votes": info["votes"], "routes": info["routes"], **(extra or {})},
+            ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def cmd_frame_fit(a):
+    """화면마다 렌즈 휨 k1 을 따로 찾아 그 화면의 코트 H 를 맞춘다 (줌 렌즈는 줌에 따라 휨이 달라진다).
+
+    기준 캘리브레이션 화면(--calib)과 대상 화면을 각자의 k1 로 편 뒤 특징점으로 화면 변환 F 를 구해 H = F × 기준 H 로
+    옮기고, 흰 선에 다시 맞춘다. 대상 화면의 k1 을 --k-min~--k-max 에서 바꿔 가며 기준 화면마다 후보를 만들고, 서로 다른
+    기준 화면에서 같은 코트 자리로 모인 무리(votes)가 가장 큰 것에서 일치율로 고른다 (_FrameFitter).
+    (실제 KBA D201: k1 -0.26 하나로 편 화면끼리는 줌이 다른 24 화면 모두 특징점 500~850개인데 일치율 0.06~0.69 로 틀렸다)
+    결과는 --out-dir 에 화면마다 캘리브레이션 JSON(그 화면의 lens 포함)과 겹친 그림으로 저장. track-court --calib 에 그대로
+    넣으면 추적 렌즈의 편 화면으로 옮겨 앵커로 쓴다."""
+    spec = _spec(a.spec)
+    raw_v = Video(a.video)
+    graphics_raw = _graphics_raw(raw_v, 0.0, raw_v.duration or 600.0, a.graphics_box, auto=not a.no_graphics_mask)
+    from .lens import Lens
+
+    ff = _FrameFitter(raw_v, a.calib, spec, Lens.load(a.lens) if a.lens else None, graphics_raw, a.k_min, a.k_max,
+                      a.k_step, a.wide_px, agree_m=a.agree_m, min_score=a.min_score)
+    out_dir = Path(a.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for t in a.t:
+        raw = raw_v.frame_at(float(t))
+        cands = ff.candidates(raw)
+        best, info, members = ff.choose(raw, cands)
         if best is None:
             print(f"{t:.2f}s: 기준 화면과 못 맞춤")
-            rows.append({"t_sec": t, "k1": "", "line_score": "", "support": "", "anchor": "", "inliers": ""})
+            rows.append({"t_sec": t, "k1": "", "line_score": "", "support": "", "anchor": "", "inliers": "", "votes": 0,
+                         "routes": 0})
             continue
-        okay, sc, k, Hr, sup, name, n = best
-        lt = lens_of(k)
-        rows.append({"t_sec": t, "k1": k, "line_score": round(sc, 3), "support": "/".join(map(str, sup)), "anchor": name,
-                     "inliers": n})
-        print(f"{t:.2f}s: k1 {k:+.3f} 일치율 {sc:.3f} 줄 {sup[1]}/{sup[0]} 엇갈림 {sup[2]} (기준 {name}, 특징점 {n})  "
-              + " ".join(f"{kk:+.2f}:{ss:.2f}" for kk, ss in curve))
+        curve: dict = {}
+        for c in cands:
+            curve[c["k"]] = max(curve.get(c["k"], 0.0), c["score"])
+        sup = best["sup"]
+        rows.append({"t_sec": t, "k1": best["k"], "line_score": round(best["score"], 3), "support": "/".join(map(str, sup)),
+                     "anchor": best["anchor"], "inliers": best["inliers"], **info,
+                     "agree_anchors": " ".join(sorted(m["anchor"] for m in members))})
+        print(f"{t:.2f}s: k1 {best['k']:+.3f} 일치율 {best['score']:.3f} 줄 {sup[1]}/{sup[0]} 엇갈림 {sup[2]} "
+              f"(기준 {best['anchor']}, 특징점 {best['inliers']}) 같은 자리 기준 화면 {info['votes']}/{info['routes']}"
+              + (f", 다른 자리 최고 {info['rival_score']}({info['rival_votes']}표, {info['rival_gap_m']}m)"
+                 if info["rival_score"] != "" else "")
+              + "  " + " ".join(f"{kk:+.2f}:{ss:.2f}" for kk, ss in sorted(curve.items())))
         stem = f"frame_{t:.2f}".replace(".", "_")
-        (out_dir / f"{stem}.json").write_text(json.dumps({
-            "spec": spec.name, "t_sec": float(t), "H_court_to_image": Hr.tolist(), "lens": lt.as_dict(),
-            "line_score": round(sc, 4), "support": list(sup), "made_by": "frame-fit", "anchor": name}, ensure_ascii=False, indent=1),
-            encoding="utf-8")
-        img = lt.undistort(raw)
-        HG.draw_court(img, Hr, spec, (0, 255, 255), 2)
+        ff.save(out_dir, stem, raw, t, best, info)
+        img = ff.lens_of(best["k"]).undistort(raw)
+        HG.draw_court(img, best["H"], spec, (0, 255, 255), 2)
         cv2.imwrite(str(out_dir / f"{stem}.jpg"), img)
     _write_csv(str(out_dir / "frame_fit.csv"), rows)
     print(f"저장: {out_dir} (화면마다 JSON·그림, frame_fit.csv)")
+
+
+def _shot_key(r: dict) -> str:
+    try:
+        return f"{float(r['t_sec']):.2f}|{float(r['u']):.1f}|{float(r['v']):.1f}"
+    except (KeyError, TypeError, ValueError):
+        return ""
+
+
+_FF_KEYS = ("ff_k1", "ff_score", "ff_support", "ff_anchor", "ff_votes", "ff_routes", "ff_agree_anchors", "ff_rival_score",
+            "ff_rival_votes", "ff_rival_gap_m", "ff_margin_lo", "ff_margin_hi", "ff_split")
+
+
+def cmd_judge_shots(a):
+    """슛마다 그 화면에서 코트를 따로 맞춰(frame-fit) 판정한다. 추적 없이 슛 화면 하나만 쓴다.
+
+    줌 렌즈 중계는 줌마다 렌즈 휨이 달라 k1 하나로 편 화면을 따라가는 추적이 쿼터 뒤로 갈수록 틀린다 (실제 KBA D201 3·4쿼터).
+    슛 화면마다 _FrameFitter 로 k1·H 를 고르고, 원본 화면 발 위치(u, v)를 그 렌즈로 펴서 판정한다 (3점 라인 보정 포함).
+    같은 자리로 모인 다른 기준 화면 후보들로도 판정해 라인까지 거리의 범위(ff_margin_lo~hi)를 내고, 2점/3점이 갈리면
+    라인근처(near_line)로 둔다. 슛마다 바로 --out 에 쓰므로 끊겨도 다시 돌리면 끝난 슛은 건너뛴다(--redo 로 처음부터).
+    출력은 rejudge 와 같은 열(+ ff_*). 자유투 표시와 사람 라인 판정(line_call)은 지킨다."""
+    from . import scorecheck as SC
+    from .lens import Lens
+
+    spec = _spec(a.spec)
+    raw_v = Video(a.video)
+    graphics_raw = _graphics_raw(raw_v, 0.0, raw_v.duration or 600.0, a.graphics_box, auto=not a.no_graphics_mask)
+    rows = SC.read_csv(a.shots)
+    done: dict = {}
+    if Path(a.out).exists() and not a.redo:
+        for r in SC.read_csv(a.out):
+            if r.get("ff_votes", "") != "" and _shot_key(r):
+                done[_shot_key(r)] = r
+    ff = _FrameFitter(raw_v, a.calib, spec, Lens.load(a.lens) if a.lens else None, graphics_raw, a.k_min, a.k_max,
+                      a.k_step, a.wide_px, agree_m=a.agree_m, min_score=a.min_score)
+    img_dir = Path(a.img_dir) if a.img_dir else None
+    if img_dir is not None:
+        img_dir.mkdir(parents=True, exist_ok=True)
+    out: list[dict] = []
+
+    def flush(rest):
+        keys = list(dict.fromkeys(k for r in out + rest for k in r))
+        _write_csv(a.out, [{k: r.get(k, "") for k in keys} for r in out + rest])
+
+    for i, r in enumerate(rows):
+        key = _shot_key(r)
+        if key and key in done:
+            out.append(done[key])
+            continue
+        r2 = dict(r)
+        if not key:
+            out.append(r2)
+            continue
+        t, u, v = float(r["t_sec"]), float(r["u"]), float(r["v"])
+        side = r.get("side") if r.get("side") in ("left", "right") else a.side
+        foot = r.get("foot_point") if r.get("foot_point") in ("mid", "toe") else "mid"
+        raw = raw_v.frame_at(t)
+        best, info, members = ff.choose(raw, ff.candidates(raw))
+        for k in _CALL_KEYS + _FF_KEYS + ("court_points", "h_source", "h_gap_s", "h_agree_m", "h_votes", "h_cam_px", "h_reject"):
+            r2.pop(k, None)
+        is_ft = str(r.get("zone", "")).upper() == "FT"
+        if best is None:
+            r2.update({k: "" for k in _CALL_KEYS + _FF_KEYS + ("court_points",)})
+            r2.update({"h_source": "none", "ff_votes": 0, "ff_routes": 0})
+            if side:
+                r2["side"] = side
+            if is_ft:
+                r2.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
+            out.append(r2)
+            print(f"{r.get('time') or t} {r.get('team', '')}: 기준 화면과 못 맞춤 (좌표 없음)")
+            flush(rows[i + 1:])
+            continue
+        lt = ff.lens_of(best["k"])
+        canvas = lt.undistort(raw)
+        uc, vc = lt.undistort_pts([[u, v]])[0]
+        call = HG.classify_click(best["H"], float(uc), float(vc), spec, side=side, frame=canvas, ignore=ff.ignore_of(best["k"]),
+                                 foot=foot)
+        calls = []
+        for m in members:
+            lm = ff.lens_of(m["k"])
+            cm = canvas if m["k"] == best["k"] else lm.undistort(raw)
+            um, vm = lm.undistort_pts([[u, v]])[0]
+            calls.append(HG.classify_click(m["H"], float(um), float(vm), spec, side=call.side, frame=cm,
+                                           ignore=ff.ignore_of(m["k"]), foot=foot))
+        margins = [c.margin for c in calls] or [call.margin]
+        split = len({c.points for c in calls} | {call.points}) > 1
+        if split:
+            call.near_line = True
+        r2.update(call.as_dict())
+        r2["court_points"] = call.points
+        r2.update({"h_source": "frame-fit", "ff_k1": best["k"], "ff_score": round(best["score"], 3),
+                   "ff_support": "/".join(map(str, best["sup"])), "ff_anchor": best["anchor"], "ff_votes": info["votes"],
+                   "ff_routes": info["routes"], "ff_agree_anchors": " ".join(sorted(m["anchor"] for m in members)),
+                   "ff_rival_score": info["rival_score"], "ff_rival_votes": info["rival_votes"],
+                   "ff_rival_gap_m": info["rival_gap_m"], "ff_margin_lo": round(min(margins), 2),
+                   "ff_margin_hi": round(max(margins), 2), "ff_split": split})
+        if r.get("line_call") in ("on", "behind"):
+            r2["points"] = 2 if r["line_call"] == "on" else 3
+        if is_ft:
+            r2.update({"points": 1, "zone": "FT", "zone_kr": "자유투"})
+        out.append(r2)
+        print(f"{r.get('time') or t} {r.get('team', '')} {r.get('result', '')}: {r2['points']}점 {r2.get('zone_kr', '')} "
+              f"라인까지 {r2['margin_m']}m ({r2['ff_margin_lo']}~{r2['ff_margin_hi']})"
+              + (" 라인근처" if call.near_line else "") + (" 기준 화면끼리 갈림" if split else "")
+              + f"  [k1 {best['k']:+.2f} 일치율 {best['score']:.2f} 같은 자리 {info['votes']}/{info['routes']} 기준 {best['anchor']}"
+              + (f", 다른 자리 최고 {info['rival_score']}({info['rival_votes']}표)" if info["rival_score"] != "" else "") + "]")
+        if img_dir is not None:
+            stem = f"shot_{t:.2f}".replace(".", "_")
+            ff.save(img_dir, stem, raw, t, best, info)
+            img = canvas.copy()
+            HG.draw_court(img, best["H"], spec, (0, 255, 255), 2)
+            cv2.circle(img, (int(round(uc)), int(round(vc))), 7, (0, 0, 255), 2)
+            cv2.putText(img, f"{t:.2f}s {r2['points']}pt margin {r2['margin_m']:+.2f} votes {info['votes']}/{info['routes']}",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+            cv2.imwrite(str(img_dir / f"{stem}.jpg"), img)
+        flush(rows[i + 1:])
+    flush([])
+    n_ok = sum(1 for r in out if r.get("h_source") == "frame-fit")
+    n_low = sum(1 for r in out if r.get("h_source") == "frame-fit" and int(r.get("ff_votes") or 0) < 2)
+    print(f"저장: {a.out} ({len(out)}개, 판정 {n_ok}개, 같은 자리 기준 화면 2개 미만 {n_low}개)")
 
 
 def cmd_hidden_lines(a):
@@ -1987,9 +2181,30 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--k-max", type=float, default=0.0)
     q.add_argument("--k-step", type=float, default=0.02)
     q.add_argument("--wide-px", type=float, default=24.0, help="12px 창 정합이 0.8 에 못 미치면 이 창으로도")
+    q.add_argument("--agree-m", type=float, default=0.3, help="두 후보가 코트를 이 m(중앙값) 안으로 같게 보면 같은 자리")
+    q.add_argument("--min-score", type=float, default=0.65, help="투표에 넣을 후보의 최소 일치율")
     q.add_argument("--graphics-box", action="append", default=None, help="방송 그래픽 자리 원본 화면 x,y,w,h 또는 JSON")
     q.add_argument("--no-graphics-mask", action="store_true")
     q.add_argument("--out-dir", required=True)
+
+    q = add("judge-shots", cmd_judge_shots, "슛마다 그 화면에서 frame-fit 으로 코트를 맞춰 판정 (추적 없이, 끊겨도 이어서)")
+    q.add_argument("--shots", required=True, help="click-shots 결과 CSV (t_sec, u, v 필요, 원본 화면 좌표)")
+    q.add_argument("--video", required=True)
+    q.add_argument("--calib", action="append", required=True, help="기준 캘리브레이션 JSON (t_sec 필요, 여러 번, 양쪽 골대)")
+    q.add_argument("--lens", default=None, help="기준 캘리브레이션에 lens 가 없을 때 그 화면을 펼 렌즈 JSON")
+    q.add_argument("--side", choices=["left", "right"], default=None, help="CSV 에 side 가 없을 때 공격 방향 림")
+    q.add_argument("--spec", default="FIBA", help=SPEC_HELP)
+    q.add_argument("--k-min", type=float, default=-0.40)
+    q.add_argument("--k-max", type=float, default=0.0)
+    q.add_argument("--k-step", type=float, default=0.02)
+    q.add_argument("--wide-px", type=float, default=24.0)
+    q.add_argument("--agree-m", type=float, default=0.3)
+    q.add_argument("--min-score", type=float, default=0.65)
+    q.add_argument("--graphics-box", action="append", default=None, help="방송 그래픽 자리 원본 화면 x,y,w,h 또는 JSON")
+    q.add_argument("--no-graphics-mask", action="store_true")
+    q.add_argument("--img-dir", default=None, help="슛마다 겹친 그림(발 자리 빨간 원)과 그 화면 캘리브레이션 JSON")
+    q.add_argument("--redo", action="store_true", help="--out 에 이미 있는 슛도 다시")
+    q.add_argument("--out", default="out/shots_judged.csv")
 
     q = add("hidden-lines", cmd_hidden_lines, "캘리브레이션 화면에서 늘 안 보이는 코트 라인 자리를 찾아 규격 JSON 의 hidden 으로 저장")
     q.add_argument("--video", required=True)

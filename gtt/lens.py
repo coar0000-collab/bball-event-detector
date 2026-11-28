@@ -177,6 +177,42 @@ def convert_h_between(H: np.ndarray, lens_from: "Lens | None", lens_to: "Lens | 
     return Hc / Hc[2, 2]
 
 
+def court_gap_m(H1: np.ndarray, lens1: "Lens | None", H2: np.ndarray, lens2: "Lens | None", shape, spec=None,
+                step: float = 1.0) -> float:
+    """두 (렌즈, H) 가 같은 원본 화면을 코트의 얼마나 다른 곳으로 보는지 (m, 중앙값).
+
+    H1(lens1 의 편 화면)로 원본 화면 안에 보이는 코트 격자점의 원본 화면 자리를 H2(lens2 의 편 화면)로 되돌려 코트에서
+    몇 m 옮겨지는지 잰다. 서로 다른 k1 로 편 화면에서 맞춘 H 끼리 비교할 때 쓴다 (frame-fit 의 기준 화면별 투표).
+    보이는 점이 4개 미만이거나 H2 로는 카메라 뒤면 inf. lens 가 None 이면 원본 화면."""
+    from .court import FIBA
+
+    spec = spec or FIBA
+    h, w = shape[:2]
+    if H1 is None or H2 is None or not (np.all(np.isfinite(H1)) and np.all(np.isfinite(H2))):
+        return float("inf")
+    gx, gy = np.meshgrid(np.arange(0.0, spec.length + 1e-9, step), np.arange(0.0, spec.width + 1e-9, step))
+    P = np.stack([gx.ravel(), gy.ravel(), np.ones(gx.size)])
+    mid = np.array([spec.length / 2, spec.width / 2, 1.0])
+    q = H1 @ P
+    with np.errstate(divide="ignore", invalid="ignore"):
+        uv = (q[:2] / q[2]).T
+    front = q[2] * (H1 @ mid)[2] > 0
+    raw = lens1.distort_pts(uv) if lens1 is not None and not lens1.is_identity else uv
+    vis = front & np.all(np.isfinite(raw), axis=1) & (raw[:, 0] >= 0) & (raw[:, 0] < w) & (raw[:, 1] >= 0) & (raw[:, 1] < h)
+    if vis.sum() < 4:
+        return float("inf")
+    c2 = lens2.undistort_pts(raw[vis]) if lens2 is not None and not lens2.is_identity else raw[vis]
+    try:
+        r = np.linalg.solve(H2, np.stack([c2[:, 0], c2[:, 1], np.ones(len(c2))]))
+    except np.linalg.LinAlgError:
+        return float("inf")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = np.hypot(r[0] / r[2] - P[0, vis], r[1] / r[2] - P[1, vis])
+    d[(1.0 / r[2]) * (H2 @ mid)[2] <= 0] = np.inf
+    d[~np.isfinite(d)] = np.inf
+    return float(np.median(d))
+
+
 class LensVideo:
     """Video 와 같은 모양으로 쓰되 화면을 편 화면(canvas)으로 돌려준다."""
 
