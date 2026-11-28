@@ -1,0 +1,37 @@
+{
+ "_설명": "선수 평가지표 수식. 확정 수식이 오면 formula 와 params 만 바꾸면 됩니다. 쓸 수 있는 기록: PTS FGM FGA P2M P2A P3M P3A FTM FTA ORB DRB REB AST STL BLK TOV PF. 영상으로 아직 못 재는 기록이 들어간 지표는 '계산 불가'로 표시되고 참고용 부분값(없는 기록=0)이 같이 나옵니다. 다른 파일을 쓰려면 gtt analyze --metrics 내수식.json",
+ "metrics": [
+  {
+   "key": "ABEi",
+   "name": "ABEi (아마추어 효율 지표)",
+   "formula": "PTS + a*REB + b*AST + c*STL + d*BLK - e*TOV - f*PF",
+   "params": {"a": 1.0, "b": 1.0, "c": 1.0, "d": 1.0, "e": 1.0, "f": 1.0},
+   "note": "GARBAGE TIME 기획서의 ABEi 식. 가중치 a~f 는 아직 확정 전이라 임시로 모두 1 (확정 값으로 바꿔 주세요).",
+   "format": "{:.1f}"
+  },
+  {
+   "key": "GmSc",
+   "name": "Game Score (Hollinger)",
+   "formula": "PTS + 0.4*FGM - 0.7*FGA - 0.4*(FTA - FTM) + 0.7*ORB + 0.3*DRB + STL + 0.7*AST + 0.7*BLK - 0.4*PF - TOV",
+   "params": {},
+   "note": "비교용 공개 지표.",
+   "format": "{:.1f}"
+  },
+  {
+   "key": "TS",
+   "name": "TS% (슈팅 효율)",
+   "formula": "PTS / (2 * (FGA + 0.44*FTA))",
+   "params": {},
+   "note": "득점과 시도만 있으면 지금도 계산됩니다.",
+   "format": "{:.1%}"
+  },
+  {
+   "key": "eFG",
+   "name": "eFG% (3점 가중 야투율)",
+   "formula": "(FGM + 0.5*P3M) / FGA",
+   "params": {},
+   "note": "",
+   "format": "{:.1%}"
+  }
+ ]
+}
