@@ -568,3 +568,11 @@ def test_hidden_lines_learns_court_spots_the_camera_never_sees(tmp_path, capsys)
     _, s1, sup1 = HG.refine_homography(raw, H, spec, return_support=True)
     assert s1 > s0 and s1 >= 0.9
     assert sup1[0] < sup0[0] or sup1[1] / sup1[0] >= sup0[1] / sup0[0]
+    # 화면이 한 장뿐이면 --min-views 2 로는 아무것도 안 넣는다 (한 장에서만 가린 것은 선수일 수 있음)
+    out2 = tmp_path / "court_hidden2.json"
+    cli.main(["hidden-lines", "--video", str(video), "--calib", str(calib), "--no-graphics-mask", "--min-views", "2",
+              "--out", str(out2)])
+    assert cli._spec(str(out2)).hidden == ()
+    cli.main(["hidden-lines", "--video", str(video), "--calib", str(calib), "--calib", str(calib), "--no-graphics-mask",
+              "--min-views", "2", "--out", str(out2)])
+    assert cli._spec(str(out2)).hidden == spec.hidden

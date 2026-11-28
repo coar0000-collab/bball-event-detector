@@ -1227,7 +1227,9 @@ def cmd_hidden_lines(a):
     hidden(코트 직사각형)으로 저장한다. 라인 정합 점수·줄 검사에서 그 자리를 빼면 맞는 H 의 점수가 제대로 나온다.
     (실제 KBA D201: 화면 아래 끝에 걸린 가까운 사이드라인·가까운 코너 직선·하프라인 아래쪽이 늘 0~15% — 맞는 H 도 일치율
     0.57~0.67, 줄 검사 10줄 중 5~6줄이라 다시 찾기·consensus 기준을 못 넘었다)
-    화면 가장자리 --edge-px 안과 그래픽 자리는 보지 않고, 선수에 잠깐 가린 것과 가르려고 --min-run-m 넘게 이어진 자리만 넣는다."""
+    화면 가장자리 --edge-px 안과 그래픽 자리는 보지 않고, 선수에 잠깐 가린 것과 가르려고 --min-run-m 넘게 이어진 자리만 넣는다.
+    캘리브레이션 화면이 한 장뿐인 쪽은 선수가 서 있던 자리도 들어가므로(실제 D201 1290.4s: 왼쪽 아크 윙 5.3m 에 선수 3명),
+    골대마다 여러 장을 주고 --min-views 2 로 두 장 넘게 안 보인 자리만 넣는 것이 좋다."""
     spec = _spec(a.spec)
     base = dataclasses.replace(spec, hidden=())
     raw_v = Video(a.video)
@@ -1275,7 +1277,7 @@ def cmd_hidden_lines(a):
             shown = (frame.copy(), H)
     rects, found = [], []
     for n, pts in polys.items():
-        miss = np.flatnonzero((seen[n] > 0) & (hits[n] == 0))
+        miss = np.flatnonzero((seen[n] >= a.min_views) & (hits[n] == 0))
         if not len(miss):
             continue
         runs = np.split(miss, np.flatnonzero(np.diff(miss) > 2) + 1)  # 한 점 빠진 곳은 이어서 본다
@@ -1848,6 +1850,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--tol", type=float, default=4.0, help="이 px 안에 흰 선이 있으면 보임")
     q.add_argument("--edge-px", type=float, default=30.0, help="화면·그래픽·검정 여백 가장자리 이 px 안은 보지 않음")
     q.add_argument("--min-run-m", type=float, default=2.0, help="이보다 길게 이어져 안 보이는 자리만 (선수에 잠깐 가린 것 빼기)")
+    q.add_argument("--min-views", type=int, default=1,
+                   help="이 장수 넘게 화면 안에 있었는데 한 번도 흰 선이 안 보인 자리만 (골대마다 여러 장 주고 2 권장)")
     q.add_argument("--piece-m", type=float, default=1.0, help="안 보이는 자리를 이 길이 조각의 직사각형으로 저장")
     q.add_argument("--pad-m", type=float, default=0.15, help="직사각형 여유 (m)")
     q.add_argument("--graphics-box", action="append", default=None,
