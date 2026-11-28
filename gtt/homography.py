@@ -708,6 +708,18 @@ def refine_homography(
     return out(best_H, best_score)
 
 
+def refine_rounds(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
+                  search_px: int = 12, rounds: int = 4):
+    """refine_homography 를 일치율이 오르는 동안 rounds 번까지 되풀이한다. (H, 일치율, line_support 결과)."""
+    H, score, sup = refine_homography(frame, H, spec, search_px=search_px, return_support=True, ignore=ignore)
+    for _ in range(rounds - 1):
+        H2, s2, sup2 = refine_homography(frame, H, spec, search_px=search_px, return_support=True, ignore=ignore)
+        if s2 <= score + 0.005:
+            break
+        H, score, sup = H2, s2, sup2
+    return H, score, sup
+
+
 def _visible(uv: np.ndarray, w: int, h: int, ignore: np.ndarray | None = None, border: int = 0) -> np.ndarray:
     """화면 안(가장자리 border px 제외)에 있고 ignore(방송 그래픽·편 화면의 검정 여백)에 안 걸린 점."""
     ok = (uv[:, 0] >= border) & (uv[:, 0] < w - 1 - border) & (uv[:, 1] >= border) & (uv[:, 1] < h - 1 - border)
@@ -1047,13 +1059,13 @@ class CourtTracker:
         return TrackResult(self.H.copy(), score, "ok")
 
     def relocalize(self, frame: np.ndarray, min_inliers: int = 40, top_k: int = 3,
-                   good_enough: float = 0.8) -> tuple[np.ndarray | None, float]:
+                   good_enough: float = 0.8, wide_px: int = 24) -> tuple[np.ndarray | None, float]:
         """놓친 뒤 현재 화면을 기준 화면(앵커)·키프레임들과 맞춰 H 를 다시 찾는다. (H, 라인 일치율) 또는 (None, 0).
 
         특징점이 가장 많이 맞은 후보 하나만 라인에 맞추면, 관중·선수에 많이 맞은 엉뚱한 키프레임이 뽑혀 놓친 상태가 길게
         이어졌다 (실제 영상 195~206s: 왼쪽 기준 화면에서 옮겨 와 맞추면 0.81~0.83 인데 계속 lost). 그래서 앵커마다 하나씩과
         키프레임 중 많이 맞은 top_k 개를 (서로 다른 자리만) 라인에 맞춰 보고, 라인이 가장 잘 맞고 support·sane 을 통과한 것을
-        고른다. good_enough 이상이 나오면 더 보지 않는다.
+        고른다. good_enough 이상이 나오면 더 보지 않는다. 후보가 good_enough 에 못 미치면 wide_px 창으로 한 번 더 맞춰 본다.
         self.last_inliers 에 고른 후보의 특징점 수를 남긴다.
         """
         self.last_inliers = 0
@@ -1096,15 +1108,18 @@ class CourtTracker:
             picks.append((n, Hc))
         best = None  # (받을 수 있는가, 일치율, H, sup, inliers)
         for n, Hc in picks:
-            H, score, sup = refine_homography(frame, Hc, self.spec, return_support=True, ignore=self.ignore)
             # 기준 화면에서 옮겨 온 H 는 멀리서 시작하는 경우가 많다. 한 번에 크기를 0.8~1.25배까지만 바꾸므로
             # 일치율이 오르는 동안 몇 번 더 맞춘다 (실제 영상: 4번 반복해 0.86~0.88 로 잡힌 슛 장면들)
-            for _ in range(3):
-                H2, s2, sup2 = refine_homography(frame, H, self.spec, return_support=True, ignore=self.ignore)
-                if s2 <= score + 0.005:
-                    break
-                H, score, sup = H2, s2, sup2
+            H, score, sup = refine_rounds(frame, Hc, self.spec, ignore=self.ignore)
             okay = self.supported(sup) and self.sane(H, frame.shape)
+            if not (okay and score >= good_enough) and wide_px > 0:
+                # 시작 H 가 라인에서 12px 넘게 떨어져 있으면 가까운 선만 끌어당겨 일치율 0.4~0.5 에 멈춘다. 더 넓은 창으로
+                # 한 번 더 맞춰 보고 나은 쪽을 쓴다. (실제 B-LAB holdout 357.8~413.8s: 왼쪽 골대 기준 화면에서 옮겨 온 맞는
+                # 후보가 추적기 안에서 0.37~0.53 에 멈춰 다시 찾지 못했다 — 따로 맞추면 0.81~0.83)
+                Hw, sw, supw = refine_rounds(frame, Hc, self.spec, ignore=self.ignore, search_px=wide_px)
+                okw = self.supported(supw) and self.sane(Hw, frame.shape)
+                if (okw, sw) > (okay, score):
+                    H, score, sup, okay = Hw, sw, supw, okw
             cand = (okay, score if okay else min(score, 0.0), H, sup, n)
             if best is None or cand[:2] > best[:2]:
                 best = cand

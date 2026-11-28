@@ -1054,12 +1054,7 @@ def _court_at_shot(look, v, t: float, spec, uv=None, window: float = 8.0, step: 
         return Hx, info
     frame = frame_t()
     for _, Hx in cands:
-        Hr, sc, sup = HG.refine_homography(frame, Hx, spec, return_support=True, ignore=look.ignore)
-        for _ in range(3):
-            H2, s2, sup2 = HG.refine_homography(frame, Hr, spec, return_support=True, ignore=look.ignore)
-            if s2 <= sc + 0.005:
-                break
-            Hr, sc, sup = H2, s2, sup2
+        Hr, sc, sup = HG.refine_rounds(frame, Hx, spec, ignore=look.ignore)
         if (sc >= min_score and HG.support_ok(sup) and HG.h_distance(Hr, Hx, frame.shape, spec) <= 10.0
                 and (Hv := take("verified", Hr)) is not None):
             return Hv, info

@@ -529,3 +529,17 @@ def test_consensus_rejects_jump_to_other_half_while_panning():
     assert trk.consensus(shape, frame=f2, pred=H2 @ near) is not None and trk.shift_rejected == 1
     trk.consensus_max_shift_m = 0  # 끄면 받는다
     assert trk.consensus(shape, frame=f2, pred=H2) is not None
+
+
+def test_relocalize_tries_wider_window_when_start_is_far():
+    """기준 화면에서 옮겨 온 H 가 라인에서 15~20px 떨어져 있으면 12px 창의 라인 정합은 가까운 선만 끌어당겨 멈춘다.
+    넓은 창(24px)으로 한 번 더 맞춰 맞는 자리를 찾는다. (실제 B-LAB holdout 357.8~413.8s: 맞는 후보가 0.37~0.53 에 멈춰
+    다시 찾지 못하는 사이, 관중석이 비슷한 반대쪽 골대 키프레임이 consensus 를 차지했다)"""
+    f0, H0 = make_scene()
+    f2, H2 = make_scene(shift=(-120, 20))
+    off = np.array([[1.03, 0, 18.0], [0, 1.03, 12.0], [0, 0, 1]])  # 기준 화면 H 가 화면에서 조금 어긋남
+    trk = HG.CourtTracker(off @ H0, f0, FIBA, use_static_mask=False)
+    _, sc = trk.relocalize(f2, wide_px=0)
+    assert sc < 0.65  # 12px 창만으로는 못 찾음
+    H, sc = trk.relocalize(f2)
+    assert sc >= 0.9 and HG.h_distance(H, H2, f2.shape) < 3.0

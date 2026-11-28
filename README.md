@@ -97,7 +97,7 @@ gtt track-court --video videos/game1.mp4 --calib configs/calib.json --step 0.2
 gtt overlay --video videos/game1.mp4 --t 1500 --track out/court_track.npz --out out/check_1500.png
 ```
 
-**양쪽 골대를 미리 맞춰 두세요.** 중계 카메라가 하프코트를 휙 가로지르면 반대쪽 골대 화면이 좌우만 바뀐 비슷한 모양이라, 기준이 없으면 다시 찾기가 어렵습니다. 왼쪽·오른쪽 골대가 잘 보이는 시각에서 각각 `calibrate`를 해 두고 `--calib`을 여러 번 주면, 첫 번째에서 출발하고 나머지는 놓쳤을 때 다시 찾는 기준으로 씁니다.
+**양쪽 골대를 미리 맞춰 두세요.** 중계 카메라가 하프코트를 휙 가로지르면 반대쪽 골대 화면이 좌우만 바뀐 비슷한 모양이라, 기준이 없으면 다시 찾기가 어렵습니다. 왼쪽·오른쪽 골대가 잘 보이는 시각에서 각각 `calibrate`를 해 두고 `--calib`을 여러 번 주면, 첫 번째에서 출발하고 나머지는 놓쳤을 때 다시 찾는 기준으로 씁니다. 다시 찾을 때 기준 화면에서 옮겨 온 위치가 라인에서 12px 넘게 떨어져 있으면 라인 정합이 가까운 선만 끌어당겨 0.4~0.5 에 멈추므로, 0.8 에 못 미치는 후보는 24px 창으로 한 번 더 맞춰 봅니다(실제 B-LAB holdout 357.8~413.8s: 왼쪽 골대 기준 화면에서 온 맞는 후보가 이렇게 멈춰 있는 사이, 관중석이 비슷한 반대쪽 골대 키프레임들이 consensus 를 차지했습니다).
 
 ```bash
 gtt calibrate --video videos/game1.mp4 --t 120 --refine --out configs/calib_right.json
