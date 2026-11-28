@@ -543,3 +543,18 @@ def test_relocalize_tries_wider_window_when_start_is_far():
     assert sc < 0.65  # 12px 창만으로는 못 찾음
     H, sc = trk.relocalize(f2)
     assert sc >= 0.9 and HG.h_distance(H, H2, f2.shape) < 3.0
+
+
+def test_line_mask_keeps_cream_lines_on_wood_but_not_colored_things():
+    """나무 바닥 위 2~3px 흰 선은 바닥색과 섞여 크림색(chroma 80 대)으로 찍힌다. 바닥보다 진하지 않으므로 라인으로 잡고,
+    바닥보다 진한 색의 밝은 가는 것(유니폼 줄무늬·광고 글자)은 뺀다. (실제 KBA D201: 아크·코너 선 chroma 75~99, 바닥
+    84~108 — 예전 절대 기준 chroma<70 에서 다 빠짐)"""
+    img = np.zeros((200, 300, 3), np.uint8)
+    img[:] = (90, 150, 210)  # 주황 나무 바닥 (BGR): min 90, chroma 120
+    img[60:63, :] = (140, 190, 225)  # 크림색 선: min 140, chroma 85
+    img[120:123, :] = (115, 120, 255)  # 바닥보다 진한 분홍빛 줄: min 115, chroma 140
+    m = HG.line_mask(img)
+    assert m[61, 50:250].mean() > 200  # 크림 선은 잡힘
+    assert m[121, 50:250].max() == 0  # 진한 색 줄은 빠짐
+    assert m[30, :].max() == 0 and m[170, :].max() == 0  # 바닥은 빠짐
+    assert HG.line_mask(img, chroma_margin=-1000)[61, 50:250].max() == 0  # 예전 기준(절대 70)이면 크림 선이 다 빠진다

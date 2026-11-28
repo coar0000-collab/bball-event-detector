@@ -478,13 +478,17 @@ def densify(poly, step: float) -> np.ndarray:
 
 
 # ---------------------------------------------------------------- 라인 정합
-def line_mask(frame: np.ndarray) -> np.ndarray:
+def line_mask(frame: np.ndarray, chroma_abs: int = 70, chroma_margin: int = 12) -> np.ndarray:
     """흰색 코트 라인 후보 픽셀 마스크 (0/255).
 
     흰색은 R·G·B 가 모두 높으므로 세 채널 중 가장 낮은 값(min 채널)으로 본다. 나무 바닥(주황·노랑)은 파랑이 낮아
     min 채널에서 어둡게 빠지고, 조명이 밝아 바닥이 하얗게 떠도 라인과의 차이가 남는다.
     (예전에는 HLS 채도를 썼는데, 아주 밝은 픽셀은 색이 조금만 섞여도 채도가 크게 튀어 라인이 사라졌다.)
-    min 채널에서 주변보다 확실히 밝은 가는 구조(top-hat)만 남기고, 색이 뚜렷한 픽셀(max-min 이 큼)은 뺀다.
+    min 채널에서 주변보다 확실히 밝은 가는 구조(top-hat)만 남기고, 색이 뚜렷한 픽셀은 뺀다 — 색(chroma = max-min)이
+    chroma_abs 미만이거나 주변 바닥의 평균 색보다 chroma_margin 넘게 진하지 않아야 한다. 2~3px 흰 선은 주황 바닥과
+    섞이고 압축돼 크림색으로 찍혀서, 절대 기준(70)만 쓰면 나무 바닥 위 선이 다 빠졌다 (실제 KBA D201 연세대: 아크·코너
+    선 chroma 75~99, 바닥 84~108 → 잡힌 비율 10~38%, 파란 페인트 위 키·자유투 라인은 chroma 27~53 로 86~100%).
+    흰 선은 바닥색을 옅게 할 뿐 더 진하게 만들지 않으므로, 바닥보다 진한 색(유니폼·광고)은 그대로 빠진다.
     """
     f = frame.astype(np.int16)
     mn = f.min(axis=2)
@@ -492,7 +496,9 @@ def line_mask(frame: np.ndarray) -> np.ndarray:
     mn8 = mn.astype(np.uint8)
     k = max(9, (min(frame.shape[:2]) // 40) | 1)
     tophat = cv2.morphologyEx(mn8, cv2.MORPH_TOPHAT, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
-    mask = ((tophat > 30) & (mn > 110) & (chroma < 70)).astype(np.uint8) * 255
+    bg = cv2.blur(chroma.astype(np.float32), (2 * k + 1, 2 * k + 1))
+    colorless = (chroma < chroma_abs) | (chroma <= bg + chroma_margin)
+    mask = ((tophat > 30) & (mn > 110) & colorless).astype(np.uint8) * 255
     return mask
 
 
@@ -709,15 +715,27 @@ def refine_homography(
 
 
 def refine_rounds(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
-                  search_px: int = 12, rounds: int = 4):
-    """refine_homography 를 일치율이 오르는 동안 rounds 번까지 되풀이한다. (H, 일치율, line_support 결과)."""
+                  search_px: int = 12, rounds: int = 4, min_gain: float = 0.005):
+    """refine_homography 를 일치율이 min_gain 넘게 오르는 동안 rounds 번까지 되풀이한다. (H, 일치율, line_support 결과)."""
     H, score, sup = refine_homography(frame, H, spec, search_px=search_px, return_support=True, ignore=ignore)
     for _ in range(rounds - 1):
         H2, s2, sup2 = refine_homography(frame, H, spec, search_px=search_px, return_support=True, ignore=ignore)
-        if s2 <= score + 0.005:
+        if s2 <= score + min_gain:
             break
         H, score, sup = H2, s2, sup2
     return H, score, sup
+
+
+def refine_best(frame: np.ndarray, H: np.ndarray, spec: CourtSpec = FIBA, ignore: np.ndarray | None = None,
+                rounds: int = 4, min_gain: float = 0.005, wide_px: int = 24, wide_below: float = 0.8):
+    """refine_rounds 를 하고, 일치율이 wide_below 에 못 미치면 wide_px 창으로도 해 보고 일치율이 높은 쪽. (H, 일치율, support)
+    시작 H 가 라인에서 12px 넘게 떨어져 있으면 12px 창은 가까운 선만 끌어당겨 0.4~0.6 에 멈춘다."""
+    best = refine_rounds(frame, H, spec, ignore=ignore, rounds=rounds, min_gain=min_gain)
+    if best[1] < wide_below and wide_px > 0:
+        w = refine_rounds(frame, H, spec, ignore=ignore, search_px=wide_px, rounds=rounds, min_gain=min_gain)
+        if w[1] > best[1]:
+            best = w
+    return best
 
 
 def _visible(uv: np.ndarray, w: int, h: int, ignore: np.ndarray | None = None, border: int = 0) -> np.ndarray:
@@ -1110,16 +1128,12 @@ class CourtTracker:
         for n, Hc in picks:
             # 기준 화면에서 옮겨 온 H 는 멀리서 시작하는 경우가 많다. 한 번에 크기를 0.8~1.25배까지만 바꾸므로
             # 일치율이 오르는 동안 몇 번 더 맞춘다 (실제 영상: 4번 반복해 0.86~0.88 로 잡힌 슛 장면들)
-            H, score, sup = refine_rounds(frame, Hc, self.spec, ignore=self.ignore)
+            # 시작 H 가 라인에서 12px 넘게 떨어져 있으면 가까운 선만 끌어당겨 일치율 0.4~0.5 에 멈추므로 good_enough 에
+            # 못 미치면 넓은 창으로도 맞춰 본다 (실제 B-LAB holdout 357.8~413.8s: 왼쪽 골대 기준 화면에서 옮겨 온 맞는
+            # 후보가 추적기 안에서 0.37~0.53 에 멈춰 다시 찾지 못했다 — 따로 맞추면 0.81~0.83)
+            H, score, sup = refine_best(frame, Hc, self.spec, ignore=self.ignore, wide_px=wide_px,
+                                        wide_below=good_enough)
             okay = self.supported(sup) and self.sane(H, frame.shape)
-            if not (okay and score >= good_enough) and wide_px > 0:
-                # 시작 H 가 라인에서 12px 넘게 떨어져 있으면 가까운 선만 끌어당겨 일치율 0.4~0.5 에 멈춘다. 더 넓은 창으로
-                # 한 번 더 맞춰 보고 나은 쪽을 쓴다. (실제 B-LAB holdout 357.8~413.8s: 왼쪽 골대 기준 화면에서 옮겨 온 맞는
-                # 후보가 추적기 안에서 0.37~0.53 에 멈춰 다시 찾지 못했다 — 따로 맞추면 0.81~0.83)
-                Hw, sw, supw = refine_rounds(frame, Hc, self.spec, ignore=self.ignore, search_px=wide_px)
-                okw = self.supported(supw) and self.sane(Hw, frame.shape)
-                if (okw, sw) > (okay, score):
-                    H, score, sup, okay = Hw, sw, supw, okw
             cand = (okay, score if okay else min(score, 0.0), H, sup, n)
             if best is None or cand[:2] > best[:2]:
                 best = cand

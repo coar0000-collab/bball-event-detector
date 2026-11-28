@@ -396,12 +396,7 @@ def _calib_on_canvas(H: np.ndarray, d: dict, frame_raw: np.ndarray, lens, spec, 
     if Hc is None:
         Hc = convert_h(H, lens, spec)
     canvas = lens.undistort(frame_raw)
-    Hc, sc = HG.refine_homography(canvas, Hc, spec, ignore=ignore)
-    for _ in range(4):
-        H2, s2 = HG.refine_homography(canvas, Hc, spec, ignore=ignore)
-        if s2 <= sc + 0.002:
-            break
-        Hc, sc = H2, s2
+    Hc, sc, _ = HG.refine_best(canvas, Hc, spec, ignore=ignore, rounds=5, min_gain=0.002)
     return Hc, sc
 
 

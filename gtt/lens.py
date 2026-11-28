@@ -198,21 +198,18 @@ def canvas_ignore(lens: Lens, graphics_raw: np.ndarray | None) -> np.ndarray | N
 
 
 def fit_on_canvas(frame_raw: np.ndarray, H_raw: np.ndarray, lens: Lens, spec=None, graphics_raw: np.ndarray | None = None,
-                  rounds: int = 6):
+                  rounds: int = 6, wide_below: float = 0.8):
     """원본 화면에서 맞춘 H 를 편 화면으로 옮겨 라인에 다시 맞춘다. (편 화면, H, 일치율, 라인까지 평균 거리 px, ignore)"""
     from .court import FIBA
-    from .homography import line_residual, refine_homography
+    from .homography import line_residual, refine_best
 
     spec = spec or FIBA
     canvas = lens.undistort(frame_raw)
     ign = canvas_ignore(lens, graphics_raw)
-    H = convert_h(H_raw, lens, spec)
-    H, sc = refine_homography(canvas, H, spec, ignore=ign)
-    for _ in range(rounds - 1):
-        H2, s2 = refine_homography(canvas, H, spec, ignore=ign)
-        if s2 <= sc + 0.002:
-            break
-        H, sc = H2, s2
+    # 펴면서 가장자리 라인이 12px 넘게 옮겨지면 12px 창 정합이 멈추므로 넓은 창도 본다
+    # (합성 MJPG 영상: 맞는 k1=-0.12 에서 일치율 0.63 에 멈춰 엉뚱한 -0.06 이 뽑혔다)
+    H, sc, _ = refine_best(canvas, convert_h(H_raw, lens, spec), spec, ignore=ign, rounds=rounds, min_gain=0.002,
+                           wide_below=wide_below)
     res, _ = line_residual(canvas, H, spec, ignore=ign)
     return canvas, H, sc, res, ign
 

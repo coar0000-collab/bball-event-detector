@@ -154,7 +154,8 @@ def test_demo_runs_end_to_end(tmp_path):
 def test_lens_fit_and_track_with_lens(tmp_path, capsys):
     """렌즈가 휜 영상: lens-fit 으로 k1 을 찾고, track-court --lens 로 편 화면에서 추적하고, 원본 화면에서 찍은 발 위치를
     shot 이 편 화면으로 옮겨 판정한다. 화면 왼쪽 아래 가장자리, 라인 바로 바깥(+0.06m) 슛: 휜 화면에 맞춘 H 만으로는
-    (라인 보정을 못 하면) -0.02m 로 2점이 나오지만, 휨을 펴면 맞는다."""
+    (라인 보정을 못 하면) 라인까지 거리가 0.04m 넘게 틀리지만(흰 선 가장자리를 덜 잡던 예전 검출에서는 -0.02m 로 2점),
+    휨을 펴면 맞는다."""
     from test_lens import distorted_scene
 
     from gtt import homography as HG
@@ -205,11 +206,12 @@ def test_lens_fit_and_track_with_lens(tmp_path, capsys):
     d = FIBA.three_radius + 0.06 + FIBA.foot_reach
     x, y = 1.575 + d * np.cos(th), 7.5 + d * np.sin(th)
     u, v = lens_true.distort_pts([np.array(HG.court_to_image(truth[0][0], x, y)) + lens_true.pad])[0]
-    assert HG.classify_click(H, u, v, FIBA, side="left").points == 2  # 휨 무시: 틀림
+    raw_call = HG.classify_click(H, u, v, FIBA, side="left")  # 휨 무시
     capsys.readouterr()
     cli.main(["shot", "--track", str(track), "--t", "0", "--u", str(u), "--v", str(v), "--side", "left"])
     out = json.loads(capsys.readouterr().out)
     assert out["points"] == 3 and abs(out["margin_m"] - 0.06) < 0.04
+    assert abs(raw_call.margin - 0.06) > 2 * abs(out["margin_m"] - 0.06)  # 휨을 무시하면 라인까지 거리가 더 틀린다
     cli.main(["shot", "--track", str(track), "--t", "0", "--u", str(u), "--v", str(v), "--video", str(video), "--side", "left"])
     out = json.loads(capsys.readouterr().out)
     assert out["points"] == 3 and abs(out["margin_m"] - 0.06) < 0.04
