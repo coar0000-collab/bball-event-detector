@@ -551,6 +551,31 @@ def view_aspect(H: np.ndarray, shape) -> float:
     return float(sv[1] / sv[0]) if sv[0] > 0 else 0.0
 
 
+def court_shift_m(Ha: np.ndarray, Hb: np.ndarray, shape, spec: CourtSpec = FIBA, step: float = 1.0) -> float:
+    """Ha 로 화면에 보이는 코트 점들의 화면 자리를 Hb 로 되돌리면 코트에서 몇 m 옮겨지는가 (중앙값). 두 H 가 화면의 같은
+    자리를 코트의 얼마나 다른 곳으로 보는지 — 반대쪽 골대 착각이면 10m 넘게 나온다. 보이는 점이 없으면 nan."""
+    if Ha is None or Hb is None or not (np.all(np.isfinite(Ha)) and np.all(np.isfinite(Hb))):
+        return float("nan")
+    h, w = shape[:2]
+    gx, gy = np.meshgrid(np.arange(0.0, spec.length + 1e-9, step), np.arange(0.0, spec.width + 1e-9, step))
+    P = np.stack([gx.ravel(), gy.ravel(), np.ones(gx.size)])
+    mid = np.array([spec.length / 2, spec.width / 2, 1.0])
+    q = Ha @ P
+    with np.errstate(divide="ignore", invalid="ignore"):
+        u, v = q[0] / q[2], q[1] / q[2]
+    vis = (q[2] * (Ha @ mid)[2] > 0) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    if not vis.any():
+        return float("nan")
+    try:
+        r = np.linalg.solve(Hb, np.stack([u[vis], v[vis], np.ones(int(vis.sum()))]))
+    except np.linalg.LinAlgError:
+        return float("nan")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        d = np.hypot(r[0] / r[2] - P[0, vis], r[1] / r[2] - P[1, vis])
+    d[(1.0 / r[2]) * (Hb @ mid)[2] <= 0] = np.inf  # Hb 로는 카메라 뒤(지평선 너머)
+    return float(np.median(d))
+
+
 _DISTINCT = ("key", "ft", "arc", "corner")  # 코트에서 자리가 하나뿐인 줄 (사이드라인·베이스라인·하프라인은 옮겨도 겹치기 쉬움)
 
 
@@ -857,7 +882,7 @@ class CourtTracker:
                  keyframe_score: float = 0.7, max_jump_px: float = 15.0, weak_inliers: int = 100,
                  min_good_lines: int = 2, min_line_frac: float = 0.6, min_area_frac: float = 0.1,
                  min_aspect_frac: float = 0.35, ignore: np.ndarray | None = None, max_cam_px: float = 0.0,
-                 consensus_line_frac: float = 0.25):
+                 consensus_line_frac: float = 0.25, consensus_max_shift_m: float = 7.0):
         """min_score: 라인 일치율이 이보다 낮으면 좌표를 내지 않는다(coast). 실제 중계에서 반대쪽 골대에 잘못 붙은 화면이
         0.36~0.47, 키가 옆으로 밀린 틀린 화면이 0.55~0.60, 맞은 화면은 0.71 이상이었으므로 0.65.
         keyframe_score: 이 이상일 때만 키프레임으로 저장(틀린 화면이 기준이 되지 않게).
@@ -875,7 +900,11 @@ class CourtTracker:
         흉내 낼 수 있어야 한다 (camera_fit_px). 0 이면 끔(기본). 실제 영상에서는 맞는 H 도 카메라 차이가 중앙 10px·90% 28px
         (B-LAB), 캘리브레이션 화면 자체가 6~18px 이라 아직 거르는 기준으로 못 쓴다 — 진단(cam-check)용.
         consensus_line_frac: 코트 안에 흰 선이 보이는데 consensus H 로 그린 줄 가운데 이 비율 미만만 흰 선과 겹치면 버린다
-        (lines_contradict frac)."""
+        (lines_contradict frac).
+        consensus_max_shift_m: 화면 이동으로 따라온 예측 H 가 있을 때(coast), consensus H 가 화면의 같은 자리를 예측과 코트에서
+        이 m 넘게 다른 곳으로 보면(court_shift_m) 버린다. 0 이면 끔. 카메라는 팬으로 이어서 움직이므로 샘플 하나 사이에 반대쪽 골대로 건너뛰지 않는다.
+        (실제 B-LAB holdout 383~529s: 왼쪽 골대를 비추는데 consensus 가 오른쪽 골대 캘리브와 거의 같은 H 를 내 발을
+        반대쪽 코트로 옮겼고, 흰 선이 많은 체육관이라 줄 검사로도 '맞음' 이었다)"""
         self.spec = spec
         self.ignore = ignore
         self.H = H0.copy()
@@ -909,6 +938,8 @@ class CourtTracker:
         self.anchors: list[tuple] = []  # 사람이 맞춘 캘리브레이션 화면들 — 지워지지 않는 키프레임 (번호는 음수)
         self.consensus_rejected = 0  # 흰 선과 어긋나 받지 않은 consensus 수
         self.camera_rejected = 0  # 카메라 자리와 안 맞아 받지 않은 consensus 수
+        self.shift_rejected = 0  # 화면 이동 예측과 다른 쪽 코트를 가리켜 받지 않은 consensus 수
+        self.consensus_max_shift_m = consensus_max_shift_m
         self.max_cam_px = max_cam_px
         self.consensus_line_frac = consensus_line_frac
         self.cams: list[np.ndarray] = []  # 캘리브레이션 화면들에서 푼 카메라 자리 (코트 좌표 m)
@@ -1086,13 +1117,14 @@ class CourtTracker:
         return H, score
 
     def consensus(self, shape, min_inliers: int = 80, agree_px: float = 4.0, min_sep: int = 10,
-                  min_votes: int = 2, frame: np.ndarray | None = None) -> np.ndarray | None:
+                  min_votes: int = 2, frame: np.ndarray | None = None, pred: np.ndarray | None = None) -> np.ndarray | None:
         """마지막 relocalize 의 후보 중, 서로 다른 시각(min_sep 샘플 이상 떨어진)의 기준 화면 min_votes 개 이상이 특징점만으로
         옮겨 온 H 가 화면에서 agree_px 안으로 같으면 그 평균 H. 아니면 None.
 
         라인이 적게 보이는 화면(스코어버그 근처 윙·코너, 반코트 확대)은 라인 정합이 support 기준을 못 넘어 몇십 초씩 좌표를
         못 냈다 (실제 B-LAB: 놓침 31%, coast 28%). 중계 카메라는 한 자리에서 돌고 당기기만 하므로 기준 화면과 지금 화면 사이는
-        관중석까지 통째로 화면 변환 하나다. 따로 맞춘 둘 이상이 같은 답을 내면 라인을 못 봐도 믿을 수 있다."""
+        관중석까지 통째로 화면 변환 하나다. 따로 맞춘 둘 이상이 같은 답을 내면 라인을 못 봐도 믿을 수 있다.
+        pred: 화면 이동으로 따라온 지금 H (coast 중). 주면 화면의 같은 자리를 consensus_max_shift_m 넘게 다른 곳으로 보는 답은 버린다."""
         c = [f for f in self.last_found if f[0] >= min_inliers]
         if len(c) < min_votes:
             return None
@@ -1112,6 +1144,12 @@ class CourtTracker:
         H = H / H[2, 2]
         if not self.sane(H, shape):
             return None
+        if pred is not None and self.consensus_max_shift_m > 0:
+            d = court_shift_m(pred, H, shape, self.spec)
+            if np.isfinite(d) and d > self.consensus_max_shift_m:
+                # 기준 화면 여럿이 같은 자리를 가리켜도, 팬으로 따라온 화면과 다른 쪽 코트면 받지 않는다
+                self.shift_rejected += 1
+                return None
         r = self.camera_px(H, shape) if self.max_cam_px else float("nan")
         if self.max_cam_px and np.isfinite(r) and r > self.max_cam_px:
             # 기준 화면 여럿이 같은 자리를 가리켜도, 중계 카메라 자리에서 돌리기·당기기로 만들 수 없는 화면이면 받지 않는다

@@ -555,7 +555,8 @@ def cmd_track_court(a):
     # 첫 기준(앵커)은 반드시 캘리브레이션한 그 화면과 그 H 로 만든다
     trk = HG.CourtTracker(H0, frame_c, spec, refine_every=a.refine_every, overlay_mask=overlay, min_score=a.min_score,
                           ignore=ignore, max_cam_px=getattr(a, "max_cam_px", 0.0),
-                          consensus_line_frac=getattr(a, "consensus_line_frac", 0.25))
+                          consensus_line_frac=getattr(a, "consensus_line_frac", 0.25),
+                          consensus_max_shift_m=getattr(a, "consensus_max_shift_m", 7.0))
     # 다른 화면(예: 반대쪽 골대)에서 맞춘 캘리브레이션은 다시 찾을 때의 기준(앵커)으로 쓴다
     # 사람이 맞춘 화면은 그 시각의 정답이기도 하다: (시각, H, 회색 화면). 추적 결과에 그 시각으로 그대로 넣고,
     # 그 직후 샘플에서 추적이 놓쳐 있으면 이 화면에서 이어 붙여 다시 잡는다.
@@ -640,7 +641,7 @@ def cmd_track_court(a):
             if strong(Hr, sc) or (Hr is not None and sc >= max(a.recover_score, 0.75)):
                 trk.reset(Hr, frame)
                 r = HG.TrackResult(Hr, sc, "recovered")
-            elif a.consensus and (Hc := trk.consensus(frame.shape, frame=frame)) is not None:
+            elif a.consensus and (Hc := trk.consensus(frame.shape, frame=frame, pred=trk.H.copy())) is not None:
                 # 라인으로는 확인 못 해도 서로 다른 시각의 기준 화면 둘 이상이 같은 자리를 가리킨다
                 trk.reset(Hc, frame)
                 r = HG.TrackResult(Hc, sc, "consensus")
@@ -748,7 +749,8 @@ def cmd_track_court(a):
     ok = sum(s in _GOOD for s in status)
     print(f"저장: {a.out}  (" + (f"슛 앞뒤 창 {len(wins)}개, " if wins else "") + f"프레임 {len(times)}개 중 코트 좌표 있음 {ok}개, 빠른 패닝 이어 붙임 {trk.chained}번, "
           f"앞뒤 정상 화면 사이 메움 {n_bridged}개, 기준 화면 여러 개 일치로 찾음 {n_consensus}개"
-          f" (흰 선과 어긋나 버림 {trk.consensus_rejected}개, 카메라 자리와 안 맞아 버림 {trk.camera_rejected}개))")
+          f" (흰 선과 어긋나 버림 {trk.consensus_rejected}개, 화면 이동과 다른 쪽 코트라 버림 {trk.shift_rejected}개,"
+          f" 카메라 자리와 안 맞아 버림 {trk.camera_rejected}개))")
     _print_cam_stats(status, cam_px, getattr(a, "max_cam_px", 0.0) or 8.0)
 
 
@@ -1721,6 +1723,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "(0 = 끔, 기본. 실제 영상에서 맞는 H 도 10~28px 이라 아직 진단용)")
     q.add_argument("--consensus-line-frac", type=float, default=0.25,
                    help="코트 안에 흰 선이 보이는데 consensus H 로 그린 줄 가운데 이 비율 미만만 흰 선(8px 안)과 겹치면 버림")
+    q.add_argument("--consensus-max-shift-m", type=float, default=7.0,
+                   help="좌표 없이 화면 이동으로 따라가는 중(coast)에 consensus H 가 화면의 같은 자리를 따라온 예측과 코트에서 "
+                        "이 m 넘게 다른 곳으로 보면 버림 (반대쪽 골대 착각; 0 = 끔)")
     q.add_argument("--no-consensus", dest="consensus", action="store_false",
                    help="라인으로 확인 못 한 화면을 '서로 다른 시각의 기준 화면 둘 이상이 같은 자리' 로 받지 않음 (비교용)")
     q.add_argument("--graphics-box", action="append", default=None,

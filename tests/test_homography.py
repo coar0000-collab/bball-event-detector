@@ -503,3 +503,29 @@ def test_consensus_rejects_other_basket_mixup():
     trk.relocalize(f3)
     assert trk.consensus(f3.shape) is not None
     assert trk.consensus(f3.shape, frame=f3) is None and trk.consensus_rejected == 1
+
+
+def test_consensus_rejects_jump_to_other_half_while_panning():
+    """좌표 없이 화면 이동으로 따라가는 중(coast)이면, 기준 화면 둘이 같은 자리를 가리켜도 그 자리가 따라온 예측과 다른 쪽
+    코트(화면의 같은 자리를 코트에서 7m 넘게 다른 곳으로 봄)면 받지 않는다. 카메라는 팬으로 이어 움직여 샘플 하나 사이에 건너뛰지 않는다.
+    (실제 B-LAB holdout 383~529s: 왼쪽 골대 화면에 오른쪽 골대 캘리브와 거의 같은 consensus H — 흰 선이 많아 줄 검사도 통과)"""
+    f0, H0 = make_scene()
+    f1, H1 = make_scene(shift=(-60, 10))
+    f2, H2 = _plain_scene((-30, 5))
+    shape = f2.shape
+    wrong = np.array([[1, 0, 10.0], [0, 1, 0], [0, 0, 1]])  # 화면이 보는 코트를 10m 옮긴 틀린 H
+    assert abs(HG.court_shift_m(H2, H2 @ wrong, shape, FIBA) - 10.0) < 1e-6
+    assert HG.court_shift_m(H2, H2, shape, FIBA) < 1e-6
+    trk = HG.CourtTracker(H0, f0, FIBA, use_static_mask=False)
+    trk.keyframes, trk.anchors = [], []
+    for n, (f, H) in enumerate([(f1, H1 @ wrong), (f0, H0 @ wrong)]):
+        trk.n = 20 * (n + 1)
+        trk._add_keyframe(cv2_gray(f), H)
+    trk.relocalize(f2)
+    assert trk.consensus(shape, frame=f2) is not None  # 흰 선이 안 보이는 화면이라 줄 검사로는 못 거름
+    assert trk.consensus(shape, frame=f2, pred=H2) is None and trk.shift_rejected == 1
+    # 예측이 consensus 와 조금(1.5m)만 어긋나면 받는다 (coast 예측은 조금씩 밀린다)
+    near = np.array([[1, 0, 8.5], [0, 1, 0], [0, 0, 1]])
+    assert trk.consensus(shape, frame=f2, pred=H2 @ near) is not None and trk.shift_rejected == 1
+    trk.consensus_max_shift_m = 0  # 끄면 받는다
+    assert trk.consensus(shape, frame=f2, pred=H2) is not None
